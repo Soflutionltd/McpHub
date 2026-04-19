@@ -10,9 +10,22 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
 pub use crate::config::ServerConfig;
+use crate::log_store::LogStore;
 use crate::protocol::ToolDef;
 
-#[derive(Debug)]
+fn guess_stderr_level(line: &str) -> &'static str {
+    let l = line.to_ascii_lowercase();
+    if l.contains("error") || l.contains("fatal") || l.contains("panic") || l.contains("traceback") {
+        "error"
+    } else if l.contains("warn") {
+        "warning"
+    } else if l.contains("debug") {
+        "debug"
+    } else {
+        "info"
+    }
+}
+
 struct ChildProcess {
     child: Child,
     stdin: tokio::process::ChildStdin,
@@ -21,7 +34,9 @@ struct ChildProcess {
     tools: Vec<ToolDef>,
     last_used: Instant,
     server_name: String,
+    #[allow(dead_code)]
     protocol_version: String,
+    log_store: Option<Arc<LogStore>>,
 }
 
 struct ServerPool {
@@ -33,36 +48,119 @@ pub struct ChildManager {
     configs: Arc<Mutex<HashMap<String, ServerConfig>>>,
     pools: Arc<Mutex<HashMap<String, Arc<ServerPool>>>>,
     idle_timeout_ms: u64,
+    default_request_timeout_secs: std::sync::atomic::AtomicU64,
+    log_store: Arc<LogStore>,
+}
+
+/// Result of a config diff during hot-reload.
+#[derive(Debug, Default, Clone)]
+pub struct ConfigDiff {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub changed: Vec<String>,
+}
+
+impl ConfigDiff {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
+    }
 }
 
 impl ChildManager {
     pub fn new(configs: HashMap<String, ServerConfig>, idle_timeout_ms: u64) -> Self {
+        Self::with_timeout(configs, idle_timeout_ms, 120)
+    }
+
+    pub fn with_timeout(
+        configs: HashMap<String, ServerConfig>,
+        idle_timeout_ms: u64,
+        default_request_timeout_secs: u64,
+    ) -> Self {
+        Self::with_full_options(
+            configs,
+            idle_timeout_ms,
+            default_request_timeout_secs,
+            Arc::new(LogStore::new()),
+        )
+    }
+
+    pub fn with_full_options(
+        configs: HashMap<String, ServerConfig>,
+        idle_timeout_ms: u64,
+        default_request_timeout_secs: u64,
+        log_store: Arc<LogStore>,
+    ) -> Self {
         Self {
             configs: Arc::new(Mutex::new(configs)),
             pools: Arc::new(Mutex::new(HashMap::new())),
             idle_timeout_ms,
+            default_request_timeout_secs: std::sync::atomic::AtomicU64::new(
+                default_request_timeout_secs.max(1),
+            ),
+            log_store,
         }
     }
 
-    pub async fn update_configs(&self, new_configs: HashMap<String, ServerConfig>) {
+    pub fn log_store(&self) -> Arc<LogStore> {
+        self.log_store.clone()
+    }
+
+    pub fn set_default_timeout(&self, secs: u64) {
+        self.default_request_timeout_secs
+            .store(secs.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn default_timeout(&self) -> u64 {
+        self.default_request_timeout_secs
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    async fn timeout_for(&self, server_name: &str) -> u64 {
+        let configs = self.configs.lock().await;
+        configs
+            .get(server_name)
+            .and_then(|c| c.request_timeout_secs)
+            .unwrap_or_else(|| self.default_timeout())
+    }
+
+    /// Update configs and return the diff (added / removed / changed).
+    /// Stopped servers will be lazily restarted on next call.
+    pub async fn update_configs(&self, new_configs: HashMap<String, ServerConfig>) -> ConfigDiff {
         let mut current_configs = self.configs.lock().await;
-        
-        let mut to_stop = Vec::new();
+        let mut diff = ConfigDiff::default();
+
         for (name, old_cfg) in current_configs.iter() {
             if let Some(new_cfg) = new_configs.get(name) {
                 if old_cfg != new_cfg {
-                    to_stop.push(name.clone());
+                    diff.changed.push(name.clone());
                 }
             } else {
-                to_stop.push(name.clone());
+                diff.removed.push(name.clone());
             }
         }
+        for name in new_configs.keys() {
+            if !current_configs.contains_key(name) {
+                diff.added.push(name.clone());
+            }
+        }
+
+        let to_stop: Vec<String> = diff
+            .removed
+            .iter()
+            .chain(diff.changed.iter())
+            .cloned()
+            .collect();
+
+        // Replace configs first so stop_server still has access if needed,
+        // then drop the lock before stopping (stop_server takes its own locks).
+        *current_configs = new_configs;
+        drop(current_configs);
 
         for name in to_stop {
             self.stop_server(&name).await;
         }
 
-        *current_configs = new_configs;
+        diff
     }
 
     async fn resolve_name(&self, name: &str) -> Option<String> {
@@ -147,7 +245,7 @@ impl ChildManager {
             cmd.args(&config.args)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null());
+                .stderr(Stdio::piped());
 
             for (k, v) in &config.env {
                 cmd.env(k, v);
@@ -156,6 +254,27 @@ impl ChildManager {
             let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn {}: {}", name, e))?;
             let stdin = child.stdin.take().ok_or("No stdin")?;
             let stdout = child.stdout.take().ok_or("No stdout")?;
+            // Capture stderr lines into the LogStore. Each child gets its own task that lives
+            // as long as the process. The store is bounded so memory stays in check.
+            if let Some(stderr) = child.stderr.take() {
+                let store = self.log_store.clone();
+                let server_name = name.to_string();
+                tokio::spawn(async move {
+                    use tokio::io::AsyncBufReadExt;
+                    let reader = BufReader::new(stderr);
+                    let mut lines = reader.lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        let level = guess_stderr_level(trimmed);
+                        store
+                            .push(&server_name, level, Some("stderr".into()), trimmed.to_string())
+                            .await;
+                    }
+                });
+            }
 
             let reader = BufReader::new(stdout);
             let lines = Arc::new(Mutex::new(reader.lines()));
@@ -169,6 +288,7 @@ impl ChildManager {
                 last_used: Instant::now(),
                 server_name: name.to_string(),
                 protocol_version: "2024-11-05".to_string(),
+                log_store: Some(self.log_store.clone()),
             };
 
             let init_result = send_request(
@@ -231,6 +351,8 @@ impl ChildManager {
             return Err(format!("Server not running: {}", server_name));
         }
 
+        let timeout_secs = self.timeout_for(server_name).await;
+
         let pool = {
             let pools = self.pools.lock().await;
             pools.get(server_name).cloned().ok_or_else(|| format!("Server not running: {}", server_name))?
@@ -240,14 +362,14 @@ impl ChildManager {
         let result = {
             let mut proc = pool.procs[idx].lock().await;
             proc.last_used = Instant::now();
-            send_request(&mut proc, method, arguments.clone()).await
+            send_request_with_timeout(&mut proc, method, arguments.clone(), timeout_secs).await
         };
 
         match result {
             Err(e) if is_connection_error(&e) => {
                 eprintln!("[McpHub][WARN] Connection error on '{}': {}. Retrying...", server_name, e);
                 self.restart_server(server_name).await?;
-                
+
                 let pool = {
                     let pools = self.pools.lock().await;
                     pools.get(server_name).cloned().ok_or_else(|| format!("Server not running: {}", server_name))?
@@ -256,7 +378,7 @@ impl ChildManager {
                 let idx = pool.next_idx.fetch_add(1, Ordering::Relaxed) % pool.procs.len();
                 let mut proc = pool.procs[idx].lock().await;
                 proc.last_used = Instant::now();
-                send_request(&mut proc, method, arguments).await
+                send_request_with_timeout(&mut proc, method, arguments, timeout_secs).await
             }
             other => other,
         }
@@ -276,6 +398,8 @@ impl ChildManager {
             self.start_server(server_name).await?;
         }
 
+        let timeout_secs = self.timeout_for(server_name).await;
+
         let pool = {
             let pools = self.pools.lock().await;
             pools.get(server_name).cloned().ok_or_else(|| format!("Server not running: {}", server_name))?
@@ -285,10 +409,11 @@ impl ChildManager {
         let result = {
             let mut proc = pool.procs[idx].lock().await;
             proc.last_used = Instant::now();
-            send_request(
+            send_request_with_timeout(
                 &mut proc,
                 "tools/call",
                 serde_json::json!({ "name": tool_name, "arguments": arguments.clone() }),
+                timeout_secs,
             ).await
         };
 
@@ -296,7 +421,7 @@ impl ChildManager {
             Err(e) if is_connection_error(&e) => {
                 eprintln!("[McpHub][WARN] Connection error on '{}': {}. Retrying...", server_name, e);
                 self.restart_server(server_name).await?;
-                
+
                 let pool = {
                     let pools = self.pools.lock().await;
                     pools.get(server_name).cloned().ok_or_else(|| format!("Server not running: {}", server_name))?
@@ -305,10 +430,11 @@ impl ChildManager {
                 let idx = pool.next_idx.fetch_add(1, Ordering::Relaxed) % pool.procs.len();
                 let mut proc = pool.procs[idx].lock().await;
                 proc.last_used = Instant::now();
-                send_request(
+                send_request_with_timeout(
                     &mut proc,
                     "tools/call",
                     serde_json::json!({ "name": tool_name, "arguments": arguments }),
+                    timeout_secs,
                 ).await
             }
             other => other,
@@ -346,6 +472,27 @@ impl ChildManager {
     pub async fn server_names(&self) -> Vec<String> {
         let configs = self.configs.lock().await;
         configs.keys().cloned().collect()
+    }
+
+    /// Fetch the tool list from a server, starting it if necessary.
+    /// Used by the discover fallback when the search index is cold.
+    pub async fn list_tools(&self, server_name: &str) -> Result<Vec<ToolDef>, String> {
+        let resolved = self.resolve_name(server_name).await
+            .ok_or_else(|| format!("Unknown server: {}", server_name))?;
+        let server_name = resolved.as_str();
+
+        if !self.is_running(server_name).await {
+            self.start_server(server_name).await?;
+        }
+
+        let pool = {
+            let pools = self.pools.lock().await;
+            pools.get(server_name).cloned()
+                .ok_or_else(|| format!("Server not running: {}", server_name))?
+        };
+
+        let proc = pool.procs[0].lock().await;
+        Ok(proc.tools.clone())
     }
 
     pub async fn request_all_running(
@@ -515,17 +662,29 @@ fn is_connection_error(e: &str) -> bool {
     e.contains("Write error") || e.contains("Flush error") || e.contains("Read error") || e.contains("Server closed connection")
 }
 
-const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Default timeout used by the legacy `send_request` helper (initialize, tools/list, etc).
+/// The configurable per-server timeout is applied via `send_request_with_timeout` for
+/// tools/call and call_method (the long-running paths).
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
 
 async fn send_request(
     proc: &mut ChildProcess,
     method: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let timeout = std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS);
+    send_request_with_timeout(proc, method, params, DEFAULT_REQUEST_TIMEOUT_SECS).await
+}
+
+async fn send_request_with_timeout(
+    proc: &mut ChildProcess,
+    method: &str,
+    params: serde_json::Value,
+    timeout_secs: u64,
+) -> Result<serde_json::Value, String> {
+    let timeout = std::time::Duration::from_secs(timeout_secs.max(1));
     match tokio::time::timeout(timeout, send_request_inner(proc, method, params)).await {
         Ok(result) => result,
-        Err(_) => Err(format!("Timeout: server did not respond within {}s", REQUEST_TIMEOUT_SECS)),
+        Err(_) => Err(format!("Timeout: server did not respond within {}s", timeout_secs)),
     }
 }
 
@@ -578,10 +737,32 @@ async fn send_request_inner(
             if let Some(method) = parsed.get("method").and_then(|v| v.as_str()) {
                 if method == "notifications/message" {
                     if let Some(params) = parsed.get("params") {
-                        if let Some(level) = params.get("level").and_then(|v| v.as_str()) {
-                            if let Some(data) = params.get("data").and_then(|v| v.as_str()) {
-                                eprintln!("[McpHub][{}][{}] {}", proc.server_name, level.to_uppercase(), data);
-                            }
+                        let level = params
+                            .get("level")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("info")
+                            .to_string();
+                        let logger = params
+                            .get("logger")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        let message = match params.get("data") {
+                            Some(serde_json::Value::String(s)) => s.clone(),
+                            Some(other) => other.to_string(),
+                            None => String::new(),
+                        };
+
+                        eprintln!(
+                            "[McpHub][{}][{}] {}",
+                            proc.server_name,
+                            level.to_uppercase(),
+                            message
+                        );
+
+                        if let Some(store) = &proc.log_store {
+                            store
+                                .push(&proc.server_name, &level, logger, message)
+                                .await;
                         }
                     }
                 }

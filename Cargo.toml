@@ -1,6 +1,6 @@
 [package]
 name = "mcp-hub"
-version = "5.0.0"
+version = "5.2.0"
 edition = "2021"
 authors = ["SOFLUTION LTD"]
 description = "Fastest MCP proxy — BM25 tool discovery + SSE transport + auto-start. Single binary, zero deps."

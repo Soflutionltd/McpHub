@@ -175,15 +175,30 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
 
   <!-- Logs View -->
   <div id="view-logs" class="hidden">
-    <div class="toolbar">
-      <button class="btn btn-ghost" onclick="clearLogs()">🚫 Clear View</button>
-      <button class="btn btn-primary" id="btn-toggle-logs" onclick="toggleLogs()">▶️ Connect Stream</button>
-      <div style="flex:1"></div>
-      <div style="font-size:11px;color:var(--text-dim)">Streaming from ~/.McpHub/mcphub.log</div>
+    <div class="toolbar" style="flex-wrap:wrap;gap:8px">
+      <select id="logs-source" onchange="restartLogs()" style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:8px 12px;color:var(--text);font-size:12px;outline:none">
+        <option value="mcp">MCP servers (structured)</option>
+        <option value="daemon">Daemon log (raw)</option>
+      </select>
+      <select id="logs-server" onchange="restartLogs()" style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:8px 12px;color:var(--text);font-size:12px;outline:none;min-width:140px">
+        <option value="">All servers</option>
+      </select>
+      <select id="logs-level" onchange="restartLogs()" style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:8px 12px;color:var(--text);font-size:12px;outline:none">
+        <option value="">All levels</option>
+        <option value="debug">≥ debug</option>
+        <option value="info">≥ info</option>
+        <option value="warning">≥ warning</option>
+        <option value="error">≥ error</option>
+      </select>
+      <input id="logs-search" type="text" placeholder="Filter text..." oninput="renderLogs()" style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:8px 12px;color:var(--text);font-size:12px;outline:none;flex:1;min-width:160px">
+      <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-dim);cursor:pointer">
+        <input type="checkbox" id="logs-autoscroll" checked> auto-scroll
+      </label>
+      <button class="btn btn-ghost" onclick="clearLogs()">Clear</button>
+      <button class="btn btn-primary" id="btn-toggle-logs" onclick="toggleLogs()">▶ Connect</button>
     </div>
-    <div id="live-logs" style="background:#0d0d14;border:1px solid var(--border);border-radius:10px;padding:12px;height:400px;overflow-y:auto;font-family:monospace;font-size:12px;line-height:1.5">
-      <div style="color:var(--text-dim)">Click 'Connect Stream' to start tailing logs...</div>
-    </div>
+    <div id="logs-status" style="font-size:11px;color:var(--text-dim);margin-bottom:8px">Disconnected — pick a source and hit Connect.</div>
+    <div id="live-logs" style="background:#0d0d14;border:1px solid var(--border);border-radius:10px;padding:8px;height:520px;overflow-y:auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.55"></div>
   </div>
 
   <!-- Settings View -->
@@ -319,6 +334,7 @@ async function fetchServers(){
   try{
     const res=await fetch('/api/servers');const data=await res.json();
     servers=data.servers||[];settings=data.settings||settings;totalTools=data.totalTools||0;cacheExists=data.cacheExists||false;
+    window._lastServers=servers;if(typeof populateLogServers==='function')populateLogServers();
     renderAll();
   }catch(e){console.error(e)}
 }
@@ -608,37 +624,112 @@ async function fetchMetrics(){
 }
 
 let logsSource=null;
-function toggleLogs(){
-  const btn=document.getElementById('btn-toggle-logs');
-  const box=document.getElementById('live-logs');
-  if(logsSource){
-    logsSource.close();logsSource=null;
-    btn.textContent='▶️ Connect Stream';
-    btn.classList.add('btn-primary');btn.classList.remove('btn-danger');
-    box.innerHTML+='<div style="color:var(--text-dim)">[Disconnected]</div>';
-  }else{
-    box.innerHTML='';
-    logsSource=new EventSource('/api/logs-stream');
-    logsSource.onmessage=e=>{
-      try{
-        const d=JSON.parse(e.data);
-        if(d.line){
-          let l=d.line.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-          if(l.includes('[ERROR]')||l.includes('[FATAL]'))l=`<span style="color:var(--danger)">${l}</span>`;
-          else if(l.includes('[WARN]'))l=`<span style="color:var(--accent)">${l}</span>`;
-          else if(l.includes('[INFO]'))l=`<span style="color:var(--blue)">${l}</span>`;
-          box.innerHTML+=`<div>${l}</div>`;
-          box.scrollTop=box.scrollHeight;
-        }else if(d.error){
-          box.innerHTML+=`<div style="color:var(--danger)">${d.error}</div>`;
-        }
-      }catch(err){}
-    };
-    btn.textContent='⏸️ Disconnect';
-    btn.classList.remove('btn-primary');btn.classList.add('btn-danger');
-  }
+let logsBuffer=[]; // For mcp source: { id, ts_ms, server, level, message, logger? }
+const LOGS_BUFFER_MAX=2000;
+const LEVEL_COLORS={debug:'#6b6b80',info:'#3b82f6',notice:'#3b82f6',warning:'#fbbf24',warn:'#fbbf24',error:'#ef4444',critical:'#ef4444',alert:'#ef4444',emergency:'#ef4444',fatal:'#ef4444'};
+function escHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function fmtTime(ms){const d=new Date(ms);return d.toLocaleTimeString('en-GB',{hour12:false})+'.'+String(d.getMilliseconds()).padStart(3,'0');}
+function setLogsStatus(t){const el=document.getElementById('logs-status');if(el)el.textContent=t;}
+function populateLogServers(){
+  const sel=document.getElementById('logs-server');if(!sel)return;
+  const current=sel.value;
+  const seen=new Set(logsBuffer.map(e=>e.server));
+  // also include configured servers if available
+  if(window._lastServers)window._lastServers.forEach(s=>seen.add(s.name));
+  const opts=['<option value="">All servers</option>'].concat([...seen].sort().map(s=>`<option value="${escHtml(s)}">${escHtml(s)}</option>`));
+  sel.innerHTML=opts.join('');
+  if([...seen].includes(current))sel.value=current;
 }
-function clearLogs(){document.getElementById('live-logs').innerHTML=''}
+function renderLogs(){
+  const box=document.getElementById('live-logs');if(!box)return;
+  const source=document.getElementById('logs-source').value;
+  if(source!=='mcp'){return;} // daemon mode renders inline
+  const serverFilter=document.getElementById('logs-server').value;
+  const levelFilter=document.getElementById('logs-level').value;
+  const text=document.getElementById('logs-search').value.toLowerCase();
+  const levelRank=l=>({debug:0,info:1,notice:1,warning:2,warn:2,error:3,critical:4,alert:4,emergency:4,fatal:4})[String(l||'').toLowerCase()]??1;
+  const minRank=levelFilter?levelRank(levelFilter):-1;
+  const rows=logsBuffer.filter(e=>{
+    if(serverFilter&&e.server!==serverFilter)return false;
+    if(levelRank(e.level)<minRank)return false;
+    if(text&&!(e.message||'').toLowerCase().includes(text)&&!(e.server||'').toLowerCase().includes(text))return false;
+    return true;
+  });
+  if(rows.length===0){
+    box.innerHTML='<div style="color:var(--text-dim);padding:8px">No matching log entries.</div>';
+    return;
+  }
+  box.innerHTML=rows.map(e=>{
+    const c=LEVEL_COLORS[String(e.level||'').toLowerCase()]||'var(--text-dim)';
+    return `<div style="display:flex;gap:8px;padding:3px 6px;border-radius:4px">
+      <span style="color:var(--text-dim);flex-shrink:0">${fmtTime(e.ts_ms)}</span>
+      <span style="color:var(--accent);flex-shrink:0;min-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(e.server)}">${escHtml(e.server)}</span>
+      <span style="color:${c};flex-shrink:0;min-width:64px;text-transform:uppercase;font-size:10px;padding-top:1px">${escHtml(e.level)}</span>
+      <span style="word-break:break-word;white-space:pre-wrap">${escHtml(e.message)}</span>
+    </div>`;
+  }).join('');
+  if(document.getElementById('logs-autoscroll').checked){box.scrollTop=box.scrollHeight;}
+}
+function pushLog(entry){
+  logsBuffer.push(entry);
+  if(logsBuffer.length>LOGS_BUFFER_MAX)logsBuffer.splice(0,logsBuffer.length-LOGS_BUFFER_MAX);
+}
+function appendDaemonLine(line){
+  const box=document.getElementById('live-logs');if(!box)return;
+  let l=escHtml(line);
+  if(l.includes('[ERROR]')||l.includes('[FATAL]'))l=`<span style="color:var(--danger)">${l}</span>`;
+  else if(l.includes('[WARN]'))l=`<span style="color:var(--accent)">${l}</span>`;
+  else if(l.includes('[INFO]'))l=`<span style="color:var(--blue)">${l}</span>`;
+  const div=document.createElement('div');div.style.padding='2px 6px';div.innerHTML=l;
+  box.appendChild(div);
+  while(box.children.length>LOGS_BUFFER_MAX)box.removeChild(box.firstChild);
+  if(document.getElementById('logs-autoscroll').checked)box.scrollTop=box.scrollHeight;
+}
+function restartLogs(){if(logsSource){disconnectLogs();connectLogs();}}
+function disconnectLogs(){
+  if(logsSource){logsSource.close();logsSource=null;}
+  const btn=document.getElementById('btn-toggle-logs');
+  if(btn){btn.textContent='▶ Connect';btn.classList.add('btn-primary');btn.classList.remove('btn-danger');}
+}
+async function connectLogs(){
+  const source=document.getElementById('logs-source').value;
+  const serverFilter=document.getElementById('logs-server').value;
+  const levelFilter=document.getElementById('logs-level').value;
+  const box=document.getElementById('live-logs');
+  box.innerHTML='';
+  logsBuffer=[];
+  if(source==='mcp'){
+    // Prime with snapshot first so we get history immediately even before stream warms up.
+    try{
+      const params=new URLSearchParams({limit:'200'});
+      if(serverFilter)params.set('server',serverFilter);
+      if(levelFilter)params.set('level',levelFilter);
+      const r=await fetch('/api/logs?'+params.toString());
+      if(r.ok){const j=await r.json();(j.entries||[]).forEach(pushLog);populateLogServers();renderLogs();}
+    }catch(e){}
+    const params=new URLSearchParams();
+    if(serverFilter)params.set('server',serverFilter);
+    if(levelFilter)params.set('level',levelFilter);
+    const url='/api/logs/stream'+(params.toString()?'?'+params.toString():'');
+    logsSource=new EventSource(url);
+    setLogsStatus('Connected to '+url);
+    logsSource.addEventListener('log',e=>{
+      try{const d=JSON.parse(e.data);pushLog(d);populateLogServers();renderLogs();}catch{}
+    });
+    logsSource.addEventListener('lag',e=>{try{const d=JSON.parse(e.data);setLogsStatus('⚠ Stream lagged — '+d.dropped+' messages dropped');}catch{}});
+    logsSource.onerror=()=>setLogsStatus('Stream disconnected (will retry).');
+  }else{
+    setLogsStatus('Tailing ~/.McpHub/mcphub.log');
+    logsSource=new EventSource('/api/logs-stream');
+    logsSource.onmessage=e=>{try{const d=JSON.parse(e.data);if(d.line)appendDaemonLine(d.line);else if(d.error)appendDaemonLine('[error] '+d.error);}catch{}};
+    logsSource.onerror=()=>setLogsStatus('Stream disconnected (will retry).');
+  }
+  const btn=document.getElementById('btn-toggle-logs');
+  btn.textContent='⏸ Disconnect';btn.classList.remove('btn-primary');btn.classList.add('btn-danger');
+}
+function toggleLogs(){if(logsSource){disconnectLogs();setLogsStatus('Disconnected.');}else{connectLogs();}
+}
+function clearLogs(){logsBuffer=[];const b=document.getElementById('live-logs');if(b)b.innerHTML='';}
 
 fetchServers();
 checkWelcome();

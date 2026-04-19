@@ -2,6 +2,7 @@
 //! Serves HTML + JSON API on http://127.0.0.1:24680
 //! Zero external dependencies — uses tokio::net::TcpListener directly.
 
+use crate::log_store::level_passes;
 use crate::proxy::ProxyServer;
 use crate::sse::{extract_session_id, SseManager};
 use serde_json::{json, Value};
@@ -401,6 +402,52 @@ async fn handle_get_metrics(proxy: Option<Arc<ProxyServer>>, sse: Option<Arc<Sse
     }
 }
 
+fn parse_query(path: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    if let Some(idx) = path.find('?') {
+        for pair in path[idx + 1..].split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                out.insert(urldecode(k), urldecode(v));
+            } else if !pair.is_empty() {
+                out.insert(urldecode(pair), String::new());
+            }
+        }
+    }
+    out
+}
+
+async fn handle_get_logs(proxy: Option<Arc<ProxyServer>>, raw_path: &str) -> Vec<u8> {
+    let proxy = match proxy {
+        Some(p) => p,
+        None => return json_err(503, "Logs not available in dashboard-only mode"),
+    };
+    let q = parse_query(raw_path);
+    let limit = q
+        .get("limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(200);
+    let server = q.get("server").map(|s| s.as_str()).filter(|s| !s.is_empty());
+    let level = q.get("level").map(|s| s.as_str()).filter(|s| !s.is_empty());
+    let since_id = q.get("since").and_then(|s| s.parse::<u64>().ok());
+
+    let store = proxy.log_store();
+    // recent() returns newest-first; UI usually wants chronological so we reverse here.
+    let mut entries = store.recent(limit, server, level, since_id).await;
+    entries.reverse();
+    let total = store.len().await;
+
+    json_ok(json!({
+        "entries": entries,
+        "total": total,
+        "filters": {
+            "server": server,
+            "level": level,
+            "limit": limit,
+            "since_id": since_id,
+        }
+    }))
+}
+
 fn handle_update_settings(body: &str) -> Vec<u8> {
     let data: Value = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -420,6 +467,75 @@ fn handle_update_settings(body: &str) -> Vec<u8> {
         json_ok(json!({"ok": true, "settings": config["settings"]}))
     } else {
         json_err(500, "Failed to save config")
+    }
+}
+
+fn handle_reload() -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let pid = std::process::id();
+        unsafe { libc_kill(pid as i32, libc_sighup()) };
+        json_ok(json!({"ok": true, "message": "SIGHUP sent, config reloading"}))
+    }
+    #[cfg(not(unix))]
+    {
+        json_ok(json!({"ok": true, "message": "Hot-reload via file watcher (5s interval)"}))
+    }
+}
+
+#[cfg(unix)]
+fn libc_sighup() -> i32 { 1 }
+
+#[cfg(unix)]
+unsafe fn libc_kill(pid: i32, sig: i32) {
+    extern "C" { fn kill(pid: i32, sig: i32) -> i32; }
+    kill(pid, sig);
+}
+
+fn handle_list_tokens() -> Vec<u8> {
+    let store = crate::auth::load_tokens();
+    let tokens: Vec<Value> = store.tokens.iter().map(|(token, entry)| {
+        json!({
+            "token": token,
+            "name": entry.name,
+            "allowed_servers": entry.allowed_servers,
+            "created_at": entry.created_at,
+            "last_used": entry.last_used,
+        })
+    }).collect();
+    json_ok(json!({"tokens": tokens}))
+}
+
+fn handle_create_token(body: &str) -> Vec<u8> {
+    let data: Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return json_err(400, "Invalid JSON"),
+    };
+    let name = match data.get("name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => return json_err(400, "Field 'name' required"),
+    };
+    let allowed_servers = data.get("allowed_servers").and_then(|v| v.as_array()).map(|arr| {
+        arr.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>()
+    });
+    let token = crate::auth::create_token(&name, allowed_servers);
+    json_ok(json!({"ok": true, "token": token, "name": name}))
+}
+
+fn handle_revoke_token(body: &str) -> Vec<u8> {
+    let data: Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return json_err(400, "Invalid JSON"),
+    };
+    let token = match data.get("token").and_then(|v| v.as_str()) {
+        Some(t) => t,
+        None => return json_err(400, "Field 'token' required"),
+    };
+    if crate::auth::revoke_token(token) {
+        json_ok(json!({"ok": true}))
+    } else {
+        json_err(404, "Token not found")
     }
 }
 
@@ -765,8 +881,13 @@ async fn route(
         ("POST", "/api/servers") => handle_add_server(&req.body),
         ("GET", "/api/settings") => handle_get_settings(),
         ("GET", "/api/metrics") => handle_get_metrics(proxy, sse).await,
+        ("GET", "/api/logs") => handle_get_logs(proxy, &req.path).await,
         ("PUT", "/api/settings") => handle_update_settings(&req.body),
         ("POST", "/api/generate") => handle_generate().await,
+        ("POST", "/api/reload") => handle_reload(),
+        ("GET", "/api/tokens") => handle_list_tokens(),
+        ("POST", "/api/tokens") => handle_create_token(&req.body),
+        ("DELETE", "/api/tokens") => handle_revoke_token(&req.body),
         _ => {
             if path.starts_with("/api/servers/") {
                 let rest = &path["/api/servers/".len()..];
@@ -947,12 +1068,11 @@ async fn handle_connection(
 
     let path = req.path.split('?').next().unwrap_or(&req.path).to_string();
 
-    let expected_auth = format!("Bearer {}", get_auth_token());
-
     // SSE endpoint: long-lived connection, don't close
     if path == "/sse" && req.method == "GET" {
-        let auth = req.headers.get("authorization").map(|s| s.as_str()).unwrap_or("");
-        if auth != expected_auth {
+        let auth_header = req.headers.get("authorization").map(|s| s.as_str()).unwrap_or("");
+        let bearer = auth_header.strip_prefix("Bearer ").unwrap_or("");
+        if crate::auth::validate_token(bearer).is_none() {
             let resp = json_err(401, "Unauthorized");
             let _ = stream.write_all(&resp).await;
             let _ = stream.shutdown().await;
@@ -972,8 +1092,9 @@ async fn handle_connection(
 
     // Message endpoint: process JSON-RPC via SSE session
     if path == "/message" && req.method == "POST" {
-        let auth = req.headers.get("authorization").map(|s| s.as_str()).unwrap_or("");
-        if auth != expected_auth {
+        let auth_header = req.headers.get("authorization").map(|s| s.as_str()).unwrap_or("");
+        let bearer = auth_header.strip_prefix("Bearer ").unwrap_or("");
+        if crate::auth::validate_token(bearer).is_none() {
             let resp = json_err(401, "Unauthorized");
             let _ = stream.write_all(&resp).await;
             let _ = stream.shutdown().await;
@@ -992,6 +1113,109 @@ async fn handle_connection(
         let _ = stream.write_all(&response).await;
         let _ = stream.shutdown().await;
         return;
+    }
+
+    // Structured MCP log stream — broadcasts entries from the in-memory LogStore.
+    // Backed by `notifications/message` from child servers (see child.rs).
+    if path == "/api/logs/stream" && req.method == "GET" {
+        let proxy_ref = match &proxy {
+            Some(p) => p.clone(),
+            None => {
+                let resp = json_err(503, "Logs not available in dashboard-only mode");
+                let _ = stream.write_all(&resp).await;
+                let _ = stream.shutdown().await;
+                return;
+            }
+        };
+
+        let q = parse_query(&req.path);
+        let server_filter = q
+            .get("server")
+            .cloned()
+            .filter(|s| !s.is_empty());
+        let level_filter = q
+            .get("level")
+            .cloned()
+            .filter(|s| !s.is_empty());
+
+        let headers = "HTTP/1.1 200 OK\r\n\
+             Content-Type: text/event-stream\r\n\
+             Cache-Control: no-cache\r\n\
+             Connection: keep-alive\r\n\
+             X-Accel-Buffering: no\r\n\
+             Access-Control-Allow-Origin: *\r\n\r\n";
+        if stream.write_all(headers.as_bytes()).await.is_err() {
+            return;
+        }
+
+        let store = proxy_ref.log_store();
+
+        // Replay last 50 entries (chronological) so the UI is populated immediately.
+        let initial = {
+            let mut e = store
+                .recent(
+                    50,
+                    server_filter.as_deref(),
+                    level_filter.as_deref(),
+                    None,
+                )
+                .await;
+            e.reverse();
+            e
+        };
+        for entry in initial {
+            let payload = serde_json::to_string(&entry).unwrap_or_default();
+            let event = format!("event: log\ndata: {}\n\n", payload);
+            if stream.write_all(event.as_bytes()).await.is_err() {
+                return;
+            }
+        }
+
+        let mut rx = store.subscribe();
+        let keepalive_every = std::time::Duration::from_secs(15);
+        let mut last_ka = std::time::Instant::now();
+
+        loop {
+            let recv = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await;
+            match recv {
+                Ok(Ok(entry)) => {
+                    if let Some(ref s) = server_filter {
+                        if !entry.server.eq_ignore_ascii_case(s) {
+                            continue;
+                        }
+                    }
+                    if let Some(ref l) = level_filter {
+                        if !level_passes(&entry.level, l) {
+                            continue;
+                        }
+                    }
+                    let payload = serde_json::to_string(&entry).unwrap_or_default();
+                    let event = format!("event: log\ndata: {}\n\n", payload);
+                    if stream.write_all(event.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    last_ka = std::time::Instant::now();
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
+                    let event = format!(
+                        "event: lag\ndata: {{\"dropped\":{}}}\n\n",
+                        n
+                    );
+                    if stream.write_all(event.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(Err(_closed)) => return,
+                Err(_) => {
+                    if last_ka.elapsed() >= keepalive_every {
+                        if stream.write_all(b": keep-alive\n\n").await.is_err() {
+                            return;
+                        }
+                        last_ka = std::time::Instant::now();
+                    }
+                }
+            }
+        }
     }
 
     if path == "/api/logs-stream" && req.method == "GET" {

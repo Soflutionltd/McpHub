@@ -9,6 +9,8 @@ pub struct ServerConfig {
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
     pub pool: usize,
+    /// Per-server request timeout override (seconds). Falls back to the global default when None.
+    pub request_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -34,6 +36,9 @@ pub struct ProxyConfig {
     pub health_check_interval_secs: u64,
     pub health_auto_restart: bool,
     pub health_notifications: bool,
+    /// Default request timeout in seconds for child MCP calls.
+    /// Per-server overrides live on `ServerConfig.request_timeout_secs`.
+    pub request_timeout_secs: u64,
 }
 
 impl Default for ProxyConfig {
@@ -47,6 +52,7 @@ impl Default for ProxyConfig {
             health_check_interval_secs: 30,
             health_auto_restart: true,
             health_notifications: true,
+            request_timeout_secs: 120,
         }
     }
 }
@@ -92,7 +98,11 @@ fn parse_servers(json: &Value) -> HashMap<String, ServerConfig> {
                 .map(|obj| obj.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect())
                 .unwrap_or_default();
             let pool = config.get("pool").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
-            result.insert(name.clone(), ServerConfig { command: cmd.to_string(), args, env, pool });
+            let request_timeout_secs = config
+                .get("requestTimeoutSecs")
+                .or_else(|| config.get("request_timeout_secs"))
+                .and_then(|v| v.as_u64());
+            result.insert(name.clone(), ServerConfig { command: cmd.to_string(), args, env, pool, request_timeout_secs });
         }
     }
     result
@@ -115,6 +125,13 @@ fn load_dedicated_config() -> Option<ProxyConfig> {
         }
         if let Some(timeout) = settings.get("idleTimeout").and_then(|v| v.as_u64()) {
             config.idle_timeout_ms = timeout * 1000;
+        }
+        if let Some(timeout) = settings
+            .get("requestTimeoutSecs")
+            .or_else(|| settings.get("request_timeout_secs"))
+            .and_then(|v| v.as_u64())
+        {
+            config.request_timeout_secs = timeout;
         }
         // Health monitor settings
         if let Some(health) = settings.get("health") {
@@ -184,6 +201,13 @@ fn apply_env_overrides(mut config: ProxyConfig) -> ProxyConfig {
     }
     if let Ok(preload) = std::env::var("MCP_ON_DEMAND_PRELOAD") {
         config.preload = match preload.as_str() { "none" => Preload::None, _ => Preload::All };
+    }
+    if let Ok(timeout) = std::env::var("MCPHUB_REQUEST_TIMEOUT_SECS") {
+        if let Ok(parsed) = timeout.parse::<u64>() {
+            if parsed > 0 {
+                config.request_timeout_secs = parsed;
+            }
+        }
     }
     config
 }

@@ -1,4 +1,5 @@
 mod add;
+pub mod auth;
 mod benchmark;
 mod cache;
 pub mod child;
@@ -8,6 +9,7 @@ mod doctor;
 mod export;
 mod health;
 mod install;
+mod log_store;
 mod logs;
 mod protocol;
 mod proxy;
@@ -42,6 +44,9 @@ USAGE:
   McpHub import       Import configuration from a file
   McpHub search "q"   Test BM25 search
   McpHub update       Self-update to the latest version on GitHub
+  McpHub token list   List all API tokens
+  McpHub token create <name> [server1,server2]  Create a new token (optionally restricted to servers)
+  McpHub token revoke <token>                   Revoke a token
   McpHub version      Show version
   McpHub help         Show this help
 
@@ -104,9 +109,10 @@ async fn cmd_generate() {
     let total = config.servers.len();
     eprintln!("Generating cache for {} servers...\n", total);
 
-    let manager = std::sync::Arc::new(child::ChildManager::new(
+    let manager = std::sync::Arc::new(child::ChildManager::with_timeout(
         config.servers.clone(),
         config.idle_timeout_ms,
+        config.request_timeout_secs,
     ));
 
     let mut server_tools: std::collections::HashMap<String, Vec<protocol::ToolDef>> = std::collections::HashMap::new();
@@ -257,6 +263,52 @@ async fn main() {
         Some("search") => {
             let query = args.get(2).map(|s| s.as_str()).unwrap_or("*");
             cmd_search(query);
+        }
+        Some("token") => {
+            match args.get(2).map(|s| s.as_str()) {
+                Some("list") => {
+                    let store = auth::load_tokens();
+                    if store.tokens.is_empty() {
+                        println!("No tokens configured. Using legacy auth-token file.");
+                    } else {
+                        println!("{:<50} {:<20} {}", "TOKEN", "NAME", "SERVERS");
+                        println!("{}", "-".repeat(90));
+                        let mut entries: Vec<_> = store.tokens.iter().collect();
+                        entries.sort_by_key(|(_, e)| &e.name);
+                        for (token, entry) in entries {
+                            let servers = entry.allowed_servers.as_ref()
+                                .map(|s| s.join(", "))
+                                .unwrap_or_else(|| "all".into());
+                            println!("{:<50} {:<20} {}", token, entry.name, servers);
+                        }
+                    }
+                }
+                Some("create") => {
+                    let name = args.get(3).map(|s| s.as_str()).unwrap_or("unnamed");
+                    let allowed = args.get(4).map(|s| {
+                        s.split(',').map(|x| x.trim().to_string()).collect::<Vec<_>>()
+                    });
+                    let token = auth::create_token(name, allowed);
+                    println!("Created token for '{}':\n{}", name, token);
+                }
+                Some("revoke") => {
+                    if let Some(token) = args.get(3) {
+                        if auth::revoke_token(token) {
+                            println!("Token revoked.");
+                        } else {
+                            eprintln!("Token not found.");
+                            std::process::exit(1);
+                        }
+                    } else {
+                        eprintln!("Usage: McpHub token revoke <token>");
+                        std::process::exit(1);
+                    }
+                }
+                _ => {
+                    eprintln!("Usage: McpHub token list|create <name> [servers]|revoke <token>");
+                    std::process::exit(1);
+                }
+            }
         }
         _ => {
             // Default: stdio proxy + HTTP server with SSE
