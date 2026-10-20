@@ -1,7 +1,6 @@
 /// Cross-platform auto-start management.
 /// `McpHub install`   — register McpHub to start at login
 /// `McpHub uninstall` — remove auto-start
-
 use std::fs;
 use std::path::PathBuf;
 
@@ -19,7 +18,7 @@ pub fn install() {
         let plist_path = plist_dir.join(format!("{}.plist", LABEL));
 
         let plist = format!(
-r#"<?xml version="1.0" encoding="UTF-8"?>
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -70,12 +69,18 @@ r#"<?xml version="1.0" encoding="UTF-8"?>
             println!("    \"mcpServers\": {{");
             println!("      \"McpHub\": {{");
             println!("        \"url\": \"http://127.0.0.1:24680/sse\",");
-            println!("        \"headers\": {{\"Authorization\": \"Bearer {}\"}}", token);
+            println!(
+                "        \"headers\": {{\"Authorization\": \"Bearer {}\"}}",
+                token
+            );
             println!("      }}");
             println!("    }}");
             println!("  }}");
         } else {
-            eprintln!("✗ launchctl load failed: {}", String::from_utf8_lossy(&output.stderr));
+            eprintln!(
+                "✗ launchctl load failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
     }
 
@@ -87,7 +92,7 @@ r#"<?xml version="1.0" encoding="UTF-8"?>
         let service_path = service_dir.join("mcphub.service");
 
         let service = format!(
-r#"[Unit]
+            r#"[Unit]
 Description=McpHub MCP Proxy Server
 After=network.target
 
@@ -124,12 +129,18 @@ WantedBy=default.target"#,
             println!("    \"mcpServers\": {{");
             println!("      \"McpHub\": {{");
             println!("        \"url\": \"http://127.0.0.1:24680/sse\",");
-            println!("        \"headers\": {{\"Authorization\": \"Bearer {}\"}}", token);
+            println!(
+                "        \"headers\": {{\"Authorization\": \"Bearer {}\"}}",
+                token
+            );
             println!("      }}");
             println!("    }}");
             println!("  }}");
         } else {
-            eprintln!("✗ systemctl enable failed: {}", String::from_utf8_lossy(&output.stderr));
+            eprintln!(
+                "✗ systemctl enable failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
     }
 
@@ -138,7 +149,17 @@ WantedBy=default.target"#,
         // Windows: add to registry Run key
         let key_path = r"Software\Microsoft\Windows\CurrentVersion\Run";
         let output = std::process::Command::new("reg")
-            .args(["add", &format!("HKCU\\{}", key_path), "/v", "McpHub", "/t", "REG_SZ", "/d", &format!("\"{}\" serve", binary_str), "/f"])
+            .args([
+                "add",
+                &format!("HKCU\\{}", key_path),
+                "/v",
+                "McpHub",
+                "/t",
+                "REG_SZ",
+                "/d",
+                &format!("\"{}\" serve", binary_str),
+                "/f",
+            ])
             .output()
             .expect("Failed to run reg");
 
@@ -151,12 +172,18 @@ WantedBy=default.target"#,
             println!("    \"mcpServers\": {{");
             println!("      \"McpHub\": {{");
             println!("        \"url\": \"http://127.0.0.1:24680/sse\",");
-            println!("        \"headers\": {{\"Authorization\": \"Bearer {}\"}}", token);
+            println!(
+                "        \"headers\": {{\"Authorization\": \"Bearer {}\"}}",
+                token
+            );
             println!("      }}");
             println!("    }}");
             println!("  }}");
         } else {
-            eprintln!("✗ Registry write failed: {}", String::from_utf8_lossy(&output.stderr));
+            eprintln!(
+                "✗ Registry write failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
     }
 }
@@ -165,7 +192,9 @@ pub fn uninstall() {
     #[cfg(target_os = "macos")]
     {
         let home = dirs::home_dir().expect("Cannot find home directory");
-        let plist_path = home.join("Library/LaunchAgents").join(format!("{}.plist", LABEL));
+        let plist_path = home
+            .join("Library/LaunchAgents")
+            .join(format!("{}.plist", LABEL));
 
         if plist_path.exists() {
             let _ = std::process::Command::new("launchctl")
@@ -201,7 +230,13 @@ pub fn uninstall() {
     {
         let key_path = r"Software\Microsoft\Windows\CurrentVersion\Run";
         let _ = std::process::Command::new("reg")
-            .args(["delete", &format!("HKCU\\{}", key_path), "/v", "McpHub", "/f"])
+            .args([
+                "delete",
+                &format!("HKCU\\{}", key_path),
+                "/v",
+                "McpHub",
+                "/f",
+            ])
             .output();
         println!("✓ McpHub removed from Windows startup");
     }

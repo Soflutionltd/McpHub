@@ -199,6 +199,7 @@ Config lives in `~/.McpHub/config.json`:
   },
   "settings": {
     "mode": "discover",
+    "mediaProfile": "safe",
     "idleTimeout": 300,
     "health": {
       "checkInterval": 30,
@@ -208,6 +209,12 @@ Config lives in `~/.McpHub/config.json`:
   }
 }
 ```
+
+`mediaProfile` is explicit and opt-in:
+
+- `safe`: default, only passes image formats known to be widely decoded by MCP clients
+- `cursor-rich`: also passes `image/webp` inline for richer clients
+- `raw`: disables inline media normalization completely
 
 ### Health monitoring
 

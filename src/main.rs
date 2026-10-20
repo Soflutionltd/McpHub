@@ -3,6 +3,7 @@ mod benchmark;
 mod cache;
 pub mod child;
 mod config;
+mod crawl;
 mod dashboard;
 mod doctor;
 mod export;
@@ -11,12 +12,17 @@ mod install;
 mod logs;
 mod protocol;
 mod proxy;
+mod description_compressor;
+mod redaction;
+mod response_cache;
 mod search;
 mod sse;
+mod untrusted;
 mod update;
 
 use config::auto_detect;
 use proxy::ProxyServer;
+use redaction::redact_command_preview;
 use search::{IndexedTool, SearchEngine};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -28,6 +34,7 @@ McpHub v{VERSION} — Fastest MCP proxy with BM25 tool discovery
 
 USAGE:
   McpHub              Start proxy (stdio + HTTP server on :24680)
+  McpHub stdio        Pure stdio mode for IDE clients (no HTTP, no background tasks)
   McpHub serve        Start HTTP-only server (SSE transport, no stdio)
   McpHub generate     Start all servers, index tools, save cache
   McpHub dashboard    Open web dashboard on http://127.0.0.1:24680
@@ -37,8 +44,9 @@ USAGE:
   McpHub doctor       Run full diagnostic of the installation
   McpHub logs         Tail daemon logs in real time
   McpHub add          Interactively add a new server
-  McpHub benchmark    Measure start and ping times for servers
-  McpHub export       Export configuration to stdout
+  McpHub benchmark    Measure server startup plus discover routing quality
+  McpHub export       Export redacted configuration to stdout
+  McpHub export --raw Export full configuration to stdout
   McpHub import       Import configuration from a file
   McpHub search "q"   Test BM25 search
   McpHub update       Self-update to the latest version on GitHub
@@ -57,6 +65,7 @@ TRANSPORT MODES:
 
 FIRST TIME SETUP:
   1. Configure servers in ~/.McpHub/config.json
+     Optional: set settings.mediaProfile to safe, cursor-rich, or raw
   2. Run: McpHub generate    (one-time, ~60s)
   3. Run: McpHub install     (auto-start at login, prints auth token)
   4. Configure Cursor with URL and auth token
@@ -69,17 +78,26 @@ fn cmd_status() {
     let config = auto_detect();
     println!("McpHub v{}", VERSION);
     println!("Mode: {:?}", config.mode);
+    println!("Media profile: {}", config.media_profile.as_str());
     println!("Servers configured: {}", config.servers.len());
-    println!("Health: check={}s, auto_restart={}, notifications={}",
-        config.health_check_interval_secs,
-        config.health_auto_restart,
-        config.health_notifications,
+    println!(
+        "Health: check={}s, auto_restart={}, notifications={}",
+        config.health_check_interval_secs, config.health_auto_restart, config.health_notifications,
     );
 
     // Cache info
     if let Some(cached) = cache::load_cache() {
-        let total_tools: usize = cached.servers.values().map(|v: &Vec<crate::protocol::ToolDef>| v.len()).sum::<usize>();
-        println!("Cache: {} servers, {} tools (v{})", cached.servers.len(), total_tools, cached.version);
+        let total_tools: usize = cached
+            .servers
+            .values()
+            .map(|v: &Vec<crate::protocol::ToolDef>| v.len())
+            .sum::<usize>();
+        println!(
+            "Cache: {} servers, {} tools (v{})",
+            cached.servers.len(),
+            total_tools,
+            cached.version
+        );
     } else {
         println!("Cache: NOT FOUND — run 'McpHub generate' first");
     }
@@ -89,8 +107,11 @@ fn cmd_status() {
     names.sort();
     for name in names {
         let s = &config.servers[name];
-        let args = s.args.join(" ");
-        println!("  {} → {} {}", name, s.command, args);
+        println!(
+            "  {} → {}",
+            name,
+            redact_command_preview(&s.command, &s.args)
+        );
     }
 }
 
@@ -107,10 +128,13 @@ async fn cmd_generate() {
     let manager = std::sync::Arc::new(child::ChildManager::new(
         config.servers.clone(),
         config.idle_timeout_ms,
+        config.request_timeout_secs,
     ));
 
-    let mut server_tools: std::collections::HashMap<String, Vec<protocol::ToolDef>> = std::collections::HashMap::new();
-    let mut server_errors: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut server_tools: std::collections::HashMap<String, Vec<protocol::ToolDef>> =
+        std::collections::HashMap::new();
+    let mut server_errors: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let mut all_tools: Vec<IndexedTool> = Vec::new();
     let mut ok = 0;
     let mut fail = 0;
@@ -131,6 +155,7 @@ async fn cmd_generate() {
                         server_name: name.clone(),
                         description: tool.description.clone(),
                         tool_def: tool,
+                        untrusted_output: false,
                     });
                 }
                 ok += 1;
@@ -154,7 +179,12 @@ async fn cmd_generate() {
     manager.stop_all().await;
 
     eprintln!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    eprintln!("Done: {} OK, {} failed, {} total tools", ok, fail, engine.tool_count());
+    eprintln!(
+        "Done: {} OK, {} failed, {} total tools",
+        ok,
+        fail,
+        engine.tool_count()
+    );
     eprintln!("Cache saved to ~/.McpHub/schema-cache.json");
     eprintln!("Proxy will now start instantly from cache.");
 }
@@ -171,18 +201,44 @@ fn cmd_search(query: &str) {
                     server_name: server_name.to_string(),
                     description: tool.description.clone(),
                     tool_def: tool.clone(),
+                    untrusted_output: false,
                 });
             }
         }
         engine.build_index(all_tools);
         let results = engine.search(query, 10);
-        println!("Query: \"{}\" ({} tools indexed)", query, engine.tool_count());
+        println!(
+            "Query: \"{}\" ({} tools indexed)",
+            query,
+            engine.tool_count()
+        );
         for (i, t) in results.iter().enumerate() {
-            println!("  {}. {} (server: {}) — {}", i + 1, t.original_name, t.server_name, &t.description[..t.description.len().min(80)]);
+            println!(
+                "  {}. {} (server: {}) — {}",
+                i + 1,
+                t.original_name,
+                t.server_name,
+                &t.description[..t.description.len().min(80)]
+            );
         }
     } else {
         println!("No cache found. Run 'McpHub generate' first.");
     }
+}
+
+/// Pure stdio mode: zero noise, zero HTTP, zero background tasks.
+/// Designed for IDE clients (Cursor) that spawn one McpHub per window.
+/// Use `McpHub serve` separately for the dashboard/SSE if you need them.
+async fn cmd_stdio() {
+    // No "starting..." banner — Cursor is sensitive to stderr volume during init.
+    let config = auto_detect();
+    let proxy = std::sync::Arc::new(ProxyServer::new(config));
+
+    // Minimal init: load cache only, no HTTP, no preload, no health, no refresh.
+    proxy.init_minimal().await;
+
+    // Run stdio loop (blocks until stdin closes)
+    proxy.stdio_loop().await;
 }
 
 /// HTTP-only server mode: dashboard + SSE, no stdio.
@@ -198,7 +254,8 @@ async fn cmd_serve() {
     tokio::spawn(async move {
         #[cfg(unix)]
         {
-            let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {}
                 _ = sigterm.recv() => {}
@@ -240,7 +297,10 @@ async fn main() {
         }
         Some("add") => add::run().await,
         Some("benchmark") => benchmark::run().await,
-        Some("export") => export::run_export(),
+        Some("export") => {
+            let raw = args.iter().skip(2).any(|arg| arg == "--raw");
+            export::run_export(raw);
+        }
         Some("import") => {
             if let Some(file) = args.get(2) {
                 export::run_import(file);
@@ -254,6 +314,7 @@ async fn main() {
         Some("uninstall") => install::uninstall(),
         Some("update") => update::run(),
         Some("serve") => cmd_serve().await,
+        Some("stdio") => cmd_stdio().await,
         Some("search") => {
             let query = args.get(2).map(|s| s.as_str()).unwrap_or("*");
             cmd_search(query);
@@ -271,7 +332,9 @@ async fn main() {
             tokio::spawn(async move {
                 #[cfg(unix)]
                 {
-                    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+                    let mut sigterm =
+                        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                            .unwrap();
                     tokio::select! {
                         _ = tokio::signal::ctrl_c() => {}
                         _ = sigterm.recv() => {}

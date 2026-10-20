@@ -17,11 +17,7 @@ pub struct HealthMonitor {
 }
 
 impl HealthMonitor {
-    pub fn new(
-        manager: Arc<ChildManager>,
-        check_interval_secs: u64,
-        auto_restart: bool,
-    ) -> Self {
+    pub fn new(manager: Arc<ChildManager>, check_interval_secs: u64, auto_restart: bool) -> Self {
         Self {
             manager,
             check_interval: Duration::from_secs(check_interval_secs),
@@ -52,10 +48,7 @@ impl HealthMonitor {
         }
 
         for (name, reason) in &dead {
-            eprintln!(
-                "[McpHub][HEALTH] Server '{}' is DOWN: {}",
-                name, reason
-            );
+            eprintln!("[McpHub][HEALTH] Server '{}' is DOWN: {}", name, reason);
 
             if self.auto_restart {
                 self.try_restart(name, reason).await;
@@ -74,7 +67,11 @@ impl HealthMonitor {
                 "[McpHub][HEALTH] Server '{}' failed {} restart attempts. Giving up.",
                 name, MAX_RESTART_ATTEMPTS
             );
-            self.notify_down(name, &format!("{} (failed {} restarts)", reason, count), false);
+            self.notify_down(
+                name,
+                &format!("{} (failed {} restarts)", reason, count),
+                false,
+            );
             return;
         }
 
@@ -102,11 +99,8 @@ impl HealthMonitor {
                 attempts.remove(name);
             }
             Err(e) => {
-                eprintln!(
-                    "[McpHub][HEALTH] Restart '{}' FAILED: {}",
-                    name, e
-                );
-                let mut attempts = self.restart_attempts.lock().await;
+                eprintln!("[McpHub][HEALTH] Restart '{}' FAILED: {}", name, e);
+                let attempts = self.restart_attempts.lock().await;
                 let count = attempts.get(name).copied().unwrap_or(0);
                 if count >= MAX_RESTART_ATTEMPTS {
                     self.notify_down(name, &format!("{} (all restarts failed)", reason), false);
@@ -137,12 +131,12 @@ fn send_notification(title: &str, body: &str) {
 
     #[cfg(target_os = "macos")]
     {
-        // osascript display alert: always works, no permissions needed, auto-dismisses
+        // osascript display notification: no permissions needed, no accessibility popup
         let escaped_title = title.replace('"', "\\\"");
         let escaped_body = body.replace('"', "\\\"");
         let script = format!(
-            "display alert \"{}\" message \"{}\" as warning giving up after 15",
-            escaped_title, escaped_body
+            "display notification \"{}\" with title \"{}\"",
+            escaped_body, escaped_title
         );
         let _ = std::process::Command::new("osascript")
             .arg("-e")

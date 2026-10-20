@@ -2,6 +2,7 @@
 //! Serves HTML + JSON API on http://127.0.0.1:24680
 //! Zero external dependencies — uses tokio::net::TcpListener directly.
 
+use crate::protocol::JsonRpcRequest;
 use crate::proxy::ProxyServer;
 use crate::sse::{extract_session_id, SseManager};
 use serde_json::{json, Value};
@@ -33,16 +34,19 @@ pub fn get_auth_token() -> String {
             return token;
         }
     }
-    
+
     use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
     let token = format!("mcphub_{:x}", nanos);
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    
+
     let _ = fs::write(&path, &token);
-    
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -51,7 +55,7 @@ pub fn get_auth_token() -> String {
             let _ = fs::set_permissions(&path, perms);
         }
     }
-    
+
     token
 }
 
@@ -145,7 +149,12 @@ fn parse_request(raw: &str) -> Option<HttpRequest> {
         String::new()
     };
 
-    Some(HttpRequest { method, path, headers, body })
+    Some(HttpRequest {
+        method,
+        path,
+        headers,
+        body,
+    })
 }
 
 fn http_response(status: u16, status_text: &str, content_type: &str, body: &str) -> Vec<u8> {
@@ -167,6 +176,21 @@ fn json_err(status: u16, msg: &str) -> Vec<u8> {
         "application/json",
         &json!({"error": msg}).to_string(),
     )
+}
+
+async fn handle_streamable_http_message(body: &str, proxy: &Arc<ProxyServer>) -> Vec<u8> {
+    let request: JsonRpcRequest = match serde_json::from_str(body) {
+        Ok(request) => request,
+        Err(e) => return json_err(400, &format!("Invalid JSON-RPC: {}", e)),
+    };
+
+    match proxy.handle_request(request).await {
+        Some(response) => match serde_json::to_string(&response) {
+            Ok(body) => http_response(200, "OK", "application/json", &body),
+            Err(e) => json_err(500, &format!("Serialize failed: {}", e)),
+        },
+        None => http_response(202, "Accepted", "application/json", "{\"ok\":true}"),
+    }
 }
 
 // ─── API Handlers ────────────────────────────────────────────
@@ -210,7 +234,10 @@ fn handle_get_servers() -> Vec<u8> {
             .unwrap_or_default();
         let tool_count = tools.len();
 
-        let error_msg = cached_errors.get(name).and_then(|v| v.as_str()).unwrap_or("");
+        let error_msg = cached_errors
+            .get(name)
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
         result.push(json!({
             "name": name,
@@ -225,7 +252,10 @@ fn handle_get_servers() -> Vec<u8> {
         }));
     }
 
-    let total_tools: usize = result.iter().map(|s| s["tools"].as_u64().unwrap_or(0) as usize).sum();
+    let total_tools: usize = result
+        .iter()
+        .map(|s| s["tools"].as_u64().unwrap_or(0) as usize)
+        .sum();
 
     json_ok(json!({
         "servers": result,
@@ -262,7 +292,11 @@ fn handle_add_server(body: &str) -> Vec<u8> {
     let env = data.get("env").cloned().unwrap_or(json!({}));
 
     let mut config = read_config();
-    let key = if config.get("servers").is_some() { "servers" } else { "mcpServers" };
+    let key = if config.get("servers").is_some() {
+        "servers"
+    } else {
+        "mcpServers"
+    };
     if config.get(key).is_none() {
         config[key] = json!({});
     }
@@ -286,7 +320,11 @@ fn handle_update_server(name: &str, body: &str) -> Vec<u8> {
     };
 
     let mut config = read_config();
-    let key = if config.get("servers").and_then(|v| v.as_object()).is_some() { "servers" } else { "mcpServers" };
+    let key = if config.get("servers").and_then(|v| v.as_object()).is_some() {
+        "servers"
+    } else {
+        "mcpServers"
+    };
     let servers = match config.get_mut(key).and_then(|v| v.as_object_mut()) {
         Some(s) => s,
         None => return json_err(404, "No servers configured"),
@@ -296,10 +334,7 @@ fn handle_update_server(name: &str, body: &str) -> Vec<u8> {
         return json_err(404, "Server not found");
     }
 
-    let new_name = data
-        .get("newName")
-        .and_then(|v| v.as_str())
-        .unwrap_or(name);
+    let new_name = data.get("newName").and_then(|v| v.as_str()).unwrap_or(name);
 
     if new_name != name {
         let existing = servers.remove(name).unwrap();
@@ -334,7 +369,11 @@ fn handle_update_server(name: &str, body: &str) -> Vec<u8> {
 
 fn handle_delete_server(name: &str) -> Vec<u8> {
     let mut config = read_config();
-    let key = if config.get("servers").and_then(|v| v.as_object()).is_some() { "servers" } else { "mcpServers" };
+    let key = if config.get("servers").and_then(|v| v.as_object()).is_some() {
+        "servers"
+    } else {
+        "mcpServers"
+    };
     let servers = match config.get_mut(key).and_then(|v| v.as_object_mut()) {
         Some(s) => s,
         None => return json_err(404, "No servers configured"),
@@ -354,10 +393,17 @@ fn handle_toggle_server(name: &str, body: &str) -> Vec<u8> {
         Ok(v) => v,
         Err(_) => return json_err(400, "Invalid JSON"),
     };
-    let disabled = data.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false);
+    let disabled = data
+        .get("disabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let mut config = read_config();
-    let key = if config.get("servers").and_then(|v| v.as_object()).is_some() { "servers" } else { "mcpServers" };
+    let key = if config.get("servers").and_then(|v| v.as_object()).is_some() {
+        "servers"
+    } else {
+        "mcpServers"
+    };
     let servers = match config.get_mut(key).and_then(|v| v.as_object_mut()) {
         Some(s) => s,
         None => return json_err(404, "No servers configured"),
@@ -389,7 +435,10 @@ fn handle_get_settings() -> Vec<u8> {
     json_ok(settings)
 }
 
-async fn handle_get_metrics(proxy: Option<Arc<ProxyServer>>, sse: Option<Arc<SseManager>>) -> Vec<u8> {
+async fn handle_get_metrics(
+    proxy: Option<Arc<ProxyServer>>,
+    sse: Option<Arc<SseManager>>,
+) -> Vec<u8> {
     if let Some(p) = proxy {
         let mut m = p.metrics.lock().await;
         if let Some(s) = sse {
@@ -448,7 +497,8 @@ async fn handle_generate() -> Vec<u8> {
                     if rest.contains("FAILED") {
                         Some((name.to_string(), 0, false))
                     } else {
-                        let tools_str = rest.find("... ")
+                        let tools_str = rest
+                            .find("... ")
                             .map(|j| &rest[j + 4..])
                             .and_then(|s| s.split_whitespace().next())
                             .and_then(|n| n.parse::<usize>().ok())
@@ -467,9 +517,18 @@ async fn handle_generate() -> Vec<u8> {
             let summary = if let Some(idx) = combined.find("Done:") {
                 let rest = &combined[idx..];
                 let parts: Vec<&str> = rest.split_whitespace().collect();
-                let ok_count = parts.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-                let failed = parts.get(3).and_then(|s| s.trim_end_matches(',').parse::<usize>().ok()).unwrap_or(0);
-                let total = parts.get(5).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                let ok_count = parts
+                    .get(1)
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let failed = parts
+                    .get(3)
+                    .and_then(|s| s.trim_end_matches(',').parse::<usize>().ok())
+                    .unwrap_or(0);
+                let total = parts
+                    .get(5)
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0);
                 Some(json!({"ok": ok_count, "failed": failed, "totalTools": total}))
             } else {
                 None
@@ -489,7 +548,11 @@ async fn handle_generate() -> Vec<u8> {
 
 async fn handle_repair_server(name: &str) -> Vec<u8> {
     let config = read_config();
-    let key = if config.get("servers").and_then(|v| v.as_object()).is_some() { "servers" } else { "mcpServers" };
+    let key = if config.get("servers").and_then(|v| v.as_object()).is_some() {
+        "servers"
+    } else {
+        "mcpServers"
+    };
     let servers = match config.get(key).and_then(|v| v.as_object()) {
         Some(s) => s,
         None => return json_err(404, "No servers configured"),
@@ -500,9 +563,14 @@ async fn handle_repair_server(name: &str) -> Vec<u8> {
 
     let srv = &servers[name];
     let command = srv.get("command").and_then(|v| v.as_str()).unwrap_or("");
-    let args: Vec<String> = srv.get("args")
+    let args: Vec<String> = srv
+        .get("args")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     // Step 1: Check if command exists
@@ -510,13 +578,21 @@ async fn handle_repair_server(name: &str) -> Vec<u8> {
         .arg(command)
         .output()
         .await;
-    
+
     let cmd_exists = cmd_check.map(|o| o.status.success()).unwrap_or(false);
     if !cmd_exists {
         // Try to find the command in common locations
         let common_paths = [
-            format!("{}/.nvm/versions/node/v25.0.0/bin/{}", dirs::home_dir().unwrap_or_default().display(), command),
-            format!("{}/.nvm/versions/node/v22.22.0/bin/{}", dirs::home_dir().unwrap_or_default().display(), command),
+            format!(
+                "{}/.nvm/versions/node/v25.0.0/bin/{}",
+                dirs::home_dir().unwrap_or_default().display(),
+                command
+            ),
+            format!(
+                "{}/.nvm/versions/node/v22.22.0/bin/{}",
+                dirs::home_dir().unwrap_or_default().display(),
+                command
+            ),
             format!("/opt/homebrew/bin/{}", command),
             format!("/usr/local/bin/{}", command),
         ];
@@ -527,7 +603,7 @@ async fn handle_repair_server(name: &str) -> Vec<u8> {
                 break;
             }
         }
-        
+
         if let Some(path) = found_path {
             return json_ok(json!({
                 "ok": false,
@@ -538,7 +614,7 @@ async fn handle_repair_server(name: &str) -> Vec<u8> {
                 "fix_command": path
             }));
         }
-        
+
         return json_ok(json!({
             "ok": false,
             "step": "command_not_found",
@@ -553,7 +629,7 @@ async fn handle_repair_server(name: &str) -> Vec<u8> {
     for arg in &args {
         cmd.arg(arg);
     }
-    
+
     // Add env vars
     if let Some(env_obj) = srv.get("env").and_then(|v| v.as_object()) {
         for (k, v) in env_obj {
@@ -562,10 +638,10 @@ async fn handle_repair_server(name: &str) -> Vec<u8> {
             }
         }
     }
-    
+
     cmd.stdin(std::process::Stdio::piped())
-       .stdout(std::process::Stdio::piped())
-       .stderr(std::process::Stdio::piped());
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
 
     let child = match cmd.spawn() {
         Ok(c) => c,
@@ -581,21 +657,20 @@ async fn handle_repair_server(name: &str) -> Vec<u8> {
     };
 
     // Give it 10 seconds to start
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        child.wait_with_output(),
-    ).await;
+    let output =
+        tokio::time::timeout(std::time::Duration::from_secs(10), child.wait_with_output()).await;
 
     match output {
         Ok(Ok(out)) => {
             let stderr = String::from_utf8_lossy(&out.stderr).to_string();
             let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-            
+
             // Check for common errors
             let combined = format!("{}\n{}", stderr, stdout);
-            
+
             if combined.contains("MODULE_NOT_FOUND") || combined.contains("Cannot find module") {
-                let module = combined.lines()
+                let module = combined
+                    .lines()
                     .find(|l| l.contains("Cannot find module"))
                     .unwrap_or("unknown module")
                     .to_string();
@@ -607,7 +682,7 @@ async fn handle_repair_server(name: &str) -> Vec<u8> {
                     "auto_fixable": false
                 }));
             }
-            
+
             if combined.contains("ENOENT") {
                 return json_ok(json!({
                     "ok": false,
@@ -618,8 +693,13 @@ async fn handle_repair_server(name: &str) -> Vec<u8> {
                     "auto_fixable": false
                 }));
             }
-            
-            if combined.contains("API") && (combined.contains("401") || combined.contains("403") || combined.contains("unauthorized") || combined.contains("Unauthorized")) {
+
+            if combined.contains("API")
+                && (combined.contains("401")
+                    || combined.contains("403")
+                    || combined.contains("unauthorized")
+                    || combined.contains("Unauthorized"))
+            {
                 return json_ok(json!({
                     "ok": false,
                     "step": "auth_error",
@@ -628,8 +708,11 @@ async fn handle_repair_server(name: &str) -> Vec<u8> {
                     "auto_fixable": false
                 }));
             }
-            
-            if combined.contains("ECONNREFUSED") || combined.contains("fetch failed") || combined.contains("network") {
+
+            if combined.contains("ECONNREFUSED")
+                || combined.contains("fetch failed")
+                || combined.contains("network")
+            {
                 return json_ok(json!({
                     "ok": false,
                     "step": "network_error",
@@ -660,16 +743,22 @@ async fn handle_repair_server(name: &str) -> Vec<u8> {
 
             match gen_output {
                 Ok(gen_out) => {
-                    let gen_combined = format!("{}{}", 
+                    let gen_combined = format!(
+                        "{}{}",
                         String::from_utf8_lossy(&gen_out.stderr),
                         String::from_utf8_lossy(&gen_out.stdout)
                     );
-                    let server_line = gen_combined.lines()
+                    let server_line = gen_combined
+                        .lines()
                         .find(|l| l.contains(name))
                         .unwrap_or("");
-                    
+
                     if server_line.contains("FAILED") {
-                        let error_part = server_line.split("FAILED:").nth(1).unwrap_or("Unknown error").trim();
+                        let error_part = server_line
+                            .split("FAILED:")
+                            .nth(1)
+                            .unwrap_or("Unknown error")
+                            .trim();
                         json_ok(json!({
                             "ok": false,
                             "step": "generate_failed",
@@ -690,17 +779,15 @@ async fn handle_repair_server(name: &str) -> Vec<u8> {
                     "step": "generate_error",
                     "error": format!("Cache rebuild failed: {}", e),
                     "auto_fixable": false
-                }))
+                })),
             }
         }
-        Ok(Err(e)) => {
-            json_ok(json!({
-                "ok": false,
-                "step": "process_error",
-                "error": format!("Process error: {}", e),
-                "auto_fixable": false
-            }))
-        }
+        Ok(Err(e)) => json_ok(json!({
+            "ok": false,
+            "step": "process_error",
+            "error": format!("Process error: {}", e),
+            "auto_fixable": false
+        })),
         Err(_) => {
             // Timeout - server is still running, which is actually good for MCP servers
             // They stay alive waiting for stdio input. Rebuild cache.
@@ -709,21 +796,25 @@ async fn handle_repair_server(name: &str) -> Vec<u8> {
                 .arg("generate")
                 .output()
                 .await;
-            
+
             match gen_output {
                 Ok(gen_out) => {
-                    let gen_combined = format!("{}{}", 
+                    let gen_combined = format!(
+                        "{}{}",
                         String::from_utf8_lossy(&gen_out.stderr),
                         String::from_utf8_lossy(&gen_out.stdout)
                     );
-                    if gen_combined.contains(&format!("{} ... ", name)) && !gen_combined.contains("FAILED") {
+                    if gen_combined.contains(&format!("{} ... ", name))
+                        && !gen_combined.contains("FAILED")
+                    {
                         json_ok(json!({
                             "ok": true,
                             "step": "repaired",
                             "message": format!("Server '{}' repaired and cache rebuilt", name)
                         }))
                     } else {
-                        let error_line = gen_combined.lines()
+                        let error_line = gen_combined
+                            .lines()
                             .find(|l| l.contains(name) && l.contains("FAILED"))
                             .unwrap_or("Unknown error");
                         json_ok(json!({
@@ -737,10 +828,10 @@ async fn handle_repair_server(name: &str) -> Vec<u8> {
                 }
                 Err(e) => json_ok(json!({
                     "ok": false,
-                    "step": "generate_error", 
+                    "step": "generate_error",
                     "error": format!("Cache rebuild failed: {}", e),
                     "auto_fixable": false
-                }))
+                })),
             }
         }
     }
@@ -882,13 +973,12 @@ async fn handle_connection(
 ) {
     // Add CORS OPTIONS handler
     let mut buf = vec![0u8; 65536];
-    let mut total_read = match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        stream.read(&mut buf),
-    ).await {
-        Ok(Ok(n)) if n > 0 => n,
-        _ => return, // Timeout or read error: drop connection
-    };
+    let mut total_read =
+        match tokio::time::timeout(std::time::Duration::from_secs(10), stream.read(&mut buf)).await
+        {
+            Ok(Ok(n)) if n > 0 => n,
+            _ => return, // Timeout or read error: drop connection
+        };
 
     // Check if it's an OPTIONS request early
     if total_read >= 7 && &buf[..7] == b"OPTIONS" {
@@ -900,10 +990,10 @@ async fn handle_connection(
     // Find end of headers
     let mut body_offset = 0;
     for i in 0..total_read.saturating_sub(3) {
-        if &buf[i..i+4] == b"\r\n\r\n" {
+        if &buf[i..i + 4] == b"\r\n\r\n" {
             body_offset = i + 4;
             break;
-        } else if i < total_read.saturating_sub(1) && &buf[i..i+2] == b"\n\n" {
+        } else if i < total_read.saturating_sub(1) && &buf[i..i + 2] == b"\n\n" {
             body_offset = i + 2;
             break;
         }
@@ -930,7 +1020,9 @@ async fn handle_connection(
             let n = match tokio::time::timeout(
                 std::time::Duration::from_secs(10),
                 stream.read(&mut buf[total_read..]),
-            ).await {
+            )
+            .await
+            {
                 Ok(Ok(n)) if n > 0 => n,
                 _ => return, // Timeout or read error
             };
@@ -951,7 +1043,11 @@ async fn handle_connection(
 
     // SSE endpoint: long-lived connection, don't close
     if path == "/sse" && req.method == "GET" {
-        let auth = req.headers.get("authorization").map(|s| s.as_str()).unwrap_or("");
+        let auth = req
+            .headers
+            .get("authorization")
+            .map(|s| s.as_str())
+            .unwrap_or("");
         if auth != expected_auth {
             let resp = json_err(401, "Unauthorized");
             let _ = stream.write_all(&resp).await;
@@ -970,9 +1066,37 @@ async fn handle_connection(
         }
     }
 
+    // Streamable HTTP endpoint: Cursor V2 first POSTs JSON-RPC to the configured URL.
+    if path == "/sse" && req.method == "POST" {
+        let auth = req
+            .headers
+            .get("authorization")
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        if auth != expected_auth {
+            let resp = json_err(401, "Unauthorized");
+            let _ = stream.write_all(&resp).await;
+            let _ = stream.shutdown().await;
+            return;
+        }
+
+        let response = if let Some(proxy_ref) = &proxy {
+            handle_streamable_http_message(&req.body, proxy_ref).await
+        } else {
+            json_err(503, "MCP proxy not available in dashboard-only mode")
+        };
+        let _ = stream.write_all(&response).await;
+        let _ = stream.shutdown().await;
+        return;
+    }
+
     // Message endpoint: process JSON-RPC via SSE session
     if path == "/message" && req.method == "POST" {
-        let auth = req.headers.get("authorization").map(|s| s.as_str()).unwrap_or("");
+        let auth = req
+            .headers
+            .get("authorization")
+            .map(|s| s.as_str())
+            .unwrap_or("");
         if auth != expected_auth {
             let resp = json_err(401, "Unauthorized");
             let _ = stream.write_all(&resp).await;
@@ -982,7 +1106,9 @@ async fn handle_connection(
 
         let response = if let (Some(proxy_ref), Some(sse_mgr)) = (&proxy, &sse) {
             if let Some(session_id) = extract_session_id(&req.path) {
-                sse_mgr.handle_message(&session_id, &req.body, proxy_ref).await
+                sse_mgr
+                    .handle_message(&session_id, &req.body, proxy_ref)
+                    .await
             } else {
                 json_err(400, "Missing sessionId parameter")
             }
@@ -1004,31 +1130,36 @@ async fn handle_connection(
         if stream.write_all(headers.as_bytes()).await.is_err() {
             return;
         }
-        
+
         let log_path = config_dir().join("mcphub.log");
         if !log_path.exists() {
-            let _ = stream.write_all(b"event: message\ndata: {\"error\": \"Log file not found\"}\n\n").await;
+            let _ = stream
+                .write_all(b"event: message\ndata: {\"error\": \"Log file not found\"}\n\n")
+                .await;
             return;
         }
-        
+
         if let Ok(file) = std::fs::File::open(&log_path) {
             use std::io::{BufRead, Seek, SeekFrom};
             let mut reader = std::io::BufReader::new(file);
             let mut pos = reader.seek(SeekFrom::End(0)).unwrap_or(0);
-            
+
             loop {
                 let mut line = String::new();
                 match reader.read_line(&mut line) {
                     Ok(0) => {
                         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                        if reader.seek(SeekFrom::Start(pos)).is_err() { break; }
+                        if reader.seek(SeekFrom::Start(pos)).is_err() {
+                            break;
+                        }
                     }
                     Ok(len) => {
                         pos += len as u64;
                         let line_trim = line.trim();
                         if !line_trim.is_empty() {
                             let json_msg = serde_json::json!({ "line": line_trim });
-                            let event = format!("event: message\ndata: {}\n\n", json_msg.to_string());
+                            let event =
+                                format!("event: message\ndata: {}\n\n", json_msg.to_string());
                             if stream.write_all(event.as_bytes()).await.is_err() {
                                 break;
                             }

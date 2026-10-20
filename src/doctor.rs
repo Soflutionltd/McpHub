@@ -1,7 +1,8 @@
+use crate::config::auto_detect;
+use crate::redaction::redact_command_preview;
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::Command;
-use std::net::TcpStream;
-use crate::config::auto_detect;
 
 fn mcphub_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_default().join(".McpHub")
@@ -13,7 +14,11 @@ pub fn run() {
 
     // 1. Binary info
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("McpHub"));
-    println!("✓ Binary: {} (v{})", exe.display(), env!("CARGO_PKG_VERSION"));
+    println!(
+        "✓ Binary: {} (v{})",
+        exe.display(),
+        env!("CARGO_PKG_VERSION")
+    );
 
     // 2. Config
     let config_path = mcphub_dir().join("config.json");
@@ -28,9 +33,17 @@ pub fn run() {
     if cache_path.exists() {
         let meta = std::fs::metadata(&cache_path).unwrap();
         let modified = meta.modified().unwrap();
-        let age = std::time::SystemTime::now().duration_since(modified).unwrap().as_secs();
+        let age = std::time::SystemTime::now()
+            .duration_since(modified)
+            .unwrap()
+            .as_secs();
         let size_kb = meta.len() / 1024;
-        println!("✓ Cache:  {} ({} KB, updated {}s ago)", cache_path.display(), size_kb, age);
+        println!(
+            "✓ Cache:  {} ({} KB, updated {}s ago)",
+            cache_path.display(),
+            size_kb,
+            age
+        );
     } else {
         println!("✗ Cache:  Not found. Run 'McpHub generate'");
     }
@@ -44,19 +57,21 @@ pub fn run() {
     // 5. Servers check
     let config = auto_detect();
     println!("\nServers ({} total):", config.servers.len());
-    
+
     for (name, srv) in &config.servers {
         print!("  {} ... ", name);
-        
+
         // Check command exists
         let output = Command::new("which").arg(&srv.command).output();
         let cmd_exists = output.map(|o| o.status.success()).unwrap_or(false);
-        
+
         if cmd_exists {
             print!("✓ Command '{}' found", srv.command);
         } else {
             print!("✗ Command '{}' NOT FOUND", srv.command);
         }
+
+        print!(" [{}]", redact_command_preview(&srv.command, &srv.args));
 
         // Check env vars presence (just warning if some common ones seem missing)
         if srv.env.is_empty() && srv.command.contains("github") {
@@ -74,5 +89,8 @@ pub fn run() {
             }
         }
     }
-    println!("\nDisk Usage: ~/.McpHub/ uses {} MB", total_size / 1024 / 1024);
+    println!(
+        "\nDisk Usage: ~/.McpHub/ uses {} MB",
+        total_size / 1024 / 1024
+    );
 }

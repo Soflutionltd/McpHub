@@ -6,7 +6,6 @@
 /// - TCP keepalive enabled to detect half-open connections
 /// - Session reaper cleans stale sessions every 60s
 /// - Write + flush errors both trigger session teardown
-
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -75,7 +74,10 @@ impl SseManager {
             "event: endpoint\ndata: /message?sessionId={}\n\n",
             session_id
         );
-        if write_and_flush(&mut stream, endpoint_event.as_bytes()).await.is_err() {
+        if write_and_flush(&mut stream, endpoint_event.as_bytes())
+            .await
+            .is_err()
+        {
             return;
         }
 
@@ -105,6 +107,7 @@ impl SseManager {
                             if write_and_flush(&mut stream, event.as_bytes()).await.is_err() {
                                 break;
                             }
+                            touch_session(&self.sessions, &session_id).await;
                         }
                         None => break, // Channel dropped (session reaped or server shutdown)
                     }
@@ -113,6 +116,7 @@ impl SseManager {
                     if write_and_flush(&mut stream, b": keepalive\n\n").await.is_err() {
                         break;
                     }
+                    touch_session(&self.sessions, &session_id).await;
                 }
             }
         }
@@ -158,7 +162,11 @@ impl SseManager {
                 Ok(j) => j,
                 Err(e) => {
                     eprintln!("[McpHub][SSE] Serialize error: {}", e);
-                    return http_response(500, "Internal Server Error", "{\"error\":\"Serialize failed\"}");
+                    return http_response(
+                        500,
+                        "Internal Server Error",
+                        "{\"error\":\"Serialize failed\"}",
+                    );
                 }
             };
 
@@ -172,7 +180,10 @@ impl SseManager {
                 match session.tx.try_send(event) {
                     Ok(_) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
-                        eprintln!("[McpHub][SSE] Session {} channel full, dropping message", session_id);
+                        eprintln!(
+                            "[McpHub][SSE] Session {} channel full, dropping message",
+                            session_id
+                        );
                         // Don't kill the session, just drop this message
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -239,7 +250,7 @@ fn configure_tcp_keepalive(stream: &TcpStream) {
     let _ = sock_ref.set_nodelay(true);
 }
 
-/// Periodically reap stale sessions (no activity for SESSION_TIMEOUT_SECS).
+/// Periodically reap stale sessions (no successful reads/writes for SESSION_TIMEOUT_SECS).
 /// Dropping the sender half of the channel causes the SSE loop to break.
 async fn session_reaper(sessions: Arc<Mutex<HashMap<String, SseSession>>>) {
     loop {
@@ -254,6 +265,13 @@ async fn session_reaper(sessions: Arc<Mutex<HashMap<String, SseSession>>>) {
             map.remove(id);
             eprintln!("[McpHub][SSE] Reaped stale session: {}", id);
         }
+    }
+}
+
+async fn touch_session(sessions: &Arc<Mutex<HashMap<String, SseSession>>>, session_id: &str) {
+    let mut sessions = sessions.lock().await;
+    if let Some(session) = sessions.get_mut(session_id) {
+        session.last_activity = Instant::now();
     }
 }
 
@@ -287,4 +305,33 @@ fn http_response(status: u16, status_text: &str, body: &str) -> Vec<u8> {
         body
     )
     .into_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn touch_session_refreshes_activity_for_keepalive() {
+        let (tx, _rx) = mpsc::channel::<String>(1);
+        let sessions = Arc::new(Mutex::new(HashMap::from([(
+            "session-1".to_string(),
+            SseSession {
+                tx,
+                last_activity: Instant::now()
+                    - std::time::Duration::from_secs(SESSION_TIMEOUT_SECS + 10),
+            },
+        )])));
+
+        touch_session(&sessions, "session-1").await;
+
+        let sessions = sessions.lock().await;
+        let elapsed = sessions
+            .get("session-1")
+            .expect("session should still exist")
+            .last_activity
+            .elapsed();
+
+        assert!(elapsed.as_secs() < SESSION_TIMEOUT_SECS);
+    }
 }

@@ -1,7 +1,3 @@
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader, AsyncWriteExt};
-use tokio::net::TcpStream;
-use serde_json::json;
-
 #[tokio::test]
 async fn test_sse_connection_and_keepalive() {
     // Note: We don't start the actual McpHub daemon in this simple test since it requires

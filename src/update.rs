@@ -71,7 +71,13 @@ pub fn run() {
     let archive_path = temp_dir.join(asset_name);
 
     let dl_status = Command::new("curl")
-        .args(["-L", "-s", "-o", archive_path.to_str().unwrap(), &download_url])
+        .args([
+            "-L",
+            "-s",
+            "-o",
+            archive_path.to_str().unwrap(),
+            &download_url,
+        ])
         .status();
 
     if !dl_status.map_or(false, |s| s.success()) {
@@ -95,7 +101,11 @@ pub fn run() {
         return;
     }
 
-    let binary_name = if os == "windows" { "McpHub.exe" } else { "McpHub" };
+    let binary_name = if os == "windows" {
+        "McpHub.exe"
+    } else {
+        "McpHub"
+    };
     let new_binary_path = temp_dir.join(binary_name);
 
     if !new_binary_path.exists() {

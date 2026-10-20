@@ -1,6 +1,6 @@
 [package]
 name = "mcp-hub"
-version = "5.0.0"
+version = "5.6.0"
 edition = "2021"
 authors = ["SOFLUTION LTD"]
 description = "Fastest MCP proxy — BM25 tool discovery + SSE transport + auto-start. Single binary, zero deps."
@@ -20,6 +20,7 @@ serde_json = "1"
 dirs = "6"
 socket2 = { version = "0.5", features = ["all"] }
 notify-rust = "4"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
 [profile.release]
 opt-level = 3

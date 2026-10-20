@@ -1,6 +1,7 @@
 /// Core proxy server: reads JSON-RPC from stdin, routes to child servers.
 /// Two modes: discover (2 meta-tools) or passthrough (all tools exposed).
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
@@ -8,10 +9,13 @@ use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 use crate::child::ChildManager;
-use crate::config::{Mode, Preload, ProxyConfig};
+use crate::config::{Mode, ProxyConfig};
+use crate::crawl;
 use crate::health::HealthMonitor;
 use crate::protocol::*;
+use crate::response_cache::ResponseCache;
 use crate::search::{IndexedTool, SearchEngine};
+use crate::untrusted;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ServerMetrics {
@@ -39,7 +43,12 @@ pub struct GlobalMetrics {
     pub start_time: SystemTime,
     pub total_requests: u64,
     pub active_sse_sessions: usize,
+    pub discover_routing: DiscoverRoutingMetrics,
+    pub execute_routing: ExecuteRoutingMetrics,
     pub servers: HashMap<String, ServerMetrics>,
+    /// Per-tool call counts (key = "server__tool"). Used to boost BM25 ranking
+    /// so frequently-used tools surface first. Persisted to ~/.McpHub/usage-stats.json.
+    pub tool_calls: HashMap<String, u64>,
 }
 
 impl GlobalMetrics {
@@ -48,9 +57,90 @@ impl GlobalMetrics {
             start_time: SystemTime::now(),
             total_requests: 0,
             active_sse_sessions: 0,
+            discover_routing: DiscoverRoutingMetrics::default(),
+            execute_routing: ExecuteRoutingMetrics::default(),
             servers: HashMap::new(),
+            tool_calls: load_usage_stats(),
         }
     }
+}
+
+fn usage_stats_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    std::path::PathBuf::from(home).join(".McpHub").join("usage-stats.json")
+}
+
+fn load_usage_stats() -> HashMap<String, u64> {
+    let path = usage_stats_path();
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_usage_stats(stats: &HashMap<String, u64>) {
+    let path = usage_stats_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string(stats) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoverRouteStrategy {
+    IndexedBm25,
+    LiveServerLookup,
+    ServerListFallback,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoverFilterSource {
+    ExplicitServer,
+    QueryServerName,
+    QueryToolName,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecuteRouteStrategy {
+    ExactCatalogMatch,
+    CaseInsensitiveCatalogMatch,
+    UncataloguedBypass,
+    UnknownToolError,
+}
+
+#[derive(Debug, Clone, serde::Serialize, Default)]
+pub struct DiscoverRoutingMetrics {
+    pub total: u64,
+    pub explicit_server: u64,
+    pub inferred_server_name: u64,
+    pub inferred_tool_name: u64,
+    pub indexed_bm25: u64,
+    pub live_server_lookup: u64,
+    pub server_list_fallback: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, Default)]
+pub struct ExecuteRoutingMetrics {
+    pub total: u64,
+    pub exact_catalog_match: u64,
+    pub case_insensitive_catalog_match: u64,
+    pub uncatalogued_bypass: u64,
+    pub unknown_tool_error: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DiscoverRoutingInfo {
+    pub strategy: DiscoverRouteStrategy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter_source: Option<DiscoverFilterSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_filter: Option<String>,
+    pub reason: String,
 }
 
 pub struct ProxyServer {
@@ -58,6 +148,8 @@ pub struct ProxyServer {
     child_manager: Arc<ChildManager>,
     search_engine: Arc<Mutex<SearchEngine>>,
     pub metrics: Arc<Mutex<GlobalMetrics>>,
+    catalog_refresh_in_progress: Arc<AtomicBool>,
+    response_cache: Arc<ResponseCache>,
 }
 
 impl ProxyServer {
@@ -65,6 +157,7 @@ impl ProxyServer {
         let child_manager = Arc::new(ChildManager::new(
             config.servers.clone(),
             config.idle_timeout_ms,
+            config.request_timeout_secs,
         ));
 
         Self {
@@ -72,33 +165,84 @@ impl ProxyServer {
             child_manager,
             search_engine: Arc::new(Mutex::new(SearchEngine::new())),
             metrics: Arc::new(Mutex::new(GlobalMetrics::new())),
+            catalog_refresh_in_progress: Arc::new(AtomicBool::new(false)),
+            response_cache: Arc::new(ResponseCache::new()),
         }
     }
 
     /// Initialize proxy: load cache, start background tasks.
     /// Call this before stdio_loop() or serving SSE.
     pub async fn init(&self) {
+        let configured_server_names = self.configured_server_names().await;
+        let configured_server_hashes = {
+            let config = self.config.lock().await;
+            crate::cache::server_config_hashes(&config.servers)
+        };
+        let mut catalog_refresh_reason = None;
+        let mut refresh_server_names: Vec<String> = Vec::new();
+        let removed_server_names: Vec<String> = Vec::new();
+
         // 1. Load cache synchronously FIRST (instant, <1ms)
         if let Some(cached) = crate::cache::load_cache() {
-            let mut all_tools: Vec<IndexedTool> = Vec::new();
-            for (server_name, tools) in &cached.servers {
-                for tool in tools {
-                    all_tools.push(IndexedTool {
-                        name: format!("{}__{}", server_name, tool.name),
-                        original_name: tool.name.clone(),
-                        server_name: server_name.to_string(),
-                        description: tool.description.clone(),
-                        tool_def: tool.clone(),
-                    });
-                }
-            }
+            let all_tools = indexed_tools_from_servers(&cached.servers);
             if !all_tools.is_empty() {
                 let mut eng = self.search_engine.lock().await;
                 eng.build_index(all_tools);
-                eprintln!("[McpHub][INFO] Ready: {} tools from cache", eng.tool_count());
+                eprintln!(
+                    "[McpHub][INFO] Ready: {} tools from cache",
+                    eng.tool_count()
+                );
+            } else {
+                catalog_refresh_reason = Some("cache is empty".to_string());
+                refresh_server_names = configured_server_names.clone();
+            }
+
+            if cached.version != env!("CARGO_PKG_VERSION") {
+                catalog_refresh_reason = Some(format!(
+                    "cache version {} differs from binary {}",
+                    cached.version,
+                    env!("CARGO_PKG_VERSION")
+                ));
+                refresh_server_names = configured_server_names.clone();
+            }
+
+            let cached_server_names: HashSet<String> = cached
+                .servers
+                .keys()
+                .chain(cached.errors.keys())
+                .cloned()
+                .collect();
+            let missing_servers: Vec<String> = configured_server_names
+                .iter()
+                .filter(|name| !cached_server_names.contains(*name))
+                .cloned()
+                .collect();
+            let stale_servers: Vec<String> = configured_server_names
+                .iter()
+                .filter(|name| {
+                    cached.server_hashes.get(*name) != configured_server_hashes.get(*name)
+                        || cached.errors.contains_key(*name)
+                })
+                .cloned()
+                .collect();
+            let mut refresh_candidates = stale_servers;
+            for missing_server in missing_servers {
+                if !refresh_candidates.contains(&missing_server) {
+                    refresh_candidates.push(missing_server);
+                }
+            }
+            if !refresh_candidates.is_empty() && catalog_refresh_reason.is_none() {
+                catalog_refresh_reason = Some(format!(
+                    "cache needs refresh for {} configured server(s): {}",
+                    refresh_candidates.len(),
+                    refresh_candidates.join(", ")
+                ));
+                refresh_server_names = refresh_candidates;
             }
         } else {
             eprintln!("[McpHub][WARN] No cache found. Run 'McpHub generate' for instant startup.");
+            catalog_refresh_reason = Some("cache not found".to_string());
+            refresh_server_names = configured_server_names.clone();
         }
 
         // 2. Start idle reaper
@@ -114,8 +258,15 @@ impl ProxyServer {
         let engine_watch = self.search_engine.clone();
         let config_watch = self.config.clone();
         let child_manager_watch = self.child_manager.clone();
+        let refresh_watch = self.catalog_refresh_in_progress.clone();
         tokio::spawn(async move {
-            config_and_cache_watcher(engine_watch, config_watch, child_manager_watch).await;
+            config_and_cache_watcher(
+                engine_watch,
+                config_watch,
+                child_manager_watch,
+                refresh_watch,
+            )
+            .await;
         });
 
         // 4. Start health monitor (notifications + auto-restart)
@@ -130,25 +281,107 @@ impl ProxyServer {
                 monitor.run().await;
             });
         }
-    }
 
-    /// Full run: init + stdio loop. Backward compatible.
-    pub async fn run(&self) {
-        self.init().await;
-        self.stdio_loop().await;
+        let preload_delay_ms = config.preload_delay_ms;
+        drop(config);
+
+        if let Some(reason) = catalog_refresh_reason {
+            spawn_catalog_refresh(
+                reason,
+                self.child_manager.clone(),
+                self.search_engine.clone(),
+                refresh_server_names,
+                removed_server_names,
+                configured_server_hashes,
+                preload_delay_ms,
+                self.catalog_refresh_in_progress.clone(),
+            );
+        }
     }
 
     pub async fn shutdown(&self) {
         self.child_manager.stop_all().await;
     }
 
-    async fn servers_to_preload(&self) -> Vec<String> {
-        let config = self.config.lock().await;
-        match &config.preload {
-            Preload::All => self.child_manager.server_names().await,
-            Preload::Some(names) => names.clone(),
-            Preload::None => Vec::new(),
+    /// Minimal init for stdio mode: load cache only, no background tasks.
+    /// No HTTP server, no preload, no health monitor, no idle reaper, no catalog refresh.
+    /// Goal: respond to initialize + tools/list as fast and quietly as possible.
+    pub async fn init_minimal(&self) {
+        if let Some(cached) = crate::cache::load_cache() {
+            let all_tools = indexed_tools_from_servers(&cached.servers);
+            if !all_tools.is_empty() {
+                let mut eng = self.search_engine.lock().await;
+                eng.build_index(all_tools);
+            }
         }
+    }
+
+    async fn normalize_result_for_profile(&self, result: serde_json::Value) -> serde_json::Value {
+        let media_profile = {
+            let config = self.config.lock().await;
+            config.media_profile.clone()
+        };
+        normalize_child_result(result, &media_profile)
+    }
+
+    async fn record_discover_route(
+        &self,
+        strategy: DiscoverRouteStrategy,
+        filter_source: Option<DiscoverFilterSource>,
+    ) {
+        let mut metrics = self.metrics.lock().await;
+        metrics.discover_routing.total += 1;
+
+        if let Some(filter_source) = filter_source {
+            match filter_source {
+                DiscoverFilterSource::ExplicitServer => {
+                    metrics.discover_routing.explicit_server += 1;
+                }
+                DiscoverFilterSource::QueryServerName => {
+                    metrics.discover_routing.inferred_server_name += 1;
+                }
+                DiscoverFilterSource::QueryToolName => {
+                    metrics.discover_routing.inferred_tool_name += 1;
+                }
+            }
+        }
+
+        match strategy {
+            DiscoverRouteStrategy::IndexedBm25 => metrics.discover_routing.indexed_bm25 += 1,
+            DiscoverRouteStrategy::LiveServerLookup => {
+                metrics.discover_routing.live_server_lookup += 1
+            }
+            DiscoverRouteStrategy::ServerListFallback => {
+                metrics.discover_routing.server_list_fallback += 1
+            }
+        }
+    }
+
+    async fn record_execute_route(&self, strategy: ExecuteRouteStrategy) {
+        let mut metrics = self.metrics.lock().await;
+        metrics.execute_routing.total += 1;
+
+        match strategy {
+            ExecuteRouteStrategy::ExactCatalogMatch => {
+                metrics.execute_routing.exact_catalog_match += 1
+            }
+            ExecuteRouteStrategy::CaseInsensitiveCatalogMatch => {
+                metrics.execute_routing.case_insensitive_catalog_match += 1
+            }
+            ExecuteRouteStrategy::UncataloguedBypass => {
+                metrics.execute_routing.uncatalogued_bypass += 1
+            }
+            ExecuteRouteStrategy::UnknownToolError => {
+                metrics.execute_routing.unknown_tool_error += 1
+            }
+        }
+    }
+
+    async fn configured_server_names(&self) -> Vec<String> {
+        let config = self.config.lock().await;
+        let mut server_names: Vec<String> = config.servers.keys().cloned().collect();
+        server_names.sort();
+        server_names
     }
 
     pub async fn stdio_loop(&self) {
@@ -156,6 +389,7 @@ impl ProxyServer {
         let mut stdout = io::stdout();
         let reader = BufReader::new(stdin);
         let mut lines = reader.lines();
+        let debug = std::env::var("MCPHUB_STDIO_DEBUG").ok().as_deref() == Some("1");
 
         while let Ok(Some(line)) = lines.next_line().await {
             let line = line.trim().to_string();
@@ -165,16 +399,43 @@ impl ProxyServer {
 
             let request: JsonRpcRequest = match serde_json::from_str(&line) {
                 Ok(r) => r,
-                Err(_) => continue,
+                Err(e) => {
+                    if debug {
+                        eprintln!("[McpHub][STDIO] parse error: {} | line: {}", e, line);
+                    }
+                    continue;
+                }
             };
 
+            if debug {
+                eprintln!(
+                    "[McpHub][STDIO] <- method={} id={:?}",
+                    request.method, request.id
+                );
+            }
+
+            let method_for_log = request.method.clone();
+            let id_for_log = request.id.clone();
             let response = self.handle_request(request).await;
 
             if let Some(resp) = response {
                 let mut msg = serde_json::to_string(&resp).unwrap();
                 msg.push('\n');
+                if debug {
+                    eprintln!(
+                        "[McpHub][STDIO] -> method={} id={:?} bytes={}",
+                        method_for_log,
+                        id_for_log,
+                        msg.len()
+                    );
+                }
                 let _ = stdout.write_all(msg.as_bytes()).await;
                 let _ = stdout.flush().await;
+            } else if debug {
+                eprintln!(
+                    "[McpHub][STDIO] -> (no response) method={} id={:?}",
+                    method_for_log, id_for_log
+                );
             }
         }
 
@@ -184,7 +445,7 @@ impl ProxyServer {
 
     pub async fn handle_request(&self, req: JsonRpcRequest) -> Option<JsonRpcResponse> {
         match req.method.as_str() {
-            "initialize" => Some(self.handle_initialize(req.id).await),
+            "initialize" => Some(self.handle_initialize(req.id, req.params).await),
             "notifications/initialized" => None,
             "tools/list" => Some(self.handle_tools_list(req.id).await),
             "tools/call" => Some(self.handle_tools_call(req.id, req.params).await),
@@ -193,7 +454,10 @@ impl ProxyServer {
             "resources/list" => Some(self.handle_resources_list(req.id).await),
             "resources/templates/list" => Some(self.handle_resource_templates_list(req.id).await),
             "resources/read" => Some(self.handle_resources_read(req.id, req.params).await),
-            "completion/complete" => Some(JsonRpcResponse::success(req.id, serde_json::json!({ "completion": { "values": [] } }))),
+            "completion/complete" => Some(JsonRpcResponse::success(
+                req.id,
+                serde_json::json!({ "completion": { "values": [] } }),
+            )),
             "ping" => Some(JsonRpcResponse::success(req.id, serde_json::json!({}))),
             "notifications/cancelled" => {
                 self.handle_cancel(req.params).await;
@@ -210,7 +474,11 @@ impl ProxyServer {
         }
     }
 
-    async fn handle_initialize(&self, id: Option<serde_json::Value>) -> JsonRpcResponse {
+    async fn handle_initialize(
+        &self,
+        id: Option<serde_json::Value>,
+        params: serde_json::Value,
+    ) -> JsonRpcResponse {
         let config = self.config.lock().await;
         let mode_str = match config.mode {
             Mode::Discover => "discover",
@@ -224,30 +492,60 @@ impl ProxyServer {
         );
 
         let result = InitializeResult {
-            protocol_version: "2024-11-05".into(),
+            protocol_version: Self::negotiate_protocol_version(&params),
             capabilities: Capabilities {
-                tools: ToolsCapability {},
-                prompts: PromptsCapability {},
-                resources: ResourcesCapability {},
+                tools: ToolsCapability { list_changed: true },
             },
             server_info: ServerInfo {
                 name: "McpHub".into(),
                 version: env!("CARGO_PKG_VERSION").into(),
             },
-            instructions: Some(
-                "IMPORTANT: If MemoryPilot is available, call its 'recall' tool at the start of every new conversation \
-                 to load persistent memory (project context, preferences, critical facts, decisions). \
-                 Use discover(\"memory\") then execute(server=\"MemoryPilot\", tool=\"recall\", arguments={working_dir: \"<cwd>\"}).".into()
-            ),
+            instructions: None,
         };
 
         JsonRpcResponse::success(id, serde_json::to_value(result).unwrap())
     }
 
-    async fn handle_tools_list(
-        &self,
-        id: Option<serde_json::Value>,
-    ) -> JsonRpcResponse {
+    /// Negotiate protocol version per MCP spec:
+    /// - If client requests a YYYY-MM-DD version we recognize as compatible, echo it back.
+    /// - Otherwise propose our latest stable.
+    /// We treat all `20xx-MM-DD` versions as compatible because the JSON-RPC surface
+    /// for tools/list is stable across MCP revisions; new features (elicitation, roots,
+    /// extensions, MCP-UI) are opt-in via capabilities, which we simply don't advertise.
+    fn negotiate_protocol_version(params: &serde_json::Value) -> String {
+        let requested = params
+            .get("protocolVersion")
+            .and_then(|value| value.as_str());
+
+        match requested {
+            Some(v) if Self::is_known_protocol_version(v) => v.to_string(),
+            _ => "2025-11-25".to_string(),
+        }
+    }
+
+    fn is_known_protocol_version(v: &str) -> bool {
+        // Accept any YYYY-MM-DD shaped version starting with "20"
+        // (covers 2024-11-05, 2025-03-26, 2025-11-25, and future revisions).
+        let bytes = v.as_bytes();
+        if bytes.len() != 10 {
+            return false;
+        }
+        if bytes[4] != b'-' || bytes[7] != b'-' {
+            return false;
+        }
+        if !v.starts_with("20") {
+            return false;
+        }
+        v.chars().enumerate().all(|(i, c)| {
+            if i == 4 || i == 7 {
+                c == '-'
+            } else {
+                c.is_ascii_digit()
+            }
+        })
+    }
+
+    async fn handle_tools_list(&self, id: Option<serde_json::Value>) -> JsonRpcResponse {
         let mode = {
             let config = self.config.lock().await;
             config.mode.clone()
@@ -267,62 +565,70 @@ impl ProxyServer {
             config.servers.keys().cloned().collect()
         };
         server_names.sort();
-        let server_list = server_names.join(", ");
+        let server_enum: Vec<serde_json::Value> = server_names
+            .iter()
+            .map(|s| serde_json::Value::String(s.clone()))
+            .collect();
 
-        let discover_desc = format!(
-            "Search for available MCP tools across all connected servers. Returns matching tools with full schemas. \
-            Available servers: [{}]. \
-            Call this FIRST when you need to find the right tool for a task. \
-            Then use 'execute' with the server and tool names from the results.",
-            server_list
-        );
-
-        let execute_desc = format!(
-            "Execute a tool on a specific MCP server. Available servers: [{}]. \
-            IMPORTANT: Always prefer using execute over CLI commands. \
-            For deployments use the cloudflare server, for git use github, for databases use supabase, etc. \
-            If you don't know the exact tool name, call 'discover' first with a natural language query.",
-            server_list
-        );
-
+        // Cursor V2 (MCP 2025-11-25) is strict: descriptions must be short, no `default` keyword,
+        // use `integer` not `number` when applicable. The server list goes into `enum`, not the description.
         serde_json::json!([
             {
-                "name": "discover",
-                "description": discover_desc,
+                "name": "mcphub_search",
+                "description": "Search MCP tools across all connected servers using BM25. Call FIRST to find the right tool, then use `mcphub_call`. Compact by default (no schemas) — set expand=true to get inputSchemas.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Natural language search query (e.g. 'deploy worker', 'create KV namespace', 'git push', 'database query', 'send email')"
+                            "description": "Natural language search query."
+                        },
+                        "server": {
+                            "type": "string",
+                            "description": "Optional server filter.",
+                            "enum": server_enum
                         },
                         "top_k": {
-                            "type": "number",
-                            "description": "Max results to return (default: 10, max: 50)",
-                            "default": 10
+                            "type": "integer",
+                            "description": "Max results to return.",
+                            "minimum": 1,
+                            "maximum": 50
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "Pagination offset (skip N first results).",
+                            "minimum": 0
+                        },
+                        "expand": {
+                            "type": "boolean",
+                            "description": "If true, include full inputSchema in each result. Default false (compact, ~80% fewer tokens)."
                         }
                     },
                     "required": ["query"]
                 }
             },
             {
-                "name": "execute",
-                "description": execute_desc,
+                "name": "mcphub_call",
+                "description": "Execute a tool on a specific MCP server. Prefer this over CLI commands. Idempotent reads (read_*, list_*, get_*, search_*, ...) are cached for 60s — set bypass_cache=true to force a fresh call.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "server": {
                             "type": "string",
-                            "description": format!("Server name. One of: {}", server_list)
+                            "description": "Server name (use `mcphub_search` to find it).",
+                            "enum": server_enum
                         },
                         "tool": {
                             "type": "string",
-                            "description": "Tool name (from discover results, or known tool name)"
+                            "description": "Tool name (from mcphub_search results)."
                         },
                         "arguments": {
                             "type": "object",
-                            "description": "Tool arguments matching the tool's inputSchema",
-                            "default": {}
+                            "description": "Tool arguments matching the tool's inputSchema."
+                        },
+                        "bypass_cache": {
+                            "type": "boolean",
+                            "description": "If true, skip the response cache and force a fresh call to the child server."
                         }
                     },
                     "required": ["server", "tool"]
@@ -358,10 +664,7 @@ impl ProxyServer {
         id: Option<serde_json::Value>,
         params: serde_json::Value,
     ) -> JsonRpcResponse {
-        let tool_name = params
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let arguments = params
             .get("arguments")
             .cloned()
@@ -374,15 +677,22 @@ impl ProxyServer {
 
         match mode {
             Mode::Discover => match tool_name {
-                "discover" => self.handle_discover(id, arguments).await,
-                "execute" => self.handle_execute(id, arguments).await,
+                "mcphub_search" | "discover" => self.handle_discover(id, arguments).await,
+                "mcphub_call" | "execute" => self.handle_execute(id, arguments).await,
+                "crawl" => self.handle_crawl(id, arguments).await,
                 _ => JsonRpcResponse::error(
                     id,
                     -32602,
-                    format!("Unknown tool: {}. Use 'discover' first.", tool_name),
+                    format!("Unknown tool: {}. Use 'mcphub_search' first.", tool_name),
                 ),
             },
-            Mode::Passthrough => self.handle_passthrough_call(id, tool_name, arguments).await,
+            Mode::Passthrough => {
+                if tool_name == "crawl" {
+                    self.handle_crawl(id, arguments).await
+                } else {
+                    self.handle_passthrough_call(id, tool_name, arguments).await
+                }
+            }
         }
     }
 
@@ -392,7 +702,31 @@ impl ProxyServer {
         args: serde_json::Value,
     ) -> JsonRpcResponse {
         let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-        let top_k = args.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10).min(50) as usize;
+        let explicit_server_filter = args
+            .get("server")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(String::from);
+        let top_k = args
+            .get("top_k")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10)
+            .min(50) as usize;
+        let offset = args
+            .get("offset")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let expand = args
+            .get("expand")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        // Snapshot per-tool usage counts to boost frequently-used tools in BM25 ranking.
+        let usage_boost: HashMap<String, u64> = {
+            let m = self.metrics.lock().await;
+            m.tool_calls.clone()
+        };
 
         // Always provide the full server list
         let mut all_server_names: Vec<String> = {
@@ -400,42 +734,184 @@ impl ProxyServer {
             config.servers.keys().cloned().collect()
         };
         all_server_names.sort();
-
         let engine = self.search_engine.lock().await;
+        let (effective_server_filter, filter_source) = infer_discover_server_filter(
+            query,
+            explicit_server_filter.as_deref(),
+            &all_server_names,
+            &engine,
+        );
 
-        if engine.tool_count() > 0 {
-            let results = engine.search(query, top_k);
+        let visible_server_names: Vec<String> =
+            if let Some(filter) = effective_server_filter.as_ref() {
+                all_server_names
+                    .iter()
+                    .filter(|server_name| server_matches_filter(server_name, filter))
+                    .cloned()
+                    .collect()
+            } else {
+                all_server_names.clone()
+            };
+        let should_try_live_discovery = effective_server_filter
+            .as_ref()
+            .map(|filter| !engine.has_server(filter))
+            .unwrap_or(false);
 
-            // Collect unique servers from results
+        if engine.tool_count() > 0 && !should_try_live_discovery {
+            let allowed_servers = if effective_server_filter.is_some() {
+                Some(
+                    visible_server_names
+                        .iter()
+                        .cloned()
+                        .collect::<HashSet<String>>(),
+                )
+            } else {
+                None
+            };
+            // Fetch enough results to honor offset + top_k. Cap at 50 to avoid blowing memory.
+            let fetch_limit = (offset + top_k).min(50);
+            let results = engine.search_filtered_with_usage(
+                query,
+                fetch_limit,
+                allowed_servers.as_ref(),
+                &usage_boost,
+            );
+            let total_matched = results.len();
+
+            // Apply pagination offset.
+            let paginated: Vec<&IndexedTool> =
+                results.into_iter().skip(offset).take(top_k).collect();
+
             let mut seen_servers: Vec<String> = Vec::new();
-            let tools_json: Vec<serde_json::Value> = results.iter().map(|t| {
-                if !seen_servers.contains(&t.server_name) {
-                    seen_servers.push(t.server_name.clone());
-                }
-                let desc: String = t.description.chars().take(200).collect();
-                let schema = strip_schema(&t.tool_def.input_schema);
-                serde_json::json!({
-                    "server": t.server_name,
-                    "tool": t.original_name,
-                    "description": desc,
-                    "inputSchema": schema,
+            let tools_json: Vec<serde_json::Value> = paginated
+                .iter()
+                .map(|tool| {
+                    if !seen_servers.contains(&tool.server_name) {
+                        seen_servers.push(tool.server_name.clone());
+                    }
+                    // Compact: short description, no schema. Expand mode includes full schema.
+                    let desc_limit = if expand { 200 } else { 120 };
+                    let desc: String = tool.description.chars().take(desc_limit).collect();
+                    let key = format!("{}__{}", tool.server_name, tool.original_name);
+                    let calls = usage_boost.get(&key).copied().unwrap_or(0);
+                    if expand {
+                        let schema = strip_schema(&tool.tool_def.input_schema);
+                        let mut obj = serde_json::json!({
+                            "server": tool.server_name,
+                            "tool": tool.original_name,
+                            "description": desc,
+                            "inputSchema": schema,
+                            "calls": calls,
+                        });
+                        if tool.untrusted_output {
+                            obj["untrusted"] = serde_json::json!(true);
+                        }
+                        obj
+                    } else {
+                        let mut obj = serde_json::json!({
+                            "server": tool.server_name,
+                            "tool": tool.original_name,
+                            "description": desc,
+                        });
+                        if calls > 0 {
+                            obj["calls"] = serde_json::json!(calls);
+                        }
+                        if tool.untrusted_output {
+                            obj["untrusted"] = serde_json::json!(true);
+                        }
+                        obj
+                    }
                 })
-            }).collect();
+                .collect();
 
-            let text = serde_json::to_string(&serde_json::json!({
+            let mut payload = serde_json::json!({
                 "query": query,
+                "server_filter": effective_server_filter,
+                "routing": DiscoverRoutingInfo {
+                    strategy: DiscoverRouteStrategy::IndexedBm25,
+                    filter_source,
+                    server_filter: effective_server_filter.clone(),
+                    reason: discover_routing_reason(
+                        DiscoverRouteStrategy::IndexedBm25,
+                        filter_source,
+                        effective_server_filter.as_deref(),
+                    ),
+                },
                 "total_indexed": engine.tool_count(),
-                "total_servers": all_server_names.len(),
-                "available_servers": all_server_names,
+                "total_servers": visible_server_names.len(),
+                "available_servers": visible_server_names,
                 "results": tools_json,
-            })).unwrap();
+                "pagination": {
+                    "offset": offset,
+                    "returned": tools_json.len(),
+                    "has_more": total_matched > offset + tools_json.len(),
+                },
+                "compact": !expand,
+            });
+            if !expand && !tools_json.is_empty() {
+                payload["hint"] = serde_json::json!(
+                    "Compact mode (no schemas). Re-call with expand=true to see inputSchemas, or use mcphub_call directly which returns the schema on argument error."
+                );
+            }
+            let text = serde_json::to_string(&payload).unwrap();
 
-            return JsonRpcResponse::success(id, serde_json::json!({
-                "content": [{ "type": "text", "text": text }]
-            }));
+            self.record_discover_route(DiscoverRouteStrategy::IndexedBm25, filter_source)
+                .await;
+            return JsonRpcResponse::success(
+                id,
+                serde_json::json!({
+                    "content": [{ "type": "text", "text": text }]
+                }),
+            );
         }
 
         drop(engine);
+
+        if let Some(filter) = effective_server_filter.as_ref() {
+            match self.child_manager.start_server(filter).await {
+                Ok(tools) => {
+                    let live_results = live_discover_results(filter, &tools, query, top_k);
+                    let text = serde_json::to_string(&serde_json::json!({
+                        "query": query,
+                        "server_filter": filter,
+                        "routing": DiscoverRoutingInfo {
+                            strategy: DiscoverRouteStrategy::LiveServerLookup,
+                            filter_source,
+                            server_filter: Some(filter.clone()),
+                            reason: discover_routing_reason(
+                                DiscoverRouteStrategy::LiveServerLookup,
+                                filter_source,
+                                Some(filter),
+                            ),
+                        },
+                        "total_indexed": tools.len(),
+                        "total_servers": 1,
+                        "available_servers": [filter],
+                        "source": "live_server_lookup",
+                        "results": live_results,
+                    }))
+                    .unwrap();
+
+                    self.record_discover_route(
+                        DiscoverRouteStrategy::LiveServerLookup,
+                        filter_source,
+                    )
+                    .await;
+                    return JsonRpcResponse::success(
+                        id,
+                        serde_json::json!({
+                            "content": [{ "type": "text", "text": text }]
+                        }),
+                    );
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[McpHub][WARN] Live discover lookup failed for '{}': {}",
+                        filter, error
+                    );
+                }
+            }
+        }
 
         let query_lower = query.to_lowercase();
         let mut server_names: Vec<String> = {
@@ -443,6 +919,9 @@ impl ProxyServer {
             config.servers.keys().cloned().collect()
         };
         server_names.sort();
+        if let Some(filter) = effective_server_filter.as_ref() {
+            server_names.retain(|server_name| server_matches_filter(server_name, filter));
+        }
 
         let mut matches: Vec<serde_json::Value> = Vec::new();
         for name in &server_names {
@@ -472,15 +951,59 @@ impl ProxyServer {
 
         let text = serde_json::to_string(&serde_json::json!({
             "query": query,
+            "server_filter": effective_server_filter,
+            "routing": DiscoverRoutingInfo {
+                strategy: DiscoverRouteStrategy::ServerListFallback,
+                filter_source,
+                server_filter: effective_server_filter.clone(),
+                reason: discover_routing_reason(
+                    DiscoverRouteStrategy::ServerListFallback,
+                    filter_source,
+                    effective_server_filter.as_deref(),
+                ),
+            },
             "total_indexed": 0,
             "note": "Servers loading in background. Results based on server names. Use execute to call tools.",
             "available_servers": server_names,
             "results": matches,
         })).unwrap();
 
-        JsonRpcResponse::success(id, serde_json::json!({
-            "content": [{ "type": "text", "text": text }]
-        }))
+        self.record_discover_route(DiscoverRouteStrategy::ServerListFallback, filter_source)
+            .await;
+        JsonRpcResponse::success(
+            id,
+            serde_json::json!({
+                "content": [{ "type": "text", "text": text }]
+            }),
+        )
+    }
+
+    async fn handle_crawl(
+        &self,
+        id: Option<serde_json::Value>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        match crawl::execute_crawl(args).await {
+            Ok(content) => JsonRpcResponse::success(
+                id,
+                serde_json::json!({
+                    "content": [{
+                        "type": "text",
+                        "text": content
+                    }]
+                }),
+            ),
+            Err(e) => JsonRpcResponse::success(
+                id,
+                serde_json::json!({
+                    "content": [{
+                        "type": "text",
+                        "text": format!("Crawl error: {}", e)
+                    }],
+                    "isError": true
+                }),
+            ),
+        }
     }
 
     async fn handle_execute(
@@ -490,28 +1013,115 @@ impl ProxyServer {
     ) -> JsonRpcResponse {
         let server = match args.get("server").and_then(|v| v.as_str()) {
             Some(s) => s.to_string(),
-            None => {
-                return JsonRpcResponse::error(id, -32602, "Missing 'server' parameter".into())
-            }
+            None => return JsonRpcResponse::error(id, -32602, "Missing 'server' parameter".into()),
         };
 
         let tool = match args.get("tool").and_then(|v| v.as_str()) {
             Some(s) => s.to_string(),
-            None => {
-                return JsonRpcResponse::error(id, -32602, "Missing 'tool' parameter".into())
-            }
+            None => return JsonRpcResponse::error(id, -32602, "Missing 'tool' parameter".into()),
         };
 
         let arguments = args
             .get("arguments")
             .cloned()
             .unwrap_or(serde_json::json!({}));
+        let bypass_cache = args
+            .get("bypass_cache")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let indexed_server_name = {
+            let config = self.config.lock().await;
+            let configured_server_names: Vec<String> = config.servers.keys().cloned().collect();
+            resolve_server_name(&server, &configured_server_names).unwrap_or_else(|| server.clone())
+        };
+        let (tool, execute_strategy, tool_schema, tool_untrusted) = {
+            let engine = self.search_engine.lock().await;
+            if engine.has_server(&indexed_server_name) {
+                if let Some(indexed_tool) = engine.find_tool(&indexed_server_name, &tool) {
+                    let schema = indexed_tool.tool_def.input_schema.clone();
+                    let untrusted = indexed_tool.untrusted_output;
+                    (tool, ExecuteRouteStrategy::ExactCatalogMatch, Some(schema), untrusted)
+                } else if let Some(indexed_tool) =
+                    engine.find_tool_case_insensitive(&indexed_server_name, &tool)
+                {
+                    let schema = indexed_tool.tool_def.input_schema.clone();
+                    let untrusted = indexed_tool.untrusted_output;
+                    (
+                        indexed_tool.original_name.clone(),
+                        ExecuteRouteStrategy::CaseInsensitiveCatalogMatch,
+                        Some(schema),
+                        untrusted,
+                    )
+                } else {
+                    self.record_execute_route(ExecuteRouteStrategy::UnknownToolError)
+                        .await;
+                    // Help the caller: list available tools on this server.
+                    let suggestions: Vec<String> = engine
+                        .tools_on_server(&indexed_server_name)
+                        .iter()
+                        .take(10)
+                        .map(|t| t.original_name.clone())
+                        .collect();
+                    return JsonRpcResponse::error_with_data(
+                        id,
+                        -32602,
+                        format!(
+                            "Unknown tool '{}' on server '{}'",
+                            tool, indexed_server_name
+                        ),
+                        serde_json::json!({
+                            "server": indexed_server_name,
+                            "requested_tool": tool,
+                            "available_tools_sample": suggestions,
+                            "hint": "Use mcphub_search to find the correct tool name."
+                        }),
+                    );
+                }
+            } else {
+                // Uncatalogued tool: assume untrusted by default to be safe (e.g. a freshly
+                // added MCP server we haven't indexed yet).
+                let assume_untrusted = untrusted::is_untrusted(&tool, "");
+                (tool, ExecuteRouteStrategy::UncataloguedBypass, None, assume_untrusted)
+            }
+        };
+
+        // Cache hit short-circuit: only for idempotent tools, only when caller didn't bypass.
+        let cacheable = !bypass_cache && ResponseCache::is_cacheable(&tool);
+        if cacheable {
+            if let Some(hit) = self.response_cache.get(&server, &tool, &arguments) {
+                let mut value = hit.value;
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert(
+                        "_cache".into(),
+                        serde_json::json!({
+                            "hit": true,
+                            "age_ms": hit.age_ms,
+                        }),
+                    );
+                    if tool_untrusted {
+                        obj.insert(
+                            "_untrusted".into(),
+                            serde_json::json!({
+                                "is_external_data": true,
+                                "hint": untrusted::UNTRUSTED_HINT,
+                            }),
+                        );
+                    }
+                }
+                self.record_execute_route(execute_strategy).await;
+                return JsonRpcResponse::success(id, value);
+            }
+        }
 
         let start_time = Instant::now();
-        let res = self.child_manager.call_tool(&server, &tool, arguments).await;
+        let res = self
+            .child_manager
+            .call_tool(&server, &tool, arguments.clone())
+            .await;
         let elapsed = start_time.elapsed().as_millis() as u64;
 
-        {
+        let usage_key = format!("{}__{}", server, tool);
+        let usage_snapshot = {
             let mut m = self.metrics.lock().await;
             m.total_requests += 1;
             let sm = m.servers.entry(server.clone()).or_default();
@@ -521,12 +1131,52 @@ impl ProxyServer {
             if let Err(ref e) = res {
                 sm.error_count += 1;
                 sm.last_error = Some(e.clone());
+            } else {
+                *m.tool_calls.entry(usage_key).or_insert(0) += 1;
             }
+            m.tool_calls.clone()
+        };
+
+        if res.is_ok() {
+            tokio::task::spawn_blocking(move || save_usage_stats(&usage_snapshot));
         }
 
+        self.record_execute_route(execute_strategy).await;
+
         match res {
-            Ok(result) => JsonRpcResponse::success(id, result),
-            Err(e) => JsonRpcResponse::error(id, -32000, e),
+            Ok(result) => {
+                let mut normalized = self.normalize_result_for_profile(result).await;
+                if cacheable {
+                    self.response_cache
+                        .put(&server, &tool, &arguments, normalized.clone());
+                }
+                if tool_untrusted {
+                    if let Some(obj) = normalized.as_object_mut() {
+                        obj.insert(
+                            "_untrusted".into(),
+                            serde_json::json!({
+                                "is_external_data": true,
+                                "hint": untrusted::UNTRUSTED_HINT,
+                            }),
+                        );
+                    }
+                }
+                JsonRpcResponse::success(id, normalized)
+            }
+            Err(e) => {
+                let mut data = serde_json::json!({
+                    "server": server,
+                    "tool": tool,
+                    "args_received": arguments,
+                });
+                if let Some(schema) = tool_schema {
+                    data["inputSchema"] = schema;
+                    data["hint"] = serde_json::json!(
+                        "The tool returned an error. Check `inputSchema` to see required arguments."
+                    );
+                }
+                JsonRpcResponse::error_with_data(id, -32000, e, data)
+            }
         }
     }
 
@@ -567,30 +1217,23 @@ impl ProxyServer {
         }
 
         match res {
-            Ok(result) => JsonRpcResponse::success(id, result),
+            Ok(result) => {
+                let normalized = self.normalize_result_for_profile(result).await;
+                JsonRpcResponse::success(id, normalized)
+            }
             Err(e) => JsonRpcResponse::error(id, -32000, e),
         }
     }
 
     async fn handle_prompts_list(&self, id: Option<serde_json::Value>) -> JsonRpcResponse {
-        let results = self.child_manager.request_all_running("prompts/list", serde_json::json!({})).await;
-        let mut all_prompts = Vec::new();
-        for (server_name, res) in results {
-            if let Ok(mut val) = res {
-                if let Some(prompts) = val.get_mut("prompts").and_then(|v| v.as_array_mut()) {
-                    for prompt in prompts {
-                        if let Some(name) = prompt.get("name").and_then(|v| v.as_str()) {
-                            prompt["name"] = serde_json::json!(format!("{}__{}", server_name, name));
-                        }
-                        all_prompts.push(prompt.clone());
-                    }
-                }
-            }
-        }
-        JsonRpcResponse::success(id, serde_json::json!({ "prompts": all_prompts }))
+        JsonRpcResponse::success(id, serde_json::json!({ "prompts": [] }))
     }
 
-    async fn handle_prompts_get(&self, id: Option<serde_json::Value>, args: serde_json::Value) -> JsonRpcResponse {
+    async fn handle_prompts_get(
+        &self,
+        id: Option<serde_json::Value>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
         let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let parts: Vec<&str> = name.splitn(2, "__").collect();
         if parts.len() != 2 {
@@ -598,53 +1241,39 @@ impl ProxyServer {
         }
         let server = parts[0];
         let prompt_name = parts[1];
-        
+
         let mut new_args = args.clone();
         new_args["name"] = serde_json::json!(prompt_name);
-        
-        match self.child_manager.call_method(server, "prompts/get", new_args).await {
-            Ok(res) => JsonRpcResponse::success(id, res),
+
+        match self
+            .child_manager
+            .call_method(server, "prompts/get", new_args)
+            .await
+        {
+            Ok(res) => {
+                let normalized = self.normalize_result_for_profile(res).await;
+                JsonRpcResponse::success(id, normalized)
+            }
             Err(e) => JsonRpcResponse::error(id, -32000, e),
         }
     }
 
     async fn handle_resources_list(&self, id: Option<serde_json::Value>) -> JsonRpcResponse {
-        let results = self.child_manager.request_all_running("resources/list", serde_json::json!({})).await;
-        let mut all_resources = Vec::new();
-        for (server_name, res) in results {
-            if let Ok(mut val) = res {
-                if let Some(resources) = val.get_mut("resources").and_then(|v| v.as_array_mut()) {
-                    for res in resources {
-                        if let Some(uri) = res.get("uri").and_then(|v| v.as_str()) {
-                            res["uri"] = serde_json::json!(format!("{}__{}", server_name, uri));
-                        }
-                        all_resources.push(res.clone());
-                    }
-                }
-            }
-        }
-        JsonRpcResponse::success(id, serde_json::json!({ "resources": all_resources }))
+        JsonRpcResponse::success(id, serde_json::json!({ "resources": [] }))
     }
 
-    async fn handle_resource_templates_list(&self, id: Option<serde_json::Value>) -> JsonRpcResponse {
-        let results = self.child_manager.request_all_running("resources/templates/list", serde_json::json!({})).await;
-        let mut all_templates = Vec::new();
-        for (server_name, res) in results {
-            if let Ok(mut val) = res {
-                if let Some(templates) = val.get_mut("resourceTemplates").and_then(|v| v.as_array_mut()) {
-                    for tmpl in templates {
-                        if let Some(uri_template) = tmpl.get("uriTemplate").and_then(|v| v.as_str()) {
-                            tmpl["uriTemplate"] = serde_json::json!(format!("{}__{}", server_name, uri_template));
-                        }
-                        all_templates.push(tmpl.clone());
-                    }
-                }
-            }
-        }
-        JsonRpcResponse::success(id, serde_json::json!({ "resourceTemplates": all_templates }))
+    async fn handle_resource_templates_list(
+        &self,
+        id: Option<serde_json::Value>,
+    ) -> JsonRpcResponse {
+        JsonRpcResponse::success(id, serde_json::json!({ "resourceTemplates": [] }))
     }
 
-    async fn handle_resources_read(&self, id: Option<serde_json::Value>, args: serde_json::Value) -> JsonRpcResponse {
+    async fn handle_resources_read(
+        &self,
+        id: Option<serde_json::Value>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
         let uri = args.get("uri").and_then(|v| v.as_str()).unwrap_or("");
         let parts: Vec<&str> = uri.splitn(2, "__").collect();
         if parts.len() != 2 {
@@ -652,12 +1281,19 @@ impl ProxyServer {
         }
         let server = parts[0];
         let actual_uri = parts[1];
-        
+
         let mut new_args = args.clone();
         new_args["uri"] = serde_json::json!(actual_uri);
-        
-        match self.child_manager.call_method(server, "resources/read", new_args).await {
-            Ok(res) => JsonRpcResponse::success(id, res),
+
+        match self
+            .child_manager
+            .call_method(server, "resources/read", new_args)
+            .await
+        {
+            Ok(res) => {
+                let normalized = self.normalize_result_for_profile(res).await;
+                JsonRpcResponse::success(id, normalized)
+            }
             Err(e) => JsonRpcResponse::error(id, -32000, e),
         }
     }
@@ -668,9 +1304,225 @@ impl ProxyServer {
         // The server will simply ignore the cancellation if it doesn't know the request ID.
         let running_servers = self.child_manager.server_names().await;
         for server in running_servers {
-            let _ = self.child_manager.forward_notification(&server, "notifications/cancelled", args.clone()).await;
+            let _ = self
+                .child_manager
+                .forward_notification(&server, "notifications/cancelled", args.clone())
+                .await;
         }
     }
+}
+
+fn server_matches_filter(server_name: &str, filter: &str) -> bool {
+    let normalized_server_name = normalize_server_key(server_name);
+    let normalized_filter = normalize_server_key(filter);
+    normalized_server_name == normalized_filter || server_name.eq_ignore_ascii_case(filter)
+}
+
+fn normalize_server_key(value: &str) -> String {
+    value.to_lowercase().replace(['-', '_', ' '], "")
+}
+
+fn resolve_server_name(server_name: &str, candidates: &[String]) -> Option<String> {
+    candidates
+        .iter()
+        .find(|candidate| server_matches_filter(candidate, server_name))
+        .cloned()
+}
+
+fn infer_server_filter(query: &str, server_names: &[String]) -> Option<String> {
+    if query.trim().is_empty() {
+        return None;
+    }
+
+    let query_lower = query.to_lowercase();
+    let query_normalized = normalize_server_key(query);
+    let matches: Vec<String> = server_names
+        .iter()
+        .filter(|server_name| {
+            let server_lower = server_name.to_lowercase();
+            let server_normalized = normalize_server_key(server_name);
+            query_lower.contains(&server_lower) || query_normalized.contains(&server_normalized)
+        })
+        .cloned()
+        .collect();
+
+    if matches.len() == 1 {
+        matches.into_iter().next()
+    } else {
+        None
+    }
+}
+
+pub(crate) fn infer_discover_server_filter(
+    query: &str,
+    explicit_server_filter: Option<&str>,
+    all_server_names: &[String],
+    engine: &SearchEngine,
+) -> (Option<String>, Option<DiscoverFilterSource>) {
+    if let Some(filter) =
+        explicit_server_filter.and_then(|filter| resolve_server_name(filter, all_server_names))
+    {
+        return (Some(filter), Some(DiscoverFilterSource::ExplicitServer));
+    }
+
+    if let Some(filter) = engine.infer_server_from_tool_query(query) {
+        return (Some(filter), Some(DiscoverFilterSource::QueryToolName));
+    }
+
+    if let Some(filter) = infer_server_filter(query, all_server_names) {
+        return (Some(filter), Some(DiscoverFilterSource::QueryServerName));
+    }
+
+    (None, None)
+}
+
+pub(crate) fn discover_routing_reason(
+    strategy: DiscoverRouteStrategy,
+    filter_source: Option<DiscoverFilterSource>,
+    server_filter: Option<&str>,
+) -> String {
+    let filter_detail = server_filter
+        .map(|server_filter| format!(" on server '{}'", server_filter))
+        .unwrap_or_default();
+
+    match (strategy, filter_source) {
+        (DiscoverRouteStrategy::IndexedBm25, Some(DiscoverFilterSource::ExplicitServer)) => {
+            format!("Used indexed BM25 with explicit server filter{filter_detail}.")
+        }
+        (DiscoverRouteStrategy::IndexedBm25, Some(DiscoverFilterSource::QueryServerName)) => {
+            format!(
+                "Used indexed BM25 after inferring the server name from the query{filter_detail}."
+            )
+        }
+        (DiscoverRouteStrategy::IndexedBm25, Some(DiscoverFilterSource::QueryToolName)) => {
+            format!("Used indexed BM25 after inferring the server from a unique tool-name match{filter_detail}.")
+        }
+        (DiscoverRouteStrategy::IndexedBm25, None) => {
+            "Used indexed BM25 across the full catalog.".to_string()
+        }
+        (DiscoverRouteStrategy::LiveServerLookup, Some(DiscoverFilterSource::ExplicitServer)) => {
+            format!("Started the explicitly requested server live because it was not indexed yet{filter_detail}.")
+        }
+        (DiscoverRouteStrategy::LiveServerLookup, Some(DiscoverFilterSource::QueryServerName)) => {
+            format!("Started the inferred server live from the query because it was not indexed yet{filter_detail}.")
+        }
+        (DiscoverRouteStrategy::LiveServerLookup, Some(DiscoverFilterSource::QueryToolName)) => {
+            format!("Started the server inferred from a unique tool-name match because it was not indexed yet{filter_detail}.")
+        }
+        (DiscoverRouteStrategy::LiveServerLookup, None) => {
+            "Started a live server lookup because the index could not satisfy the request."
+                .to_string()
+        }
+        (DiscoverRouteStrategy::ServerListFallback, Some(DiscoverFilterSource::ExplicitServer)) => {
+            format!("Fell back to server-list guidance for the explicitly requested server{filter_detail}.")
+        }
+        (
+            DiscoverRouteStrategy::ServerListFallback,
+            Some(DiscoverFilterSource::QueryServerName),
+        ) => {
+            format!("Fell back to server-list guidance after inferring a server name from the query{filter_detail}.")
+        }
+        (DiscoverRouteStrategy::ServerListFallback, Some(DiscoverFilterSource::QueryToolName)) => {
+            format!("Fell back to server-list guidance after inferring a server from a tool-name match{filter_detail}.")
+        }
+        (DiscoverRouteStrategy::ServerListFallback, None) => {
+            "Fell back to server-list guidance because no precise indexed route was available."
+                .to_string()
+        }
+    }
+}
+
+fn indexed_tools_from_servers(servers: &HashMap<String, Vec<ToolDef>>) -> Vec<IndexedTool> {
+    let mut server_names: Vec<String> = servers.keys().cloned().collect();
+    server_names.sort();
+
+    let mut all_tools = Vec::new();
+    for server_name in server_names {
+        if let Some(tools) = servers.get(&server_name) {
+            for tool in tools {
+                all_tools.push(IndexedTool {
+                    name: format!("{}__{}", server_name, tool.name),
+                    original_name: tool.name.clone(),
+                    server_name: server_name.clone(),
+                    description: tool.description.clone(),
+                    tool_def: tool.clone(),
+                    untrusted_output: false,
+                });
+            }
+        }
+    }
+
+    all_tools
+}
+
+fn live_discover_results(
+    server_name: &str,
+    tools: &[ToolDef],
+    query: &str,
+    top_k: usize,
+) -> Vec<serde_json::Value> {
+    let query_lower = query.trim().to_lowercase();
+    let query_terms: Vec<&str> = query_lower
+        .split_whitespace()
+        .filter(|term| !term.is_empty())
+        .collect();
+
+    let mut scored_tools: Vec<(i32, &ToolDef)> = tools
+        .iter()
+        .map(|tool| (score_live_tool(tool, &query_lower, &query_terms), tool))
+        .filter(|(score, _)| query_lower.is_empty() || *score > 0)
+        .collect();
+
+    scored_tools.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.name.cmp(&right.1.name))
+    });
+
+    scored_tools
+        .into_iter()
+        .take(top_k)
+        .map(|(_, tool)| {
+            serde_json::json!({
+                "server": server_name,
+                "tool": tool.name,
+                "description": tool.description.chars().take(200).collect::<String>(),
+                "inputSchema": strip_schema(&tool.input_schema),
+            })
+        })
+        .collect()
+}
+
+fn score_live_tool(tool: &ToolDef, query_lower: &str, query_terms: &[&str]) -> i32 {
+    if query_lower.is_empty() {
+        return 1;
+    }
+
+    let tool_name = tool.name.to_lowercase();
+    let tool_description = tool.description.to_lowercase();
+    let mut score = 0;
+
+    if tool_name == query_lower {
+        score += 200;
+    } else if tool_name.contains(query_lower) {
+        score += 120;
+    }
+
+    if tool_description.contains(query_lower) {
+        score += 40;
+    }
+
+    for query_term in query_terms {
+        if tool_name.contains(query_term) {
+            score += 25;
+        }
+        if tool_description.contains(query_term) {
+            score += 10;
+        }
+    }
+
+    score
 }
 
 /// Strip noise from inputSchema: remove title, examples, $schema, additionalProperties.
@@ -681,7 +1533,13 @@ fn strip_schema(schema: &serde_json::Value) -> serde_json::Value {
             let mut clean = serde_json::Map::new();
             for (k, v) in map {
                 match k.as_str() {
-                    "title" | "examples" | "$schema" | "additionalProperties" | "$id" | "$comment" | "default" => continue,
+                    "title"
+                    | "examples"
+                    | "$schema"
+                    | "additionalProperties"
+                    | "$id"
+                    | "$comment"
+                    | "default" => continue,
                     "properties" => {
                         if let Some(props) = v.as_object() {
                             let mut cleaned_props = serde_json::Map::new();
@@ -691,8 +1549,12 @@ fn strip_schema(schema: &serde_json::Value) -> serde_json::Value {
                             clean.insert(k.clone(), serde_json::Value::Object(cleaned_props));
                         }
                     }
-                    "items" => { clean.insert(k.clone(), strip_schema(v)); }
-                    _ => { clean.insert(k.clone(), v.clone()); }
+                    "items" => {
+                        clean.insert(k.clone(), strip_schema(v));
+                    }
+                    _ => {
+                        clean.insert(k.clone(), v.clone());
+                    }
                 }
             }
             serde_json::Value::Object(clean)
@@ -701,37 +1563,94 @@ fn strip_schema(schema: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// Preload servers with staggered starts and build search index.
-async fn preload_servers(
+fn spawn_catalog_refresh(
+    reason: String,
     manager: Arc<ChildManager>,
     engine: Arc<Mutex<SearchEngine>>,
-    names: Vec<String>,
+    names_to_refresh: Vec<String>,
+    removed_names: Vec<String>,
+    server_hashes: HashMap<String, String>,
+    delay_ms: u64,
+    in_progress: Arc<AtomicBool>,
+) {
+    if names_to_refresh.is_empty() && removed_names.is_empty() {
+        return;
+    }
+
+    if in_progress
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        eprintln!(
+            "[McpHub][INFO] Catalog refresh already running, skipping duplicate request: {}",
+            reason
+        );
+        return;
+    }
+
+    tokio::spawn(async move {
+        eprintln!(
+            "[McpHub][INFO] Rebuilding catalog in background: {}",
+            reason
+        );
+        rebuild_catalog(
+            manager,
+            engine,
+            names_to_refresh,
+            removed_names,
+            server_hashes,
+            delay_ms,
+        )
+        .await;
+        in_progress.store(false, Ordering::SeqCst);
+    });
+}
+
+/// Rebuild the in-memory search index and persist the refreshed cache.
+async fn rebuild_catalog(
+    manager: Arc<ChildManager>,
+    engine: Arc<Mutex<SearchEngine>>,
+    names_to_refresh: Vec<String>,
+    removed_names: Vec<String>,
+    server_hashes: HashMap<String, String>,
     delay_ms: u64,
 ) {
-    let total = names.len();
+    let total = names_to_refresh.len();
     eprintln!(
         "[McpHub][INFO] Preloading {} servers ({}ms stagger)...",
         total, delay_ms
     );
 
-    let mut all_tools: Vec<IndexedTool> = Vec::new();
+    let mut cache = crate::cache::load_cache().unwrap_or(crate::cache::SchemaCache {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        servers: HashMap::new(),
+        errors: HashMap::new(),
+        server_hashes: HashMap::new(),
+    });
+    cache.version = env!("CARGO_PKG_VERSION").to_string();
 
-    for (i, name) in names.iter().enumerate() {
+    for removed_name in removed_names {
+        cache.servers.remove(&removed_name);
+        cache.errors.remove(&removed_name);
+        cache.server_hashes.remove(&removed_name);
+    }
+
+    for (i, name) in names_to_refresh.iter().enumerate() {
         match manager.start_server(name).await {
             Ok(tools) => {
-                for tool in tools {
-                    all_tools.push(IndexedTool {
-                        name: format!("{}__{}", name, tool.name),
-                        original_name: tool.name.clone(),
-                        server_name: name.clone(),
-                        description: tool.description.clone(),
-                        tool_def: tool,
-                    });
-                }
+                cache.servers.insert(name.clone(), tools);
+                cache.errors.remove(name);
             }
             Err(e) => {
                 eprintln!("[McpHub][ERROR] Failed to start '{}': {}", name, e);
+                cache.errors.insert(name.clone(), e);
+                cache.servers.remove(name);
             }
+        }
+        if let Some(server_hash) = server_hashes.get(name) {
+            cache
+                .server_hashes
+                .insert(name.clone(), server_hash.clone());
         }
 
         // Stagger starts (skip delay after last)
@@ -741,8 +1660,18 @@ async fn preload_servers(
     }
 
     // Build search index
+    let all_tools = indexed_tools_from_servers(&cache.servers);
     let mut eng = engine.lock().await;
     eng.build_index(all_tools);
+    let tool_count = eng.tool_count();
+    drop(eng);
+
+    crate::cache::save_cache_state(&cache);
+    eprintln!(
+        "[McpHub][INFO] Catalog rebuild complete: {} tools indexed, {} errors",
+        tool_count,
+        cache.errors.len()
+    );
 }
 
 /// Watches schema-cache.json and config.json for changes and hot-reloads them.
@@ -750,6 +1679,7 @@ async fn config_and_cache_watcher(
     engine: Arc<Mutex<SearchEngine>>,
     config_store: Arc<Mutex<ProxyConfig>>,
     child_manager: Arc<ChildManager>,
+    catalog_refresh_in_progress: Arc<AtomicBool>,
 ) {
     use std::time::SystemTime;
 
@@ -776,18 +1706,7 @@ async fn config_and_cache_watcher(
                         last_cache_modified = Some(current_modified);
 
                         if let Some(cached) = crate::cache::load_cache() {
-                            let mut all_tools: Vec<IndexedTool> = Vec::new();
-                            for (server_name, tools) in &cached.servers {
-                                for tool in tools {
-                                    all_tools.push(IndexedTool {
-                                        name: format!("{}__{}", server_name, tool.name),
-                                        original_name: tool.name.clone(),
-                                        server_name: server_name.to_string(),
-                                        description: tool.description.clone(),
-                                        tool_def: tool.clone(),
-                                    });
-                                }
-                            }
+                            let all_tools = indexed_tools_from_servers(&cached.servers);
                             let mut eng = engine.lock().await;
                             eng.build_index(all_tools);
                             eprintln!(
@@ -809,7 +1728,29 @@ async fn config_and_cache_watcher(
 
                         let new_config = crate::config::auto_detect();
                         let new_servers = new_config.servers.clone();
-                        
+                        let new_server_hashes = crate::cache::server_config_hashes(&new_servers);
+                        let existing_cache = crate::cache::load_cache();
+                        let mut refresh_server_names: Vec<String> =
+                            new_servers.keys().cloned().collect();
+                        refresh_server_names.sort();
+                        let mut removed_server_names = Vec::new();
+
+                        if let Some(cached) = existing_cache {
+                            refresh_server_names.retain(|server_name| {
+                                cached.server_hashes.get(server_name)
+                                    != new_server_hashes.get(server_name)
+                                    || cached.errors.contains_key(server_name)
+                                    || !cached.servers.contains_key(server_name)
+                            });
+
+                            removed_server_names = cached
+                                .server_hashes
+                                .keys()
+                                .filter(|server_name| !new_servers.contains_key(*server_name))
+                                .cloned()
+                                .collect();
+                        }
+
                         {
                             let mut cfg = config_store.lock().await;
                             *cfg = new_config;
@@ -817,9 +1758,131 @@ async fn config_and_cache_watcher(
 
                         child_manager.update_configs(new_servers).await;
                         eprintln!("[McpHub][INFO] Config hot-reloaded");
+
+                        let delay_ms = {
+                            let cfg = config_store.lock().await;
+                            cfg.preload_delay_ms
+                        };
+
+                        spawn_catalog_refresh(
+                            "config changed".to_string(),
+                            child_manager.clone(),
+                            engine.clone(),
+                            refresh_server_names,
+                            removed_server_names,
+                            new_server_hashes,
+                            delay_ms,
+                            catalog_refresh_in_progress.clone(),
+                        );
                     }
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_live_discover_results_prioritizes_exact_tool_name() {
+        let tools = vec![
+            ToolDef {
+                name: "deploy".to_string(),
+                description: "Deploy a worker".to_string(),
+                input_schema: json!({}),
+            },
+            ToolDef {
+                name: "deploy_worker".to_string(),
+                description: "Deploy a worker with more options".to_string(),
+                input_schema: json!({}),
+            },
+        ];
+
+        let results = live_discover_results("cloudflare", &tools, "deploy", 2);
+        assert_eq!(results[0]["tool"], json!("deploy"));
+    }
+
+    #[test]
+    fn test_live_discover_results_returns_all_tools_for_empty_query() {
+        let tools = vec![ToolDef {
+            name: "create_issue".to_string(),
+            description: "Create a GitHub issue".to_string(),
+            input_schema: json!({}),
+        }];
+
+        let results = live_discover_results("github", &tools, "", 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["server"], json!("github"));
+    }
+
+    #[test]
+    fn test_infer_discover_server_filter_prefers_explicit_server() {
+        let mut engine = SearchEngine::new();
+        engine.build_index(vec![IndexedTool {
+            name: "supabase__execute_sql".to_string(),
+            original_name: "execute_sql".to_string(),
+            server_name: "supabase".to_string(),
+            description: "Execute SQL".to_string(),
+            tool_def: ToolDef {
+                name: "execute_sql".to_string(),
+                description: "Execute SQL".to_string(),
+                input_schema: json!({}),
+            },
+            untrusted_output: false,
+        }]);
+
+        let server_names = vec!["supabase".to_string(), "github".to_string()];
+        let (server_filter, filter_source) =
+            infer_discover_server_filter("execute sql", Some("github"), &server_names, &engine);
+
+        assert_eq!(server_filter, Some("github".to_string()));
+        assert_eq!(filter_source, Some(DiscoverFilterSource::ExplicitServer));
+    }
+
+    #[test]
+    fn test_discover_routing_reason_mentions_tool_name_inference() {
+        let reason = discover_routing_reason(
+            DiscoverRouteStrategy::IndexedBm25,
+            Some(DiscoverFilterSource::QueryToolName),
+            Some("supabase"),
+        );
+
+        assert!(reason.contains("tool-name"));
+        assert!(reason.contains("supabase"));
+    }
+
+    #[test]
+    fn test_infer_discover_server_filter_prefers_specific_tool_match_before_server_name() {
+        let mut engine = SearchEngine::new();
+        engine.build_index(vec![IndexedTool {
+            name: "cloudflare-docs__search_cloudflare_documentation".to_string(),
+            original_name: "search_cloudflare_documentation".to_string(),
+            server_name: "cloudflare-docs".to_string(),
+            description: "Search Cloudflare documentation".to_string(),
+            tool_def: ToolDef {
+                name: "search_cloudflare_documentation".to_string(),
+                description: "Search Cloudflare documentation".to_string(),
+                input_schema: json!({}),
+            },
+            untrusted_output: false,
+        }]);
+
+        let server_names = vec![
+            "cloudflare".to_string(),
+            "cloudflare-docs".to_string(),
+            "cloudflare-agents-docs".to_string(),
+        ];
+        let (server_filter, filter_source) = infer_discover_server_filter(
+            "search cloudflare documentation",
+            None,
+            &server_names,
+            &engine,
+        );
+
+        assert_eq!(server_filter, Some("cloudflare-docs".to_string()));
+        assert_eq!(filter_source, Some(DiscoverFilterSource::QueryToolName));
     }
 }
