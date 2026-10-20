@@ -1,24 +1,27 @@
 mod add;
+mod audit;
 mod benchmark;
 mod cache;
 pub mod child;
 mod config;
 mod crawl;
 mod dashboard;
+mod description_compressor;
 mod doctor;
 mod export;
 mod health;
 mod install;
 mod logs;
+mod permissions;
 mod protocol;
 mod proxy;
-mod description_compressor;
 mod redaction;
 mod response_cache;
 mod search;
 mod sse;
 mod untrusted;
 mod update;
+mod vault;
 
 use config::auto_detect;
 use proxy::ProxyServer;
@@ -49,6 +52,9 @@ USAGE:
   McpHub export --raw Export full configuration to stdout
   McpHub import       Import configuration from a file
   McpHub search "q"   Test BM25 search
+  McpHub vault        Secrets in the macOS Keychain (status, list, set, get, rm, migrate)
+  McpHub policy       Show tool permissions; 'policy test SERVER TOOL' to check one
+  McpHub audit        Show the audit log (--tail N, --server S, --tool T, --decision D, --json)
   McpHub update       Self-update to the latest version on GitHub
   McpHub version      Show version
   McpHub help         Show this help
@@ -319,6 +325,12 @@ async fn main() {
             let query = args.get(2).map(|s| s.as_str()).unwrap_or("*");
             cmd_search(query);
         }
+        Some("vault") => vault::run_cli(&args[2..]),
+        Some("policy") => {
+            let config = auto_detect();
+            permissions::run_cli(&args[2..], &config.permissions);
+        }
+        Some("audit") => audit::run_cli(&args[2..]),
         _ => {
             // Default: stdio proxy + HTTP server with SSE
             eprintln!("McpHub v{} — starting...", VERSION);

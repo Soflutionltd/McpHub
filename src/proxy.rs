@@ -8,10 +8,12 @@ use std::time::{Instant, SystemTime};
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
+use crate::audit::{AuditConfig, AuditEntry, AuditLogger};
 use crate::child::ChildManager;
 use crate::config::{Mode, ProxyConfig};
 use crate::crawl;
 use crate::health::HealthMonitor;
+use crate::permissions::{Action, ConfirmStore};
 use crate::protocol::*;
 use crate::response_cache::ResponseCache;
 use crate::search::{IndexedTool, SearchEngine};
@@ -67,7 +69,9 @@ impl GlobalMetrics {
 
 fn usage_stats_path() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    std::path::PathBuf::from(home).join(".McpHub").join("usage-stats.json")
+    std::path::PathBuf::from(home)
+        .join(".McpHub")
+        .join("usage-stats.json")
 }
 
 fn load_usage_stats() -> HashMap<String, u64> {
@@ -150,6 +154,19 @@ pub struct ProxyServer {
     pub metrics: Arc<Mutex<GlobalMetrics>>,
     catalog_refresh_in_progress: Arc<AtomicBool>,
     response_cache: Arc<ResponseCache>,
+    confirmations: Arc<ConfirmStore>,
+    audit: Arc<AuditLogger>,
+}
+
+/// Résultat du contrôle de permission avant un appel d'outil.
+enum PolicyGate {
+    /// L'appel peut partir. `decision` = "allow" ou "confirmed", `policy` = source de la règle.
+    Proceed {
+        decision: &'static str,
+        policy: String,
+    },
+    /// Réponse déjà prête (blocage ou demande de confirmation), à renvoyer telle quelle.
+    Respond(JsonRpcResponse),
 }
 
 impl ProxyServer {
@@ -167,6 +184,145 @@ impl ProxyServer {
             metrics: Arc::new(Mutex::new(GlobalMetrics::new())),
             catalog_refresh_in_progress: Arc::new(AtomicBool::new(false)),
             response_cache: Arc::new(ResponseCache::new()),
+            confirmations: Arc::new(ConfirmStore::new()),
+            audit: Arc::new(AuditLogger::new(crate::audit::default_path())),
+        }
+    }
+
+    async fn audit_config(&self) -> AuditConfig {
+        self.config.lock().await.audit.clone()
+    }
+
+    async fn record_audit(&self, entry: AuditEntry) {
+        let cfg = self.audit_config().await;
+        self.audit.record(&cfg, entry);
+    }
+
+    /// Applique les permissions (allow / confirm / deny) avant tout appel d'outil,
+    /// y compris quand la réponse viendrait du cache.
+    async fn policy_gate(
+        &self,
+        id: &Option<serde_json::Value>,
+        mode: &'static str,
+        server: &str,
+        tool: &str,
+        arguments: &serde_json::Value,
+        confirmation_token: Option<&str>,
+    ) -> PolicyGate {
+        let permissions = self.config.lock().await.permissions.clone();
+        let decision = permissions.decide(server, tool);
+        let base_entry = || AuditEntry {
+            server: server.to_string(),
+            tool: tool.to_string(),
+            mode,
+            policy: decision.source.clone(),
+            arguments: Some(arguments.clone()),
+            ..Default::default()
+        };
+        match decision.action {
+            Action::Allow => PolicyGate::Proceed {
+                decision: "allow",
+                policy: decision.source.clone(),
+            },
+            Action::Deny => {
+                self.record_audit(AuditEntry {
+                    decision: "deny",
+                    status: "blocked",
+                    ..base_entry()
+                })
+                .await;
+                let reason = decision
+                    .reason
+                    .clone()
+                    .map(|r| format!(" Raison : {}.", r))
+                    .unwrap_or_default();
+                PolicyGate::Respond(JsonRpcResponse::error_with_data(
+                    id.clone(),
+                    -32001,
+                    format!(
+                        "Bloque par la politique McpHub ({}) : {}/{} est interdit.{}",
+                        decision.source, server, tool, reason
+                    ),
+                    serde_json::json!({
+                        "server": server,
+                        "tool": tool,
+                        "policy": decision.source,
+                        "hint": "Cet appel est interdit par ~/.McpHub/config.json (settings.permissions). Ne pas reessayer : le signaler a l'utilisateur."
+                    }),
+                ))
+            }
+            Action::Confirm => {
+                let fp = crate::permissions::fingerprint(server, tool, arguments);
+                match confirmation_token {
+                    Some(token) if self.confirmations.consume(token, &fp) => PolicyGate::Proceed {
+                        decision: "confirmed",
+                        policy: decision.source.clone(),
+                    },
+                    Some(_) => {
+                        self.record_audit(AuditEntry {
+                            decision: "invalid_token",
+                            status: "blocked",
+                            ..base_entry()
+                        })
+                        .await;
+                        PolicyGate::Respond(JsonRpcResponse::error(
+                            id.clone(),
+                            -32001,
+                            "Jeton de confirmation invalide, expire, deja utilise, ou arguments differents de ceux confirmes. Refaire l'appel sans jeton pour en obtenir un nouveau, et redemander l'accord de l'utilisateur.".into(),
+                        ))
+                    }
+                    None => {
+                        let token = self.confirmations.issue(&fp, permissions.confirm_ttl_secs);
+                        self.record_audit(AuditEntry {
+                            decision: "confirm_requested",
+                            status: "pending",
+                            ..base_entry()
+                        })
+                        .await;
+                        let preview = crate::audit::safe_arguments(arguments);
+                        let reason = decision
+                            .reason
+                            .clone()
+                            .unwrap_or_else(|| "action sensible".into());
+                        let text = format!(
+                            "CONFIRMATION REQUISE par McpHub ({}, {}).\n\
+                             Appel : serveur `{}`, outil `{}`\n\
+                             Arguments : {}\n\n\
+                             Montre cet appel a l'utilisateur et demande-lui un accord explicite. \
+                             Seulement s'il accepte, rappelle le meme outil avec exactement les memes \
+                             serveur, outil et arguments, plus {}: \"{}\". \
+                             Le jeton est valable {} secondes et une seule fois. Ne confirme jamais a sa place.",
+                            decision.source,
+                            reason,
+                            server,
+                            tool,
+                            preview,
+                            if mode == "passthrough" {
+                                "l'argument `_mcphub_confirmation_token` (dans les arguments de l'outil)"
+                            } else {
+                                "le parametre `confirmation_token` de mcphub_call"
+                            },
+                            token,
+                            permissions.confirm_ttl_secs
+                        );
+                        PolicyGate::Respond(JsonRpcResponse::success(
+                            id.clone(),
+                            serde_json::json!({
+                                "content": [{ "type": "text", "text": text }],
+                                "isError": false,
+                                "_mcphub": {
+                                    "status": "confirmation_required",
+                                    "confirmation_token": token,
+                                    "expires_in_secs": permissions.confirm_ttl_secs,
+                                    "server": server,
+                                    "tool": tool,
+                                    "policy": decision.source,
+                                }
+                            }),
+                        ))
+                    }
+                }
+            }
         }
     }
 
@@ -629,6 +785,10 @@ impl ProxyServer {
                         "bypass_cache": {
                             "type": "boolean",
                             "description": "If true, skip the response cache and force a fresh call to the child server."
+                        },
+                        "confirmation_token": {
+                            "type": "string",
+                            "description": "Only when a previous call answered confirmation_required AND the user explicitly approved. Same server, tool and arguments."
                         }
                     },
                     "required": ["server", "tool"]
@@ -713,10 +873,7 @@ impl ProxyServer {
             .and_then(|v| v.as_u64())
             .unwrap_or(10)
             .min(50) as usize;
-        let offset = args
-            .get("offset")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let expand = args
             .get("expand")
             .and_then(|v| v.as_bool())
@@ -1040,7 +1197,12 @@ impl ProxyServer {
                 if let Some(indexed_tool) = engine.find_tool(&indexed_server_name, &tool) {
                     let schema = indexed_tool.tool_def.input_schema.clone();
                     let untrusted = indexed_tool.untrusted_output;
-                    (tool, ExecuteRouteStrategy::ExactCatalogMatch, Some(schema), untrusted)
+                    (
+                        tool,
+                        ExecuteRouteStrategy::ExactCatalogMatch,
+                        Some(schema),
+                        untrusted,
+                    )
                 } else if let Some(indexed_tool) =
                     engine.find_tool_case_insensitive(&indexed_server_name, &tool)
                 {
@@ -1081,8 +1243,42 @@ impl ProxyServer {
                 // Uncatalogued tool: assume untrusted by default to be safe (e.g. a freshly
                 // added MCP server we haven't indexed yet).
                 let assume_untrusted = untrusted::is_untrusted(&tool, "");
-                (tool, ExecuteRouteStrategy::UncataloguedBypass, None, assume_untrusted)
+                (
+                    tool,
+                    ExecuteRouteStrategy::UncataloguedBypass,
+                    None,
+                    assume_untrusted,
+                )
             }
+        };
+
+        // Permissions : appliquées avant le cache, pour qu'un outil bloqué le reste même en cache.
+        let confirmation_token = args
+            .get("confirmation_token")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let (gate_decision, gate_policy) = match self
+            .policy_gate(
+                &id,
+                "discover",
+                &indexed_server_name,
+                &tool,
+                &arguments,
+                confirmation_token.as_deref(),
+            )
+            .await
+        {
+            PolicyGate::Proceed { decision, policy } => (decision, policy),
+            PolicyGate::Respond(response) => return response,
+        };
+        let audit_base = AuditEntry {
+            server: indexed_server_name.clone(),
+            tool: tool.clone(),
+            mode: "discover",
+            decision: gate_decision,
+            policy: gate_policy,
+            arguments: Some(arguments.clone()),
+            ..Default::default()
         };
 
         // Cache hit short-circuit: only for idempotent tools, only when caller didn't bypass.
@@ -1109,6 +1305,12 @@ impl ProxyServer {
                     }
                 }
                 self.record_execute_route(execute_strategy).await;
+                self.record_audit(AuditEntry {
+                    status: "cache_hit",
+                    duration_ms: Some(0),
+                    ..audit_base.clone()
+                })
+                .await;
                 return JsonRpcResponse::success(id, value);
             }
         }
@@ -1142,6 +1344,13 @@ impl ProxyServer {
         }
 
         self.record_execute_route(execute_strategy).await;
+        self.record_audit(AuditEntry {
+            status: audit_status(&res),
+            duration_ms: Some(elapsed),
+            error: res.as_ref().err().cloned(),
+            ..audit_base
+        })
+        .await;
 
         match res {
             Ok(result) => {
@@ -1199,9 +1408,45 @@ impl ProxyServer {
         let server = parts[0];
         let tool = parts[1];
 
+        // En mode passthrough, le jeton de confirmation voyage dans un argument réservé,
+        // retiré avant l'envoi au serveur.
+        let mut arguments = arguments;
+        let confirmation_token = arguments
+            .as_object_mut()
+            .and_then(|obj| obj.remove("_mcphub_confirmation_token"))
+            .and_then(|v| v.as_str().map(String::from));
+        let (gate_decision, gate_policy) = match self
+            .policy_gate(
+                &id,
+                "passthrough",
+                server,
+                tool,
+                &arguments,
+                confirmation_token.as_deref(),
+            )
+            .await
+        {
+            PolicyGate::Proceed { decision, policy } => (decision, policy),
+            PolicyGate::Respond(response) => return response,
+        };
+        let audit_arguments = arguments.clone();
+
         let start_time = Instant::now();
         let res = self.child_manager.call_tool(server, tool, arguments).await;
         let elapsed = start_time.elapsed().as_millis() as u64;
+
+        self.record_audit(AuditEntry {
+            server: server.to_string(),
+            tool: tool.to_string(),
+            mode: "passthrough",
+            decision: gate_decision,
+            policy: gate_policy,
+            status: audit_status(&res),
+            duration_ms: Some(elapsed),
+            arguments: Some(audit_arguments),
+            error: res.as_ref().err().cloned(),
+        })
+        .await;
 
         {
             let mut m = self.metrics.lock().await;
@@ -1309,6 +1554,16 @@ impl ProxyServer {
                 .forward_notification(&server, "notifications/cancelled", args.clone())
                 .await;
         }
+    }
+}
+
+/// Statut d'audit : "error" si l'appel a échoué, "tool_error" si le serveur a répondu
+/// avec `isError: true`, sinon "ok".
+fn audit_status(res: &Result<serde_json::Value, String>) -> &'static str {
+    match res {
+        Err(_) => "error",
+        Ok(v) if v.get("isError").and_then(|b| b.as_bool()).unwrap_or(false) => "tool_error",
+        Ok(_) => "ok",
     }
 }
 

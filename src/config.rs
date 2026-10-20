@@ -39,6 +39,8 @@ pub struct ProxyConfig {
     pub health_check_interval_secs: u64,
     pub health_auto_restart: bool,
     pub health_notifications: bool,
+    pub permissions: crate::permissions::PermissionsConfig,
+    pub audit: crate::audit::AuditConfig,
 }
 
 impl Default for ProxyConfig {
@@ -54,6 +56,8 @@ impl Default for ProxyConfig {
             health_check_interval_secs: 30,
             health_auto_restart: true,
             health_notifications: true,
+            permissions: crate::permissions::PermissionsConfig::default(),
+            audit: crate::audit::AuditConfig::default(),
         }
     }
 }
@@ -86,10 +90,23 @@ fn is_self(name: &str, config: &Value) -> bool {
 
 static SECRETS_INIT: std::sync::Once = std::sync::Once::new();
 
-/// Charge ~/.mcphub/secrets.env (KEY=VALUE) dans l'environnement du process, une seule fois.
+/// Charge les secrets dans l'environnement du process, une seule fois.
+/// Ordre de priorité : environnement réel > Trousseau macOS (vault) > ~/.mcphub/secrets.env.
 /// Les variables déjà présentes dans l'environnement ne sont pas écrasées.
 fn load_secrets_env() {
     SECRETS_INIT.call_once(|| {
+        let (from_vault, missing) = crate::vault::load_into_env();
+        if from_vault > 0 || !missing.is_empty() {
+            eprintln!(
+                "[McpHub][INFO] Trousseau: {} secrets charges{}",
+                from_vault,
+                if missing.is_empty() {
+                    String::new()
+                } else {
+                    format!(", introuvables: {}", missing.join(", "))
+                }
+            );
+        }
         let home = match dirs::home_dir() {
             Some(h) => h,
             None => return,
@@ -140,7 +157,10 @@ fn expand_vars(input: &str) -> String {
             match std::env::var(var) {
                 Ok(val) => out.push_str(&val),
                 Err(_) => {
-                    eprintln!("[McpHub][WARN] variable ${{{}}} absente de secrets.env", var);
+                    eprintln!(
+                        "[McpHub][WARN] variable ${{{}}} absente de secrets.env",
+                        var
+                    );
                     out.push_str("${");
                     out.push_str(var);
                     out.push('}');
@@ -311,6 +331,12 @@ fn config_from_json(json: &Value, source_path: Option<&Path>) -> Option<ProxyCon
             if let Some(notify) = health.get("notifications").and_then(|v| v.as_bool()) {
                 config.health_notifications = notify;
             }
+        }
+        if let Some(permissions) = settings.get("permissions") {
+            config.permissions = crate::permissions::PermissionsConfig::from_json(permissions);
+        }
+        if let Some(audit) = settings.get("audit") {
+            config.audit = crate::audit::AuditConfig::from_json(audit);
         }
     }
     Some(config)
