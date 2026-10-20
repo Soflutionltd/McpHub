@@ -1257,11 +1257,19 @@ impl ProxyServer {
             .get("confirmation_token")
             .and_then(|v| v.as_str())
             .map(String::from);
+        // Le contrôle et l'appel portent sur le même nom canonique, celui que le
+        // gestionnaire de processus utilisera réellement (pas de contournement par la casse,
+        // les tirets ou les underscores).
+        let server = self
+            .child_manager
+            .resolve_name(&server)
+            .await
+            .unwrap_or(server);
         let (gate_decision, gate_policy) = match self
             .policy_gate(
                 &id,
                 "discover",
-                &indexed_server_name,
+                &server,
                 &tool,
                 &arguments,
                 confirmation_token.as_deref(),
@@ -1272,7 +1280,7 @@ impl ProxyServer {
             PolicyGate::Respond(response) => return response,
         };
         let audit_base = AuditEntry {
-            server: indexed_server_name.clone(),
+            server: server.clone(),
             tool: tool.clone(),
             mode: "discover",
             decision: gate_decision,
@@ -1405,7 +1413,12 @@ impl ProxyServer {
             );
         }
 
-        let server = parts[0];
+        let canonical_server = self
+            .child_manager
+            .resolve_name(parts[0])
+            .await
+            .unwrap_or_else(|| parts[0].to_string());
+        let server = canonical_server.as_str();
         let tool = parts[1];
 
         // En mode passthrough, le jeton de confirmation voyage dans un argument réservé,

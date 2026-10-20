@@ -98,7 +98,7 @@ fn save_names(names: &BTreeSet<String>) -> Result<(), String> {
         "note": "Noms des secrets stockes dans le Trousseau macOS. Aucune valeur ici.",
         "keys": names.iter().collect::<Vec<_>>(),
     });
-    let tmp = path.with_extension("json.tmp");
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
     fs::write(
         &tmp,
         serde_json::to_string_pretty(&json).unwrap_or_default(),
@@ -109,16 +109,36 @@ fn save_names(names: &BTreeSet<String>) -> Result<(), String> {
     Ok(())
 }
 
-fn add_name(name: &str) -> Result<(), String> {
+/// Lecture-modification-écriture de l'index sous verrou inter-processus.
+fn update_names(f: impl FnOnce(&mut BTreeSet<String>)) -> Result<(), String> {
+    let path = index_path().ok_or("dossier ~/.McpHub introuvable")?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path.with_extension("json.lock"))
+        .map_err(|e| e.to_string())?;
+    lock.lock().map_err(|e| e.to_string())?;
     let mut names: BTreeSet<String> = list_names().into_iter().collect();
-    names.insert(name.to_string());
-    save_names(&names)
+    f(&mut names);
+    let res = save_names(&names);
+    let _ = lock.unlock();
+    res
+}
+
+fn add_name(name: &str) -> Result<(), String> {
+    update_names(|names| {
+        names.insert(name.to_string());
+    })
 }
 
 fn remove_name(name: &str) -> Result<(), String> {
-    let mut names: BTreeSet<String> = list_names().into_iter().collect();
-    names.remove(name);
-    save_names(&names)
+    update_names(|names| {
+        names.remove(name);
+    })
 }
 
 #[cfg(unix)]
@@ -141,21 +161,72 @@ pub fn get(name: &str) -> Result<Option<String>, String> {
     if !is_valid_name(name) {
         return Err(format!("nom invalide: {}", name));
     }
+    // -g écrit la valeur sur stderr sous la forme `password: "texte"` ou, pour les
+    // caractères non ASCII, `password: 0xC3A9...  "..."` : on décode l'hexadécimal.
     let out = Command::new("/usr/bin/security")
-        .args(["find-generic-password", "-s", &service(), "-a", name, "-w"])
+        .args(["find-generic-password", "-s", &service(), "-a", name, "-g"])
         .args(keychain_args())
         .stdin(Stdio::null())
         .output()
         .map_err(|e| e.to_string())?;
     if !out.status.success() {
-        // Code 44 = élément introuvable.
-        return Ok(None);
+        // Code 44 = élément introuvable ; tout autre code est une vraie erreur
+        // (trousseau verrouillé, accès refusé...).
+        if out.status.code() == Some(44) {
+            return Ok(None);
+        }
+        return Err(format!(
+            "Trousseau: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
-    let mut value = String::from_utf8_lossy(&out.stdout).to_string();
-    if value.ends_with('\n') {
-        value.pop();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    match stderr
+        .lines()
+        .find_map(|l| l.strip_prefix("password: "))
+        .and_then(parse_password_line)
+    {
+        Some(value) => Ok(Some(value)),
+        None => Err("Trousseau: format de reponse inattendu".into()),
     }
-    Ok(Some(value))
+}
+
+/// Décode la ligne `password:` de `security -g`.
+fn parse_password_line(rest: &str) -> Option<String> {
+    let rest = rest.trim_end();
+    if let Some(hex) = rest.strip_prefix("0x") {
+        let hex: String = hex.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+        if hex.len() % 2 != 0 {
+            return None;
+        }
+        let bytes: Option<Vec<u8>> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+            .collect();
+        return bytes.map(|b| String::from_utf8_lossy(&b).to_string());
+    }
+    if rest.len() >= 2 && rest.starts_with('"') && rest.ends_with('"') {
+        return Some(rest[1..rest.len() - 1].to_string());
+    }
+    if rest.is_empty() {
+        return Some(String::new());
+    }
+    None
+}
+
+/// Met une valeur entre guillemets pour le mode interactif de `security`
+/// (le caractère `\` échappe le suivant).
+fn quote_for_security(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
 }
 
 pub fn set(name: &str, value: &str) -> Result<(), String> {
@@ -168,31 +239,47 @@ pub fn set(name: &str, value: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err("valeur vide".into());
     }
+    if value.contains('\n') || value.contains('\r') {
+        return Err("valeur sur plusieurs lignes non prise en charge".into());
+    }
+    // La commande passe par l'entrée standard de `security -i` : la valeur n'apparaît
+    // jamais dans les arguments du processus (invisible pour `ps`).
     // -U : met à jour l'élément s'il existe déjà.
-    let out = Command::new("/usr/bin/security")
-        .args([
-            "add-generic-password",
-            "-U",
-            "-s",
-            &service(),
-            "-a",
-            name,
-            "-l",
-            &format!("McpHub: {}", name),
-            "-w",
-            value,
-        ])
-        .args(keychain_args())
-        .stdin(Stdio::null())
-        .output()
+    let mut command = format!(
+        "add-generic-password -U -s {} -a {} -l {} -w {}",
+        quote_for_security(&service()),
+        quote_for_security(name),
+        quote_for_security(&format!("McpHub: {}", name)),
+        quote_for_security(value)
+    );
+    for k in keychain_args() {
+        command.push(' ');
+        command.push_str(&quote_for_security(&k));
+    }
+    command.push('\n');
+    let mut child = Command::new("/usr/bin/security")
+        .arg("-i")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        return Err(format!(
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(command.as_bytes())
+            .map_err(|e| e.to_string())?;
+    }
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    // `security -i` renvoie 0 même si la commande échoue : on vérifie en relisant.
+    match get(name) {
+        Ok(Some(read_back)) if read_back == value => add_name(name),
+        Ok(Some(_)) => Err("relecture differente apres ecriture".into()),
+        Ok(None) => Err(format!(
             "echec d'ecriture dans le Trousseau: {}",
             String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        )),
+        Err(e) => Err(e),
     }
-    add_name(name)
 }
 
 pub fn delete(name: &str) -> Result<bool, String> {
@@ -208,8 +295,16 @@ pub fn delete(name: &str) -> Result<bool, String> {
         .stdin(Stdio::null())
         .output()
         .map_err(|e| e.to_string())?;
+    let removed = out.status.success();
+    if !removed && out.status.code() != Some(44) {
+        // Erreur réelle : on garde le nom dans l'index pour ne pas perdre la trace de l'élément.
+        return Err(format!(
+            "suppression refusee par le Trousseau: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
     remove_name(name)?;
-    Ok(out.status.success())
+    Ok(removed)
 }
 
 /// Charge dans l'environnement du process les secrets du coffre dont la variable
@@ -526,6 +621,23 @@ mod tests {
                 ("D".into(), "quatre".into()),
             ]
         );
+    }
+
+    #[test]
+    fn parses_security_password_lines() {
+        assert_eq!(parse_password_line("\"abc123\""), Some("abc123".into()));
+        assert_eq!(
+            parse_password_line("0xC3A974C3A9E286926F6B  \"\\303\\251t\""),
+            Some("été→ok".into())
+        );
+        assert_eq!(parse_password_line("0xABC"), None);
+        assert_eq!(parse_password_line("garbage"), None);
+    }
+
+    #[test]
+    fn quotes_for_security_interactive_mode() {
+        assert_eq!(quote_for_security("a b"), "\"a b\"");
+        assert_eq!(quote_for_security("x\"y\\z"), "\"x\\\"y\\\\z\"");
     }
 
     #[test]

@@ -149,13 +149,37 @@ pub fn format_entry(cfg: &AuditConfig, e: &AuditEntry) -> String {
 }
 
 /// Arguments sans secrets, et tronqués s'ils sont trop longs.
+/// Deux passes : par nom de clé (api_key, token...), puis sur le contenu de chaque texte
+/// (un "Bearer ghp_..." ou "sk_live_..." caché dans un champ `body` ou `query`).
 pub fn safe_arguments(args: &Value) -> Value {
-    let redacted = crate::redaction::redact_json_value(args);
+    let redacted = redact_string_leaves(&crate::redaction::redact_json_value(args));
     let text = redacted.to_string();
     if text.chars().count() <= MAX_ARGS_CHARS {
         redacted
     } else {
         json!({ "_truncated": true, "preview": truncate(&text, MAX_ARGS_CHARS) })
+    }
+}
+
+fn redact_string_leaves(value: &Value) -> Value {
+    match value {
+        Value::String(s) => {
+            let redacted = crate::redaction::redact_text(s);
+            // redact_text recolle les mots avec un seul espace : ne garder sa version
+            // que si elle a réellement masqué quelque chose.
+            if redacted.contains("[REDACTED") {
+                Value::String(redacted)
+            } else {
+                Value::String(s.clone())
+            }
+        }
+        Value::Array(items) => Value::Array(items.iter().map(redact_string_leaves).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), redact_string_leaves(v)))
+                .collect(),
+        ),
+        other => other.clone(),
     }
 }
 
@@ -172,6 +196,15 @@ fn append_line(path: &PathBuf, line: &str, max: u64, keep: usize) -> std::io::Re
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    // Plusieurs processus McpHub (une fenêtre Cursor = un processus stdio, plus le daemon)
+    // écrivent le même fichier : verrou inter-processus pour la rotation et l'écriture.
+    let lock_path = path.with_extension("jsonl.lock");
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)?;
+    lock_file.lock()?;
     if let Ok(meta) = fs::metadata(path) {
         if meta.len() >= max {
             rotate(path, keep);
@@ -182,8 +215,13 @@ fn append_line(path: &PathBuf, line: &str, max: u64, keep: usize) -> std::io::Re
     if is_new {
         crate::vault::restrict_permissions(path);
     }
-    file.write_all(line.as_bytes())?;
-    file.write_all(b"\n")?;
+    // Une seule écriture : la ligne et son retour à la ligne ne peuvent pas être séparés.
+    let mut buf = String::with_capacity(line.len() + 1);
+    buf.push_str(line);
+    buf.push('\n');
+    file.write_all(buf.as_bytes())?;
+    drop(file);
+    let _ = lock_file.unlock();
     Ok(())
 }
 
@@ -318,6 +356,16 @@ mod tests {
         let safe = safe_arguments(&args);
         assert_eq!(safe["query"], "facture");
         assert!(safe["api_key"].as_str().unwrap().starts_with("[REDACTED"));
+
+        let hidden = json!({
+            "body": "Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz123456",
+            "text": "voici sk_live_abcdefghijklmnop merci",
+            "note": "facture   avril"
+        });
+        let safe = safe_arguments(&hidden);
+        assert!(!safe.to_string().contains("ghp_abcdefghijklmnop"));
+        assert!(!safe.to_string().contains("sk_live_abcdefghijklmnop"));
+        assert_eq!(safe["note"], "facture   avril");
 
         let big = json!({ "text": "x".repeat(10_000) });
         let safe = safe_arguments(&big);

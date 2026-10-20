@@ -73,7 +73,9 @@ impl ChildManager {
         *current_configs = new_configs;
     }
 
-    async fn resolve_name(&self, name: &str) -> Option<String> {
+    /// Nom canonique (clé de config) d'un serveur. Utilisé aussi par le proxy pour que
+    /// les permissions s'appliquent exactement au serveur qui sera appelé.
+    pub async fn resolve_name(&self, name: &str) -> Option<String> {
         let configs = self.configs.lock().await;
         if configs.contains_key(name) {
             return Some(name.to_string());

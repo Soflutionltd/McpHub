@@ -21,6 +21,12 @@
 //! - `*` est un joker ; la comparaison ignore la casse.
 //! - `autoClassify` : sans règle, un outil au nom destructeur (delete, remove, drop, purge...)
 //!   passe en `confirm` au lieu de la valeur `default`.
+//!
+//! LIMITE IMPORTANTE : `confirm` renvoie le jeton à l'agent IA, qui doit demander l'accord de
+//! l'utilisateur avant de rappeler l'outil. Cela protège contre les erreurs d'un agent honnête,
+//! pas contre un agent manipulé (injection de prompt) qui rappellerait tout seul. Pour ce qui
+//! est critique (suppression de dépôt, base de production, paiements), utiliser `deny`.
+//! Une validation hors bande (tableau de bord, notification macOS) est prévue plus tard.
 
 use serde_json::Value;
 use std::collections::HashMap;

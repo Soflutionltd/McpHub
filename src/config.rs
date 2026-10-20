@@ -158,7 +158,7 @@ fn expand_vars(input: &str) -> String {
                 Ok(val) => out.push_str(&val),
                 Err(_) => {
                     eprintln!(
-                        "[McpHub][WARN] variable ${{{}}} absente de secrets.env",
+                        "[McpHub][WARN] variable ${{{}}} introuvable (Trousseau et secrets.env)",
                         var
                     );
                     out.push_str("${");
