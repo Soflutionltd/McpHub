@@ -14,6 +14,9 @@ pub struct ServerConfig {
     pub request_timeout_secs: Option<u64>,
     /// Isolation macOS (sandbox-exec), None = sans isolation.
     pub sandbox: Option<crate::sandbox::SandboxSpec>,
+    /// Variables du démon explicitement transmises à ce serveur (`inheritEnv`). Par défaut un
+    /// serveur ne reçoit que l'environnement système de base et son propre `env`.
+    pub inherit_env: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -253,6 +256,11 @@ fn parse_servers(json: &Value) -> HashMap<String, ServerConfig> {
                     pool,
                     request_timeout_secs,
                     sandbox,
+                    inherit_env: config
+                        .get("inheritEnv")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                        .unwrap_or_default(),
                 },
             );
         }

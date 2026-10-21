@@ -31,6 +31,34 @@ struct ServerPool {
     next_idx: AtomicUsize,
 }
 
+/// Variables système transmises à tous les serveurs.
+const BASE_ENV: &[&str] = &[
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
+    "TERM", "__CF_USER_TEXT_ENCODING", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy",
+    "https_proxy", "no_proxy", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE",
+];
+
+fn base_child_env(unsandboxed: bool, inherit: &[String]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for k in BASE_ENV {
+        if let Ok(v) = std::env::var(k) {
+            out.push((k.to_string(), v));
+        }
+    }
+    // L'agent SSH permet de signer avec les clés : réservé aux serveurs non isolés.
+    if unsandboxed {
+        if let Ok(v) = std::env::var("SSH_AUTH_SOCK") {
+            out.push(("SSH_AUTH_SOCK".into(), v));
+        }
+    }
+    for k in inherit {
+        if let Ok(v) = std::env::var(k) {
+            out.push((k.clone(), v));
+        }
+    }
+    out
+}
+
 /// Version de protocole proposée aux serveurs enfants (ils répondent avec la leur).
 const CHILD_PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -228,6 +256,13 @@ impl ChildManager {
                 .stdout(Stdio::piped())
                 .stderr(child_stderr(name));
 
+            // Environnement minimal : les secrets chargés dans le démon (Trousseau, plist) ne
+            // doivent jamais fuiter vers TOUS les serveurs. Chacun ne reçoit que la base système,
+            // ses propres variables (`env`) et celles qu'il demande nommément (`inheritEnv`).
+            cmd.env_clear();
+            for (k, v) in base_child_env(config.sandbox.is_none(), &config.inherit_env) {
+                cmd.env(k, v);
+            }
             for (k, v) in &config.env {
                 cmd.env(k, v);
             }
