@@ -321,6 +321,57 @@ impl ProxyServer {
             }
             Action::Confirm => {
                 let fp = crate::permissions::fingerprint(server, tool, arguments);
+                // Confirmation humaine d'abord : fenêtre macOS que l'agent ne peut pas valider.
+                if permissions.confirm_via_dialog && confirmation_token.is_none() {
+                    let reason = decision
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "action sensible".into());
+                    let origin = match current_profile() {
+                        Some(p) => format!("mode {}, profil {}", mode, p),
+                        None => format!("mode {}", mode),
+                    };
+                    let preview = crate::audit::safe_arguments(arguments);
+                    let preview = serde_json::to_string_pretty(&preview).unwrap_or_default();
+                    let message =
+                        crate::confirm_dialog::build_message(server, tool, &reason, &preview, &origin);
+                    match crate::confirm_dialog::ask(message, permissions.dialog_timeout_secs).await {
+                        crate::confirm_dialog::DialogAnswer::Allow => {
+                            return PolicyGate::Proceed {
+                                decision: "confirmed_human",
+                                policy: decision.source.clone(),
+                            };
+                        }
+                        answer @ (crate::confirm_dialog::DialogAnswer::Deny
+                        | crate::confirm_dialog::DialogAnswer::Timeout) => {
+                            let timeout = answer == crate::confirm_dialog::DialogAnswer::Timeout;
+                            self.record_audit(AuditEntry {
+                                decision: if timeout { "human_timeout" } else { "human_denied" },
+                                status: "blocked",
+                                ..base_entry()
+                            })
+                            .await;
+                            return PolicyGate::Respond(JsonRpcResponse::error_with_data(
+                                id.clone(),
+                                -32001,
+                                if timeout {
+                                    format!("Pas de reponse de l'utilisateur dans la fenetre de confirmation McpHub : {}/{} non execute.", server, tool)
+                                } else {
+                                    format!("L'utilisateur a refuse {}/{} dans la fenetre de confirmation McpHub.", server, tool)
+                                },
+                                serde_json::json!({
+                                    "server": server,
+                                    "tool": tool,
+                                    "policy": decision.source,
+                                    "hint": "Ne pas reessayer automatiquement : demander a l'utilisateur ce qu'il souhaite."
+                                }),
+                            ));
+                        }
+                        crate::confirm_dialog::DialogAnswer::Unavailable => {
+                            // Pas d'écran (session sans interface) : repli sur le jeton ci-dessous.
+                        }
+                    }
+                }
                 match confirmation_token {
                     Some(token) if self.confirmations.consume(token, &fp) => PolicyGate::Proceed {
                         decision: "confirmed",

@@ -4,6 +4,7 @@ mod benchmark;
 mod cache;
 pub mod child;
 mod config;
+mod confirm_dialog;
 mod crawl;
 mod dashboard;
 mod description_compressor;

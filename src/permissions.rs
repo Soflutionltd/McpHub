@@ -73,6 +73,10 @@ pub struct PermissionsConfig {
     pub auto_classify: bool,
     pub confirm_ttl_secs: u64,
     pub rules: Vec<Rule>,
+    /// `confirm` = fenêtre macOS (seul un humain peut cliquer) ; repli sur le jeton
+    /// si aucune interface graphique n'est disponible. `confirmVia: "token"` pour forcer le jeton.
+    pub confirm_via_dialog: bool,
+    pub dialog_timeout_secs: u64,
 }
 
 impl Default for PermissionsConfig {
@@ -82,6 +86,8 @@ impl Default for PermissionsConfig {
             auto_classify: false,
             confirm_ttl_secs: 300,
             rules: Vec::new(),
+            confirm_via_dialog: true,
+            dialog_timeout_secs: 120,
         }
     }
 }
@@ -109,6 +115,12 @@ impl PermissionsConfig {
         }
         if let Some(t) = value.get("confirmTtlSecs").and_then(|v| v.as_u64()) {
             cfg.confirm_ttl_secs = t.clamp(30, 3600);
+        }
+        if let Some(v) = value.get("confirmVia").and_then(|v| v.as_str()) {
+            cfg.confirm_via_dialog = !v.eq_ignore_ascii_case("token");
+        }
+        if let Some(t) = value.get("dialogTimeoutSecs").and_then(|v| v.as_u64()) {
+            cfg.dialog_timeout_secs = t.clamp(10, 600);
         }
         if let Some(rules) = value.get("rules").and_then(|v| v.as_array()) {
             for (i, r) in rules.iter().enumerate() {
