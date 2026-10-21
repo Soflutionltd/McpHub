@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" width="1600" height="900" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title>Defense in depth</title>
+<defs>
+  <filter id="sh" x="-10%" y="-10%" width="120%" height="140%">
+    <feDropShadow dx="0" dy="10" stdDeviation="18" flood-color="#0F172A" flood-opacity="0.08"/>
+  </filter>
+  <filter id="sh2" x="-10%" y="-10%" width="120%" height="140%">
+    <feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#0F172A" flood-opacity="0.06"/>
+  </filter>
+  <pattern id="dots" width="28" height="28" patternUnits="userSpaceOnUse">
+    <circle cx="2" cy="2" r="1.4" fill="#E2E8F0"/>
+  </pattern>
+  <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+    <stop offset="0" stop-color="#FFE9A8" stop-opacity="0.9"/>
+    <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+  </radialGradient>
+  <radialGradient id="fade" cx="50%" cy="45%" r="70%">
+    <stop offset="0" stop-color="#fff" stop-opacity="1"/>
+    <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+  </radialGradient>
+  <mask id="dotmask"><rect width="100%" height="100%" fill="url(#fade)"/></mask>
+  <linearGradient id="amberbar" x1="0" x2="1">
+    <stop offset="0" stop-color="#FBBF24"/><stop offset="1" stop-color="#F59E0B"/>
+  </linearGradient>
+  <linearGradient id="redbar" x1="0" x2="1">
+    <stop offset="0" stop-color="#FCA5A5"/><stop offset="1" stop-color="#EF4444"/>
+  </linearGradient>
+  <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#94A3B8"/>
+  </marker>
+  
+</defs>
+<rect width="1600" height="900" fill="#FFFFFF"/>
+<rect width="1600" height="900" fill="#F8FAFC"/>
+<text x="800.0" y="74" font-size="42" font-weight="800" fill="#0F172A" text-anchor="middle" >Defense in depth</text>
+<text x="800.0" y="114" font-size="22" font-weight="400" fill="#475569" text-anchor="middle" >MCP servers are third-party code with your permissions. McpHub puts eight layers around them.</text>
+<rect x="80" y="160" width="700" height="150" rx="22" fill="#fff" stroke="#E2E8F0" filter="url(#sh)"/>
+<rect x="108" y="194" width="72" height="72" rx="20" fill="#2563EB" fill-opacity="0.12"/>
+<text x="144" y="242" font-size="32" font-weight="800" fill="#2563EB" text-anchor="middle" >1</text>
+<text x="208" y="218" font-size="25" font-weight="800" fill="#0F172A" text-anchor="start" >Locked local API</text>
+<text x="208" y="252" font-size="18" font-weight="400" fill="#475569" text-anchor="start" >Bearer token, Host and Origin checks, no CORS.</text>
+<text x="208" y="278" font-size="18" font-weight="400" fill="#475569" text-anchor="start" >Web pages cannot reach the hub.</text>
+<rect x="820" y="160" width="700" height="150" rx="22" fill="#fff" stroke="#E2E8F0" filter="url(#sh)"/>
+<rect x="848" y="194" width="72" height="72" rx="20" fill="#F5B301" fill-opacity="0.12"/>
+<text x="884" y="242" font-size="32" font-weight="800" fill="#F5B301" text-anchor="middle" >2</text>
+<text x="948" y="218" font-size="25" font-weight="800" fill="#0F172A" text-anchor="start" >Secrets in the Keychain</text>
+<text x="948" y="252" font-size="18" font-weight="400" fill="#475569" text-anchor="start" >Config files only hold ${NAME} references.</text>
+<text x="948" y="278" font-size="18" font-weight="400" fill="#475569" text-anchor="start" >No plain-text secrets on disk.</text>
+<rect x="80" y="336" width="700" height="150" rx="22" fill="#fff" stroke="#E2E8F0" filter="url(#sh)"/>
+<rect x="108" y="370" width="72" height="72" rx="20" fill="#0D9488" fill-opacity="0.12"/>
+<text x="144" y="418" font-size="32" font-weight="800" fill="#0D9488" text-anchor="middle" >3</text>
+<text x="208" y="394" font-size="25" font-weight="800" fill="#0F172A" text-anchor="start" >Minimal environment</text>
+<text x="208" y="428" font-size="18" font-weight="400" fill="#475569" text-anchor="start" >Each server only receives its own variables,</text>
+<text x="208" y="454" font-size="18" font-weight="400" fill="#475569" text-anchor="start" >never every secret of the daemon.</text>
+<rect x="820" y="336" width="700" height="150" rx="22" fill="#fff" stroke="#E2E8F0" filter="url(#sh)"/>
+<rect x="848" y="370" width="72" height="72" rx="20" fill="#7C3AED" fill-opacity="0.12"/>
+<text x="884" y="418" font-size="32" font-weight="800" fill="#7C3AED" text-anchor="middle" >4</text>
+<text x="948" y="394" font-size="25" font-weight="800" fill="#0F172A" text-anchor="start" >Tool pinning</text>
+<text x="948" y="428" font-size="18" font-weight="400" fill="#475569" text-anchor="start" >SHA-256 fingerprint of every tool definition.</text>
+<text x="948" y="454" font-size="18" font-weight="400" fill="#475569" text-anchor="start" >A silent change is quarantined.</text>
+<rect x="80" y="512" width="700" height="150" rx="22" fill="#fff" stroke="#E2E8F0" filter="url(#sh)"/>
+<rect x="108" y="546" width="72" height="72" rx="20" fill="#E11D48" fill-opacity="0.12"/>
+<text x="144" y="594" font-size="32" font-weight="800" fill="#E11D48" text-anchor="middle" >5</text>
+<text x="208" y="570" font-size="25" font-weight="800" fill="#0F172A" text-anchor="start" >Poisoning scan</text>
+<text x="208" y="604" font-size="18" font-weight="400" fill="#475569" text-anchor="start" >Invisible Unicode and injection phrases</text>
+<text x="208" y="630" font-size="18" font-weight="400" fill="#475569" text-anchor="start" >("ignore previous instructions") are blocked.</text>
+<rect x="820" y="512" width="700" height="150" rx="22" fill="#fff" stroke="#E2E8F0" filter="url(#sh)"/>
+<rect x="848" y="546" width="72" height="72" rx="20" fill="#16A34A" fill-opacity="0.12"/>
+<text x="884" y="594" font-size="32" font-weight="800" fill="#16A34A" text-anchor="middle" >6</text>
+<text x="948" y="570" font-size="25" font-weight="800" fill="#0F172A" text-anchor="start" >macOS sandbox</text>
+<text x="948" y="604" font-size="18" font-weight="400" fill="#475569" text-anchor="start" >No access to SSH keys, cloud tokens, browser</text>
+<text x="948" y="630" font-size="18" font-weight="400" fill="#475569" text-anchor="start" >cookies, shell profiles or LaunchAgents.</text>
+<rect x="80" y="688" width="700" height="150" rx="22" fill="#fff" stroke="#E2E8F0" filter="url(#sh)"/>
+<rect x="108" y="722" width="72" height="72" rx="20" fill="#EA580C" fill-opacity="0.12"/>
+<text x="144" y="770" font-size="32" font-weight="800" fill="#EA580C" text-anchor="middle" >7</text>
+<text x="208" y="746" font-size="25" font-weight="800" fill="#0F172A" text-anchor="start" >Permissions and profiles</text>
+<text x="208" y="780" font-size="18" font-weight="400" fill="#475569" text-anchor="start" >Allow or deny per server and tool, per client.</text>
+<text x="208" y="806" font-size="18" font-weight="400" fill="#475569" text-anchor="start" >Read-only modes in one line.</text>
+<rect x="820" y="688" width="700" height="150" rx="22" fill="#fff" stroke="#E2E8F0" filter="url(#sh)"/>
+<rect x="848" y="722" width="72" height="72" rx="20" fill="#475569" fill-opacity="0.12"/>
+<text x="884" y="770" font-size="32" font-weight="800" fill="#475569" text-anchor="middle" >8</text>
+<text x="948" y="746" font-size="25" font-weight="800" fill="#0F172A" text-anchor="start" >Audit trail</text>
+<text x="948" y="780" font-size="18" font-weight="400" fill="#475569" text-anchor="start" >Every call is logged with redacted arguments,</text>
+<text x="948" y="806" font-size="18" font-weight="400" fill="#475569" text-anchor="start" >duration and decision.</text>
+</svg>

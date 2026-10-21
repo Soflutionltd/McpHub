@@ -331,24 +331,26 @@ async function fetchServers(){
 }
 
 function renderAll(){
-  const active=servers.filter(s=>s.status==='cached').length;
-  const failed=servers.filter(s=>s.status!=='cached').length;
+  // Les serveurs désactivés ne sont ni actifs ni en échec.
+  const enabled=servers.filter(s=>!s.disabled);
+  const active=enabled.filter(s=>s.status==='cached').length;
+  const failed=enabled.filter(s=>s.status!=='cached').length;
   document.getElementById('online-count').textContent=active;
   document.getElementById('fail-count').textContent=failed;
   document.getElementById('fail-count').style.color=failed>0?'var(--danger)':'var(--ok)';
-  document.getElementById('stat-servers').textContent=servers.length;
+  document.getElementById('stat-servers').textContent=enabled.length;
   document.getElementById('stat-tools').textContent=totalTools;
-  // Token savings calculator: ~80 tokens per tool definition average
-  const TOKENS_PER_TOOL=80;
-  const DISCOVER_OVERHEAD=160; // 2 meta-tools
+  // Coût réel des définitions d'outils (taille JSON / 4), contre les 3 outils de McpHub.
+  const DISCOVER_OVERHEAD=920;
   const mode=settings.mode||'discover';
-  const passthroughCost=totalTools*TOKENS_PER_TOOL;
+  const passthroughCost=enabled.reduce((a,s)=>a+(s.schemaTokens||s.tools*80),0);
   const discoverCost=DISCOVER_OVERHEAD;
   if(mode==='discover'&&totalTools>0){
     const saved=passthroughCost-discoverCost;
     const pct=Math.round((saved/passthroughCost)*100);
-    document.getElementById('stat-tokens-saved').innerHTML=saved>1000?Math.round(saved/1000)+'<small>k</small>':saved.toString();
-    document.getElementById('stat-savings-pct').innerHTML=pct+'<small>%</small>';
+    document.getElementById('stat-tokens-saved').innerHTML=saved>=1e6?(saved/1e6).toFixed(2)+'<small>M</small>':saved>1000?Math.round(saved/1000)+'<small>k</small>':saved.toString();
+    const pctTxt=saved/passthroughCost>=0.999?'99.9':pct;
+    document.getElementById('stat-savings-pct').innerHTML=pctTxt+'<small>%</small>';
   }else if(mode==='passthrough'){
     document.getElementById('stat-tokens-saved').innerHTML='0';
     document.getElementById('stat-savings-pct').innerHTML='<small>passthrough</small>';
@@ -382,11 +384,13 @@ function renderGrid(){
           <div class="toggle-knob"></div>
         </label>
       </div>
-      <div class="card-meta">${s.status==='cached'
+      <div class="card-meta">${s.disabled
+        ?`<span style="color:var(--text-dim);font-size:11px">Disabled</span>`
+        :s.status==='cached'
         ?`<span>${s.tools} tools</span>`
         :`<span style="color:var(--danger);font-size:11px">${shortErr||'Not cached'}</span>`
       }</div>
-      ${s.status!=='cached'?'<div style="font-size:10px;color:var(--accent);margin-top:4px;cursor:pointer">🔧 Click to diagnose</div>':''}
+      ${s.status!=='cached'&&!s.disabled?'<div style="font-size:10px;color:var(--accent);margin-top:4px;cursor:pointer">🔧 Click to diagnose</div>':''}
       <div class="card-cat">${cat(s.name)}</div>
     </div>`}).join('');
 }

@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <title>McpHub</title>
+  <g fill="none" stroke="#1E1B4B" stroke-linecap="round">
+    <circle cx="256" cy="256" r="122" stroke-opacity=".18" stroke-width="2"/>
+    <circle cx="256" cy="256" r="92" stroke-opacity=".28" stroke-width="2"/>
+    <circle cx="256" cy="256" r="64" stroke-opacity=".38" stroke-width="2"/>
+    <polygon points="256.0,96.0 369.1,142.9 416.0,256.0 369.1,369.1 256.0,416.0 142.9,369.1 96.0,256.0 142.9,142.9" stroke-opacity=".45" stroke-width="3"/>
+    <polygon points="369.1,142.9 369.1,369.1 142.9,369.1 142.9,142.9" stroke-opacity=".25" stroke-width="2"/>
+    <polygon points="256.0,96.0 416.0,256.0 256.0,416.0 96.0,256.0" stroke-opacity=".15" stroke-width="2"/>
+    <g stroke-width="5" stroke-opacity=".85"><line x1="256" y1="256" x2="256.0" y2="96.0"/><line x1="256" y1="256" x2="369.1" y2="142.9"/><line x1="256" y1="256" x2="416.0" y2="256.0"/><line x1="256" y1="256" x2="369.1" y2="369.1"/><line x1="256" y1="256" x2="256.0" y2="416.0"/><line x1="256" y1="256" x2="142.9" y2="369.1"/><line x1="256" y1="256" x2="96.0" y2="256.0"/><line x1="256" y1="256" x2="142.9" y2="142.9"/></g>
+  </g>
+  <circle cx="256.0" cy="96.0" r="13" fill="#F5B301"/><circle cx="256.0" cy="96.0" r="5" fill="#FFF7DB"/><circle cx="369.1" cy="142.9" r="13" fill="#F5B301"/><circle cx="369.1" cy="142.9" r="5" fill="#FFF7DB"/><circle cx="416.0" cy="256.0" r="13" fill="#F5B301"/><circle cx="416.0" cy="256.0" r="5" fill="#FFF7DB"/><circle cx="369.1" cy="369.1" r="13" fill="#F5B301"/><circle cx="369.1" cy="369.1" r="5" fill="#FFF7DB"/><circle cx="256.0" cy="416.0" r="13" fill="#F5B301"/><circle cx="256.0" cy="416.0" r="5" fill="#FFF7DB"/><circle cx="142.9" cy="369.1" r="13" fill="#F5B301"/><circle cx="142.9" cy="369.1" r="5" fill="#FFF7DB"/><circle cx="96.0" cy="256.0" r="13" fill="#F5B301"/><circle cx="96.0" cy="256.0" r="5" fill="#FFF7DB"/><circle cx="142.9" cy="142.9" r="13" fill="#F5B301"/><circle cx="142.9" cy="142.9" r="5" fill="#FFF7DB"/>
+  <circle cx="256" cy="256" r="46" fill="#FFF3C4"/>
+  <circle cx="256" cy="256" r="32" fill="#FFE08A"/>
+  <circle cx="256" cy="256" r="18" fill="#F5B301"/>
+</svg>

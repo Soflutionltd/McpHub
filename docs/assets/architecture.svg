@@ -1,0 +1,165 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 860" width="1600" height="860" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title>How McpHub works</title>
+<defs>
+  <filter id="sh" x="-10%" y="-10%" width="120%" height="140%">
+    <feDropShadow dx="0" dy="10" stdDeviation="18" flood-color="#0F172A" flood-opacity="0.08"/>
+  </filter>
+  <filter id="sh2" x="-10%" y="-10%" width="120%" height="140%">
+    <feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#0F172A" flood-opacity="0.06"/>
+  </filter>
+  <pattern id="dots" width="28" height="28" patternUnits="userSpaceOnUse">
+    <circle cx="2" cy="2" r="1.4" fill="#E2E8F0"/>
+  </pattern>
+  <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+    <stop offset="0" stop-color="#FFE9A8" stop-opacity="0.9"/>
+    <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+  </radialGradient>
+  <radialGradient id="fade" cx="50%" cy="45%" r="70%">
+    <stop offset="0" stop-color="#fff" stop-opacity="1"/>
+    <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+  </radialGradient>
+  <mask id="dotmask"><rect width="100%" height="100%" fill="url(#fade)"/></mask>
+  <linearGradient id="amberbar" x1="0" x2="1">
+    <stop offset="0" stop-color="#FBBF24"/><stop offset="1" stop-color="#F59E0B"/>
+  </linearGradient>
+  <linearGradient id="redbar" x1="0" x2="1">
+    <stop offset="0" stop-color="#FCA5A5"/><stop offset="1" stop-color="#EF4444"/>
+  </linearGradient>
+  <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#94A3B8"/>
+  </marker>
+  
+</defs>
+<rect width="1600" height="860" fill="#FFFFFF"/>
+<rect width="1600" height="860" fill="#F8FAFC"/>
+<text x="800.0" y="64" font-size="40" font-weight="800" fill="#0F172A" text-anchor="middle" >How McpHub works</text>
+<text x="800.0" y="102" font-size="22" font-weight="400" fill="#475569" text-anchor="middle" >Every client connects once. Every call goes through the same guards.</text>
+<text x="80" y="168" font-size="16" font-weight="700" fill="#94A3B8" text-anchor="start" letter-spacing="2">AI CLIENTS</text>
+<rect x="60" y="190" width="330" height="96" rx="18" fill="#fff" stroke="#E2E8F0" filter="url(#sh2)"/>
+<rect x="80" y="216" width="44" height="44" rx="12" fill="#FFF7DB"/>
+<text x="102" y="246" font-size="22" font-weight="800" fill="#B45309" text-anchor="middle" >C</text>
+<text x="140" y="234" font-size="22" font-weight="700" fill="#0F172A" text-anchor="start" >Cursor</text>
+<text x="140" y="262" font-size="13.5" font-weight="500" fill="#94A3B8" text-anchor="start" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" >Streamable HTTP  /mcp/cursor</text>
+<rect x="60" y="306" width="330" height="96" rx="18" fill="#fff" stroke="#E2E8F0" filter="url(#sh2)"/>
+<rect x="80" y="332" width="44" height="44" rx="12" fill="#FFF7DB"/>
+<text x="102" y="362" font-size="22" font-weight="800" fill="#B45309" text-anchor="middle" >C</text>
+<text x="140" y="350" font-size="22" font-weight="700" fill="#0F172A" text-anchor="start" >Claude Desktop</text>
+<text x="140" y="378" font-size="13.5" font-weight="500" fill="#94A3B8" text-anchor="start" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" >Streamable HTTP  /mcp</text>
+<rect x="60" y="422" width="330" height="96" rx="18" fill="#fff" stroke="#E2E8F0" filter="url(#sh2)"/>
+<rect x="80" y="448" width="44" height="44" rx="12" fill="#FFF7DB"/>
+<text x="102" y="478" font-size="22" font-weight="800" fill="#B45309" text-anchor="middle" >C</text>
+<text x="140" y="466" font-size="22" font-weight="700" fill="#0F172A" text-anchor="start" >Claude Code</text>
+<text x="140" y="494" font-size="13.5" font-weight="500" fill="#94A3B8" text-anchor="start" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" >Streamable HTTP  /mcp</text>
+<rect x="60" y="538" width="330" height="96" rx="18" fill="#fff" stroke="#E2E8F0" filter="url(#sh2)"/>
+<rect x="80" y="564" width="44" height="44" rx="12" fill="#FFF7DB"/>
+<text x="102" y="594" font-size="22" font-weight="800" fill="#B45309" text-anchor="middle" >W</text>
+<text x="140" y="582" font-size="22" font-weight="700" fill="#0F172A" text-anchor="start" >Windsurf</text>
+<text x="140" y="610" font-size="13.5" font-weight="500" fill="#94A3B8" text-anchor="start" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" >SSE  /sse</text>
+<rect x="60" y="654" width="330" height="96" rx="18" fill="#fff" stroke="#E2E8F0" filter="url(#sh2)"/>
+<rect x="80" y="680" width="44" height="44" rx="12" fill="#FFF7DB"/>
+<text x="102" y="710" font-size="22" font-weight="800" fill="#B45309" text-anchor="middle" >V</text>
+<text x="140" y="698" font-size="22" font-weight="700" fill="#0F172A" text-anchor="start" >VS Code</text>
+<text x="140" y="726" font-size="13.5" font-weight="500" fill="#94A3B8" text-anchor="start" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" >stdio  McpHub stdio</text>
+<rect x="520" y="160" width="560" height="640" rx="28" fill="#fff" stroke="#E2E8F0" filter="url(#sh)"/>
+<rect x="520" y="160" width="560" height="96" rx="28" fill="#0F172A"/>
+<rect x="520" y="220" width="560" height="36" fill="#0F172A"/>
+<g transform="translate(544,174) scale(0.1328)">
+  <g fill="none" stroke="#1E1B4B" stroke-linecap="round">
+    <circle cx="256" cy="256" r="122" stroke-opacity=".18" stroke-width="2"/>
+    <circle cx="256" cy="256" r="92" stroke-opacity=".28" stroke-width="2"/>
+    <circle cx="256" cy="256" r="64" stroke-opacity=".38" stroke-width="2"/>
+    <polygon points="256.0,96.0 369.1,142.9 416.0,256.0 369.1,369.1 256.0,416.0 142.9,369.1 96.0,256.0 142.9,142.9" stroke-opacity=".45" stroke-width="3"/>
+    <polygon points="369.1,142.9 369.1,369.1 142.9,369.1 142.9,142.9" stroke-opacity=".22" stroke-width="2"/>
+    <polygon points="256.0,96.0 416.0,256.0 256.0,416.0 96.0,256.0" stroke-opacity=".14" stroke-width="2"/>
+    <g stroke-width="6" stroke-opacity=".8"><line x1="256" y1="256" x2="256.0" y2="96.0"/><line x1="256" y1="256" x2="369.1" y2="142.9"/><line x1="256" y1="256" x2="416.0" y2="256.0"/><line x1="256" y1="256" x2="369.1" y2="369.1"/><line x1="256" y1="256" x2="256.0" y2="416.0"/><line x1="256" y1="256" x2="142.9" y2="369.1"/><line x1="256" y1="256" x2="96.0" y2="256.0"/><line x1="256" y1="256" x2="142.9" y2="142.9"/></g>
+  </g>
+  <circle cx="256.0" cy="96.0" r="14" fill="#F5B301"/><circle cx="256.0" cy="96.0" r="5" fill="#FFF7DB"/><circle cx="369.1" cy="142.9" r="14" fill="#F5B301"/><circle cx="369.1" cy="142.9" r="5" fill="#FFF7DB"/><circle cx="416.0" cy="256.0" r="14" fill="#F5B301"/><circle cx="416.0" cy="256.0" r="5" fill="#FFF7DB"/><circle cx="369.1" cy="369.1" r="14" fill="#F5B301"/><circle cx="369.1" cy="369.1" r="5" fill="#FFF7DB"/><circle cx="256.0" cy="416.0" r="14" fill="#F5B301"/><circle cx="256.0" cy="416.0" r="5" fill="#FFF7DB"/><circle cx="142.9" cy="369.1" r="14" fill="#F5B301"/><circle cx="142.9" cy="369.1" r="5" fill="#FFF7DB"/><circle cx="96.0" cy="256.0" r="14" fill="#F5B301"/><circle cx="96.0" cy="256.0" r="5" fill="#FFF7DB"/><circle cx="142.9" cy="142.9" r="14" fill="#F5B301"/><circle cx="142.9" cy="142.9" r="5" fill="#FFF7DB"/>
+  <circle cx="256" cy="256" r="46" fill="#FFF3C4"/>
+  <circle cx="256" cy="256" r="32" fill="#FFE08A"/>
+  <circle cx="256" cy="256" r="18" fill="#F5B301"/>
+</g>
+<text x="628" y="212" font-size="30" font-weight="800"><tspan fill="#fff">Mcp</tspan><tspan fill="#F5B301">Hub</tspan></text>
+<text x="628" y="240" font-size="16" font-weight="500" fill="#CBD5E1" text-anchor="start" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" >daemon  ·  127.0.0.1:24680  ·  one process</text>
+<circle cx="572" cy="310" r="18" fill="#2563EB"/>
+<text x="572" y="317" font-size="18" font-weight="800" fill="#fff" text-anchor="middle" >1</text>
+<line x1="572" y1="330" x2="572" y2="362" stroke="#E2E8F0" stroke-width="3"/>
+<text x="608" y="308" font-size="21" font-weight="700" fill="#0F172A" text-anchor="start" >Authenticate</text>
+<text x="608" y="334" font-size="16" font-weight="400" fill="#475569" text-anchor="start" >Bearer token, Host and Origin checks</text>
+<circle cx="572" cy="382" r="18" fill="#7C3AED"/>
+<text x="572" y="389" font-size="18" font-weight="800" fill="#fff" text-anchor="middle" >2</text>
+<line x1="572" y1="402" x2="572" y2="434" stroke="#E2E8F0" stroke-width="3"/>
+<text x="608" y="380" font-size="21" font-weight="700" fill="#0F172A" text-anchor="start" >Apply the client profile</text>
+<text x="608" y="406" font-size="16" font-weight="400" fill="#475569" text-anchor="start" >Which servers and tools this client may see</text>
+<circle cx="572" cy="454" r="18" fill="#F5B301"/>
+<text x="572" y="461" font-size="18" font-weight="800" fill="#fff" text-anchor="middle" >3</text>
+<line x1="572" y1="474" x2="572" y2="506" stroke="#E2E8F0" stroke-width="3"/>
+<text x="608" y="452" font-size="21" font-weight="700" fill="#0F172A" text-anchor="start" >Discover</text>
+<text x="608" y="478" font-size="16" font-weight="400" fill="#475569" text-anchor="start" >BM25 search: the client only sees 3 tools</text>
+<circle cx="572" cy="526" r="18" fill="#E11D48"/>
+<text x="572" y="533" font-size="18" font-weight="800" fill="#fff" text-anchor="middle" >4</text>
+<line x1="572" y1="546" x2="572" y2="578" stroke="#E2E8F0" stroke-width="3"/>
+<text x="608" y="524" font-size="21" font-weight="700" fill="#0F172A" text-anchor="start" >Guard the tool</text>
+<text x="608" y="550" font-size="16" font-weight="400" fill="#475569" text-anchor="start" >SHA-256 pinning and poisoning scan</text>
+<circle cx="572" cy="598" r="18" fill="#16A34A"/>
+<text x="572" y="605" font-size="18" font-weight="800" fill="#fff" text-anchor="middle" >5</text>
+<line x1="572" y1="618" x2="572" y2="650" stroke="#E2E8F0" stroke-width="3"/>
+<text x="608" y="596" font-size="21" font-weight="700" fill="#0F172A" text-anchor="start" >Check permissions</text>
+<text x="608" y="622" font-size="16" font-weight="400" fill="#475569" text-anchor="start" >Allow / deny rules per server and tool</text>
+<circle cx="572" cy="670" r="18" fill="#0D9488"/>
+<text x="572" y="677" font-size="18" font-weight="800" fill="#fff" text-anchor="middle" >6</text>
+<line x1="572" y1="690" x2="572" y2="722" stroke="#E2E8F0" stroke-width="3"/>
+<text x="608" y="668" font-size="21" font-weight="700" fill="#0F172A" text-anchor="start" >Run code mode</text>
+<text x="608" y="694" font-size="16" font-weight="400" fill="#475569" text-anchor="start" >Sandboxed JavaScript chains many calls</text>
+<circle cx="572" cy="742" r="18" fill="#475569"/>
+<text x="572" y="749" font-size="18" font-weight="800" fill="#fff" text-anchor="middle" >7</text>
+<text x="608" y="740" font-size="21" font-weight="700" fill="#0F172A" text-anchor="start" >Write the audit log</text>
+<text x="608" y="766" font-size="16" font-weight="400" fill="#475569" text-anchor="start" >Every call, secrets redacted</text>
+<path d="M390,238 C455,238 455,480.0 514,480.0" fill="none" stroke="#CBD5E1" stroke-width="2.5" marker-end="url(#arrow)"/>
+<path d="M390,354 C455,354 455,480.0 514,480.0" fill="none" stroke="#CBD5E1" stroke-width="2.5" marker-end="url(#arrow)"/>
+<path d="M390,470 C455,470 455,480.0 514,480.0" fill="none" stroke="#CBD5E1" stroke-width="2.5" marker-end="url(#arrow)"/>
+<path d="M390,586 C455,586 455,480.0 514,480.0" fill="none" stroke="#CBD5E1" stroke-width="2.5" marker-end="url(#arrow)"/>
+<path d="M390,702 C455,702 455,480.0 514,480.0" fill="none" stroke="#CBD5E1" stroke-width="2.5" marker-end="url(#arrow)"/>
+<text x="1230" y="168" font-size="16" font-weight="700" fill="#94A3B8" text-anchor="start" letter-spacing="2">MCP SERVERS</text>
+<rect x="1210" y="190" width="330" height="270" rx="22" fill="#fff" stroke="#E2E8F0" filter="url(#sh)"/>
+<rect x="1210" y="190" width="8" height="270" rx="4" fill="#16A34A"/>
+<text x="1240" y="234" font-size="22" font-weight="800" fill="#0F172A" text-anchor="start" >Local servers</text>
+<text x="1240" y="260" font-size="15" font-weight="500" fill="#475569" text-anchor="start" >run under the macOS sandbox</text>
+<rect x="1240" y="288" width="106" height="34" rx="17" fill="#fff" stroke="#E2E8F0"/>
+<text x="1293.0" y="311" font-size="15" font-weight="600" fill="#0F172A" text-anchor="middle" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" >supabase</text>
+<rect x="1356" y="288" width="126" height="34" rx="17" fill="#fff" stroke="#E2E8F0"/>
+<text x="1419.0" y="311" font-size="15" font-weight="600" fill="#0F172A" text-anchor="middle" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" >xcodebuild</text>
+<rect x="1240" y="334" width="126" height="34" rx="17" fill="#fff" stroke="#E2E8F0"/>
+<text x="1303.0" y="357" font-size="15" font-weight="600" fill="#0F172A" text-anchor="middle" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" >playwright</text>
+<rect x="1376" y="334" width="106" height="34" rx="17" fill="#fff" stroke="#E2E8F0"/>
+<text x="1429.0" y="357" font-size="15" font-weight="600" fill="#0F172A" text-anchor="middle" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" >context7</text>
+<rect x="1240" y="380" width="116" height="34" rx="17" fill="#fff" stroke="#E2E8F0"/>
+<text x="1298.0" y="403" font-size="15" font-weight="600" fill="#0F172A" text-anchor="middle" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" >firecrawl</text>
+<rect x="1366" y="380" width="87" height="34" rx="17" fill="#fff" stroke="#E2E8F0"/>
+<text x="1409.5" y="403" font-size="15" font-weight="600" fill="#0F172A" text-anchor="middle" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" >memory</text>
+<rect x="1463" y="380" width="39" height="34" rx="17" fill="#fff" stroke="#E2E8F0"/>
+<text x="1482.5" y="403" font-size="15" font-weight="600" fill="#0F172A" text-anchor="middle" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" >x</text>
+<rect x="1240" y="426" width="106" height="34" rx="17" fill="#F8FAFC" stroke="#E2E8F0"/>
+<text x="1293.0" y="449" font-size="15" font-weight="600" fill="#94A3B8" text-anchor="middle" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" >+17 more</text>
+<path d="M1086,480.0 C1150,480.0 1140,325.0 1202,325.0" fill="none" stroke="#CBD5E1" stroke-width="2.5" marker-end="url(#arrow)"/>
+<rect x="1210" y="500" width="330" height="270" rx="22" fill="#fff" stroke="#E2E8F0" filter="url(#sh)"/>
+<rect x="1210" y="500" width="8" height="270" rx="4" fill="#2563EB"/>
+<text x="1240" y="544" font-size="22" font-weight="800" fill="#0F172A" text-anchor="start" >Remote servers</text>
+<text x="1240" y="570" font-size="15" font-weight="500" fill="#475569" text-anchor="start" >native HTTP, OAuth in the Keychain</text>
+<rect x="1240" y="598" width="87" height="34" rx="17" fill="#fff" stroke="#E2E8F0"/>
+<text x="1283.5" y="621" font-size="15" font-weight="600" fill="#0F172A" text-anchor="middle" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" >stripe</text>
+<rect x="1337" y="598" width="87" height="34" rx="17" fill="#fff" stroke="#E2E8F0"/>
+<text x="1380.5" y="621" font-size="15" font-weight="600" fill="#0F172A" text-anchor="middle" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" >sentry</text>
+<rect x="1240" y="644" width="126" height="34" rx="17" fill="#fff" stroke="#E2E8F0"/>
+<text x="1303.0" y="667" font-size="15" font-weight="600" fill="#0F172A" text-anchor="middle" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" >cloudflare</text>
+<rect x="1376" y="644" width="126" height="34" rx="17" fill="#fff" stroke="#E2E8F0"/>
+<text x="1439.0" y="667" font-size="15" font-weight="600" fill="#0F172A" text-anchor="middle" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" >revenuecat</text>
+<rect x="1240" y="690" width="126" height="34" rx="17" fill="#fff" stroke="#E2E8F0"/>
+<text x="1303.0" y="713" font-size="15" font-weight="600" fill="#0F172A" text-anchor="middle" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" >tiktok-ads</text>
+<rect x="1376" y="690" width="87" height="34" rx="17" fill="#fff" stroke="#E2E8F0"/>
+<text x="1419.5" y="713" font-size="15" font-weight="600" fill="#0F172A" text-anchor="middle" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" >mobbin</text>
+<rect x="1240" y="736" width="97" height="34" rx="17" fill="#F8FAFC" stroke="#E2E8F0"/>
+<text x="1288.5" y="759" font-size="15" font-weight="600" fill="#94A3B8" text-anchor="middle" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" >+5 more</text>
+<path d="M1086,480.0 C1150,480.0 1140,635.0 1202,635.0" fill="none" stroke="#CBD5E1" stroke-width="2.5" marker-end="url(#arrow)"/>
+<rect x="1210" y="790" width="330" height="46" rx="14" fill="#FFF7DB" stroke="#FDE68A"/>
+<text x="1375.0" y="820" font-size="17" font-weight="700" fill="#92400E" text-anchor="middle" >Secrets stay in the macOS Keychain</text>
+</svg>

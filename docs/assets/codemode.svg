@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 640" width="1600" height="640" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title>Code mode</title>
+<defs>
+  <filter id="sh" x="-10%" y="-10%" width="120%" height="140%">
+    <feDropShadow dx="0" dy="10" stdDeviation="18" flood-color="#0F172A" flood-opacity="0.08"/>
+  </filter>
+  <filter id="sh2" x="-10%" y="-10%" width="120%" height="140%">
+    <feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#0F172A" flood-opacity="0.06"/>
+  </filter>
+  <pattern id="dots" width="28" height="28" patternUnits="userSpaceOnUse">
+    <circle cx="2" cy="2" r="1.4" fill="#E2E8F0"/>
+  </pattern>
+  <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+    <stop offset="0" stop-color="#FFE9A8" stop-opacity="0.9"/>
+    <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+  </radialGradient>
+  <radialGradient id="fade" cx="50%" cy="45%" r="70%">
+    <stop offset="0" stop-color="#fff" stop-opacity="1"/>
+    <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+  </radialGradient>
+  <mask id="dotmask"><rect width="100%" height="100%" fill="url(#fade)"/></mask>
+  <linearGradient id="amberbar" x1="0" x2="1">
+    <stop offset="0" stop-color="#FBBF24"/><stop offset="1" stop-color="#F59E0B"/>
+  </linearGradient>
+  <linearGradient id="redbar" x1="0" x2="1">
+    <stop offset="0" stop-color="#FCA5A5"/><stop offset="1" stop-color="#EF4444"/>
+  </linearGradient>
+  <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#94A3B8"/>
+  </marker>
+  
+</defs>
+<rect width="1600" height="640" fill="#FFFFFF"/>
+<text x="80" y="88" font-size="40" font-weight="800" fill="#0F172A" text-anchor="start" >Code mode: one call instead of 25</text>
+<text x="80" y="128" font-size="22" font-weight="400" fill="#475569" text-anchor="start" >The agent sends a short program; only the final answer comes back into its context.</text>
+<rect x="60" y="170" width="700" height="410" rx="24" fill="#fff" stroke="#E2E8F0" filter="url(#sh)"/>
+<text x="100" y="222" font-size="24" font-weight="800" fill="#0F172A" text-anchor="start" >Without code mode</text>
+<text x="100" y="252" font-size="17" font-weight="400" fill="#475569" text-anchor="start" >Each step is a round trip, each result fills the context.</text>
+<rect x="100" y="284" width="620" height="52" rx="12" fill="#F8FAFC" stroke="#E2E8F0"/>
+<text x="124" y="317" font-size="18" font-weight="600" fill="#0F172A" text-anchor="start" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" >mcphub_call  list_projects</text>
+<text x="696" y="317" font-size="18" font-weight="700" fill="#DC2626" text-anchor="end" >14 KB</text>
+<rect x="100" y="348" width="620" height="52" rx="12" fill="#F8FAFC" stroke="#E2E8F0"/>
+<text x="124" y="381" font-size="18" font-weight="600" fill="#0F172A" text-anchor="start" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" >mcphub_call  list_tables  ×12</text>
+<text x="696" y="381" font-size="18" font-weight="700" fill="#DC2626" text-anchor="end" >96 KB</text>
+<rect x="100" y="412" width="620" height="52" rx="12" fill="#F8FAFC" stroke="#E2E8F0"/>
+<text x="124" y="445" font-size="18" font-weight="600" fill="#0F172A" text-anchor="start" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" >mcphub_call  execute_sql  ×12</text>
+<text x="696" y="445" font-size="18" font-weight="700" fill="#DC2626" text-anchor="end" >48 KB</text>
+<rect x="100" y="476" width="620" height="52" rx="12" fill="#F8FAFC" stroke="#E2E8F0"/>
+<text x="124" y="509" font-size="18" font-weight="600" fill="#0F172A" text-anchor="start" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" >…</text>
+<text x="100" y="556" font-size="19" font-weight="700" fill="#DC2626" text-anchor="start" >25 round trips  ·  ~158 KB pushed into the model</text>
+<rect x="840" y="170" width="700" height="410" rx="24" fill="#fff" stroke="#E2E8F0" filter="url(#sh)"/>
+<text x="880" y="222" font-size="24" font-weight="800" fill="#0F172A" text-anchor="start" >With mcphub_run</text>
+<text x="880" y="252" font-size="17" font-weight="400" fill="#475569" text-anchor="start" >Runs in an isolated Node process: no files, no network.</text>
+<rect x="880" y="276" width="620" height="200" rx="14" fill="#0F172A"/>
+<text x="904" y="308" font-size="13.5" font-weight="500" fill="#E2E8F0" text-anchor="start" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" xml:space="preserve">const ps = await mcp.call('supabase', 'list_projects', {});</text>
+<text x="904" y="332" font-size="13.5" font-weight="500" fill="#E2E8F0" text-anchor="start" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" xml:space="preserve">const out = [];</text>
+<text x="904" y="356" font-size="13.5" font-weight="500" fill="#E2E8F0" text-anchor="start" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" xml:space="preserve">for (const p of ps) {</text>
+<text x="904" y="380" font-size="13.5" font-weight="500" fill="#CBD5E1" text-anchor="start" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" xml:space="preserve">  const t = await mcp.call('supabase','list_tables',{project_id:p.id});</text>
+<text x="904" y="404" font-size="13.5" font-weight="500" fill="#CBD5E1" text-anchor="start" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" xml:space="preserve">  out.push({ name: p.name, tables: t.length });</text>
+<text x="904" y="428" font-size="13.5" font-weight="500" fill="#E2E8F0" text-anchor="start" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" xml:space="preserve">}</text>
+<text x="904" y="452" font-size="13.5" font-weight="500" fill="#F5B301" text-anchor="start" font-family="'SF Mono', ui-monospace, Menlo, Consolas, monospace" xml:space="preserve">return out;</text>
+<rect x="880" y="492" width="620" height="52" rx="12" fill="#F0FDF4" stroke="#BBF7D0"/>
+<text x="904" y="525" font-size="19" font-weight="700" fill="#16A34A" text-anchor="start" >1 call  ·  the answer only, a few hundred bytes</text>
+</svg>

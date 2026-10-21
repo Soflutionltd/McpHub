@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 640" width="1600" height="640" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title>McpHub</title>
+<defs>
+  <filter id="sh" x="-10%" y="-10%" width="120%" height="140%">
+    <feDropShadow dx="0" dy="10" stdDeviation="18" flood-color="#0F172A" flood-opacity="0.08"/>
+  </filter>
+  <filter id="sh2" x="-10%" y="-10%" width="120%" height="140%">
+    <feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#0F172A" flood-opacity="0.06"/>
+  </filter>
+  <pattern id="dots" width="28" height="28" patternUnits="userSpaceOnUse">
+    <circle cx="2" cy="2" r="1.4" fill="#E2E8F0"/>
+  </pattern>
+  <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+    <stop offset="0" stop-color="#FFE9A8" stop-opacity="0.9"/>
+    <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+  </radialGradient>
+  <radialGradient id="fade" cx="50%" cy="45%" r="70%">
+    <stop offset="0" stop-color="#fff" stop-opacity="1"/>
+    <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+  </radialGradient>
+  <mask id="dotmask"><rect width="100%" height="100%" fill="url(#fade)"/></mask>
+  <linearGradient id="amberbar" x1="0" x2="1">
+    <stop offset="0" stop-color="#FBBF24"/><stop offset="1" stop-color="#F59E0B"/>
+  </linearGradient>
+  <linearGradient id="redbar" x1="0" x2="1">
+    <stop offset="0" stop-color="#FCA5A5"/><stop offset="1" stop-color="#EF4444"/>
+  </linearGradient>
+  <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#94A3B8"/>
+  </marker>
+  
+</defs>
+<rect width="1600" height="640" fill="#FFFFFF"/>
+<rect width="1600" height="640" fill="url(#dots)" mask="url(#dotmask)"/>
+<circle cx="370" cy="320" r="300" fill="url(#glow)"/>
+<g transform="translate(140,90) scale(0.8984)">
+  <g fill="none" stroke="#1E1B4B" stroke-linecap="round">
+    <circle cx="256" cy="256" r="122" stroke-opacity=".18" stroke-width="2"/>
+    <circle cx="256" cy="256" r="92" stroke-opacity=".28" stroke-width="2"/>
+    <circle cx="256" cy="256" r="64" stroke-opacity=".38" stroke-width="2"/>
+    <polygon points="256.0,96.0 369.1,142.9 416.0,256.0 369.1,369.1 256.0,416.0 142.9,369.1 96.0,256.0 142.9,142.9" stroke-opacity=".45" stroke-width="3"/>
+    <polygon points="369.1,142.9 369.1,369.1 142.9,369.1 142.9,142.9" stroke-opacity=".22" stroke-width="2"/>
+    <polygon points="256.0,96.0 416.0,256.0 256.0,416.0 96.0,256.0" stroke-opacity=".14" stroke-width="2"/>
+    <g stroke-width="5" stroke-opacity=".8"><line x1="256" y1="256" x2="256.0" y2="96.0"/><line x1="256" y1="256" x2="369.1" y2="142.9"/><line x1="256" y1="256" x2="416.0" y2="256.0"/><line x1="256" y1="256" x2="369.1" y2="369.1"/><line x1="256" y1="256" x2="256.0" y2="416.0"/><line x1="256" y1="256" x2="142.9" y2="369.1"/><line x1="256" y1="256" x2="96.0" y2="256.0"/><line x1="256" y1="256" x2="142.9" y2="142.9"/></g>
+  </g>
+  <circle cx="256.0" cy="96.0" r="14" fill="#F5B301"/><circle cx="256.0" cy="96.0" r="5" fill="#FFF7DB"/><circle cx="369.1" cy="142.9" r="14" fill="#F5B301"/><circle cx="369.1" cy="142.9" r="5" fill="#FFF7DB"/><circle cx="416.0" cy="256.0" r="14" fill="#F5B301"/><circle cx="416.0" cy="256.0" r="5" fill="#FFF7DB"/><circle cx="369.1" cy="369.1" r="14" fill="#F5B301"/><circle cx="369.1" cy="369.1" r="5" fill="#FFF7DB"/><circle cx="256.0" cy="416.0" r="14" fill="#F5B301"/><circle cx="256.0" cy="416.0" r="5" fill="#FFF7DB"/><circle cx="142.9" cy="369.1" r="14" fill="#F5B301"/><circle cx="142.9" cy="369.1" r="5" fill="#FFF7DB"/><circle cx="96.0" cy="256.0" r="14" fill="#F5B301"/><circle cx="96.0" cy="256.0" r="5" fill="#FFF7DB"/><circle cx="142.9" cy="142.9" r="14" fill="#F5B301"/><circle cx="142.9" cy="142.9" r="5" fill="#FFF7DB"/>
+  <circle cx="256" cy="256" r="46" fill="#FFF3C4"/>
+  <circle cx="256" cy="256" r="32" fill="#FFE08A"/>
+  <circle cx="256" cy="256" r="18" fill="#F5B301"/>
+</g>
+<text x="690" y="268" font-size="132" font-weight="800" letter-spacing="-4"><tspan fill="#0F172A">Mcp</tspan><tspan fill="#F5B301">Hub</tspan></text>
+<text x="694" y="330" font-size="40" font-weight="600" fill="#475569" text-anchor="start" >One secure hub for all your MCP servers.</text>
+<text x="694" y="378" font-size="26" font-weight="400" fill="#94A3B8" text-anchor="start" >Cursor, Claude, Windsurf and VS Code see 3 tools instead of 928.</text>
+<g transform="translate(690,430)"><rect width="265" height="48" rx="24.0" fill="#fff" stroke="#E2E8F0" filter="url(#sh2)"/><circle cx="26" cy="24.0" r="6" fill="#F5B301"/><text x="42" y="31.2" font-size="20" font-weight="600" fill="#0F172A">99.9% fewer tokens</text></g>
+<g transform="translate(971,430)"><rect width="254" height="48" rx="24.0" fill="#fff" stroke="#E2E8F0" filter="url(#sh2)"/><circle cx="26" cy="24.0" r="6" fill="#16A34A"/><text x="42" y="31.2" font-size="20" font-weight="600" fill="#0F172A">Sandboxed servers</text></g>
+<g transform="translate(1241,430)"><rect width="299" height="48" rx="24.0" fill="#fff" stroke="#E2E8F0" filter="url(#sh2)"/><circle cx="26" cy="24.0" r="6" fill="#2563EB"/><text x="42" y="31.2" font-size="20" font-weight="600" fill="#0F172A">OAuth in the Keychain</text></g>
+<g transform="translate(690,496)"><rect width="299" height="48" rx="24.0" fill="#fff" stroke="#E2E8F0" filter="url(#sh2)"/><circle cx="26" cy="24.0" r="6" fill="#7C3AED"/><text x="42" y="31.2" font-size="20" font-weight="600" fill="#0F172A">Anti rug-pull pinning</text></g>
+<g transform="translate(1005,496)"><rect width="164" height="48" rx="24.0" fill="#fff" stroke="#E2E8F0" filter="url(#sh2)"/><circle cx="26" cy="24.0" r="6" fill="#0D9488"/><text x="42" y="31.2" font-size="20" font-weight="600" fill="#0F172A">Code mode</text></g>
+<g transform="translate(1185,496)"><rect width="265" height="48" rx="24.0" fill="#fff" stroke="#E2E8F0" filter="url(#sh2)"/><circle cx="26" cy="24.0" r="6" fill="#E11D48"/><text x="42" y="31.2" font-size="20" font-weight="600" fill="#0F172A">Single Rust binary</text></g>
+<text x="1552" y="604" font-size="18" font-weight="500" fill="#94A3B8" text-anchor="end" >v5.8  ·  MIT  ·  macOS</text>
+</svg>

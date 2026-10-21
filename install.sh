@@ -10,7 +10,13 @@ cargo build --release
 
 echo "Installing binary..."
 cp target/release/McpHub "$INSTALL_DIR/McpHub"
-codesign --force --sign - "$INSTALL_DIR/McpHub"
+# Signature stable si un certificat Developer ID est present (macOS garde alors ses autorisations).
+SIGN_ID=$(security find-identity -v -p codesigning 2>/dev/null | grep -m1 "Developer ID Application" | sed -E 's/.*"(.*)"/\1/' || true)
+if [ -n "$SIGN_ID" ]; then
+  codesign --force --sign "$SIGN_ID" --identifier com.soflution.mcphub --options runtime --timestamp "$INSTALL_DIR/McpHub"
+else
+  codesign --force --sign - --identifier com.soflution.mcphub "$INSTALL_DIR/McpHub"
+fi
 
 echo "✓ McpHub installed to $INSTALL_DIR/McpHub"
 echo ""

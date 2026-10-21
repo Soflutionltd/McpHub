@@ -343,6 +343,8 @@ fn handle_get_servers() -> Vec<u8> {
             "env": srv.get("env").unwrap_or(&json!({})),
             "disabled": srv.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false),
             "tools": tool_count,
+            "schemaTokens": cached.map(|c| c.to_string().len() / 4).unwrap_or(0),
+            "url": srv.get("url").and_then(|v| v.as_str()).unwrap_or(""),
             "toolNames": tools,
             "status": if cached.is_some() { "cached" } else if !error_msg.is_empty() { "error" } else { "uncached" },
             "error": error_msg
