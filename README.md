@@ -80,6 +80,8 @@ McpHub install    # start the daemon at login (LaunchAgent)
 3. `tar -xzf McpHub-macos-universal.tar.gz && install -m 755 McpHub ~/.local/bin/McpHub`
 4. Downloaded through a browser? Clear the quarantine flag: `xattr -d com.apple.quarantine ~/.local/bin/McpHub`
 
+Linux (amd64, arm64) and Windows (amd64) archives are attached to [every release](https://github.com/Soflutionltd/McpHub/releases/latest) too. On those systems the macOS sandbox, Keychain and confirmation dialog are not available.
+
 </details>
 
 <details>
