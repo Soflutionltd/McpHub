@@ -193,6 +193,27 @@ async fn get_json(client: &reqwest::Client, url: &str) -> Option<Value> {
     r.json::<Value>().await.ok()
 }
 
+/// HTTPS obligatoire (HTTP toléré seulement vers la machine locale).
+pub fn secure_url(raw: &str) -> bool {
+    match Url::parse(raw) {
+        Ok(u) => match u.scheme() {
+            "https" => true,
+            "http" => matches!(u.host_str(), Some("localhost") | Some("127.0.0.1") | Some("[::1]")),
+            _ => false,
+        },
+        Err(_) => false,
+    }
+}
+
+/// La ressource annoncée doit couvrir l'URL du serveur (RFC 9728 §3.3) : même origine et
+/// préfixe de chemin. Sinon un serveur pourrait obtenir un jeton destiné à un autre service.
+pub fn resource_matches(resource: &str, url: &str) -> bool {
+    let (Ok(r), Ok(u)) = (Url::parse(resource), Url::parse(url)) else {
+        return false;
+    };
+    origin(&r) == origin(&u) && u.path().starts_with(r.path().trim_end_matches('/'))
+}
+
 fn origin(u: &Url) -> String {
     match u.port() {
         Some(p) => format!("{}://{}:{}", u.scheme(), u.host_str().unwrap_or(""), p),
@@ -209,7 +230,7 @@ pub async fn discover(url: &str, www_authenticate: Option<&str>) -> Result<(Auth
 
     let mut prm_urls = Vec::new();
     if let Some(h) = www_authenticate {
-        if let Some(m) = www_param(h, "resource_metadata") {
+        if let Some(m) = www_param(h, "resource_metadata").filter(|m| secure_url(m)) {
             prm_urls.push(m);
         }
     }
@@ -242,10 +263,19 @@ pub async fn discover(url: &str, www_authenticate: Option<&str>) -> Result<(Auth
                     .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" "))
                     .filter(|s| !s.is_empty());
             }
-            (issuer, v.get("resource").and_then(|r| r.as_str()).map(String::from))
+            let resource = v.get("resource").and_then(|r| r.as_str()).map(String::from);
+            if let Some(r) = &resource {
+                if !resource_matches(r, url) {
+                    return Err(format!("ressource annoncee ({}) sans rapport avec {} : refuse", r, url));
+                }
+            }
+            (issuer, resource)
         }
         None => (base.clone(), None),
     };
+    if !secure_url(&issuer) {
+        return Err(format!("serveur d'autorisation non HTTPS refuse : {}", issuer));
+    }
 
     let iu = Url::parse(&issuer).map_err(|e| format!("issuer invalide : {}", e))?;
     let ibase = origin(&iu);
@@ -263,12 +293,16 @@ pub async fn discover(url: &str, www_authenticate: Option<&str>) -> Result<(Auth
         if let Some(v) = get_json(&client, m).await {
             let get = |k: &str| v.get(k).and_then(|x| x.as_str()).map(String::from);
             if let (Some(a), Some(t)) = (get("authorization_endpoint"), get("token_endpoint")) {
+                let reg = get("registration_endpoint");
+                if !secure_url(&a) || !secure_url(&t) || reg.as_deref().map_or(false, |r| !secure_url(r)) {
+                    return Err("points d'acces OAuth non HTTPS refuses".into());
+                }
                 return Ok((
                     AuthServerMeta {
                         issuer: get("issuer").unwrap_or_else(|| issuer.clone()),
                         authorization_endpoint: a,
                         token_endpoint: t,
-                        registration_endpoint: get("registration_endpoint"),
+                        registration_endpoint: reg,
                     },
                     resource,
                     scope,
@@ -367,6 +401,10 @@ pub async fn access_token(server: &str, url: &str) -> Result<Option<String>, Str
     let lock = server_lock(server);
     let _g = lock.lock().await;
     let Some(mut s) = load(server) else { return Ok(None) };
+    if !same_target(&s.url, url) {
+        // Jeton émis pour une autre adresse : ne jamais l'envoyer ailleurs.
+        return Ok(None);
+    }
     let Some(tokens) = s.tokens.clone() else { return Ok(None) };
     let fresh = tokens.expires_at.map_or(true, |e| e > now_ms() + 60_000);
     if fresh {
@@ -380,10 +418,17 @@ pub async fn force_refresh(server: &str, url: &str) -> Result<Option<String>, St
     let lock = server_lock(server);
     let _g = lock.lock().await;
     let Some(mut s) = load(server) else { return Ok(None) };
+    if !same_target(&s.url, url) {
+        return Ok(None);
+    }
     if s.tokens.as_ref().and_then(|t| t.refresh_token.as_ref()).is_none() {
         return Ok(None);
     }
     refresh_locked(server, url, &mut s).await.map(Some)
+}
+
+fn same_target(stored: &str, url: &str) -> bool {
+    stored.trim_end_matches('/') == url.trim_end_matches('/')
 }
 
 async fn refresh_locked(server: &str, url: &str, s: &mut Stored) -> Result<String, String> {
@@ -440,9 +485,27 @@ pub fn complete_callback(state: &str, result: CallbackResult) -> bool {
 }
 
 /// Connexion complète dans le navigateur. Bloque jusqu'au retour (5 minutes au plus).
+fn logins_in_progress() -> std::sync::MutexGuard<'static, std::collections::HashSet<String>> {
+    static S: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+struct LoginGuard(String);
+impl Drop for LoginGuard {
+    fn drop(&mut self) {
+        logins_in_progress().remove(&self.0);
+    }
+}
+
 pub async fn interactive_login(server: &str, url: &str, www_authenticate: Option<&str>) -> Result<(), String> {
-    let lock = server_lock(server);
-    let _g = lock.lock().await;
+    // Une seule connexion à la fois par serveur, et sans bloquer ses appels en attendant le
+    // navigateur (le verrou du serveur n'est pris qu'à l'enregistrement final).
+    if !logins_in_progress().insert(server.to_string()) {
+        return Err("une connexion est deja en cours pour ce serveur".into());
+    }
+    let _login = LoginGuard(server.to_string());
     let (meta, resource, scope) = discover(url, www_authenticate).await?;
     let mut stored = load(server).unwrap_or_default();
     stored.url = url.to_string();
@@ -456,6 +519,9 @@ pub async fn interactive_login(server: &str, url: &str, www_authenticate: Option
     };
     let verifier = random_b64(48).ok_or("source aleatoire indisponible")?;
     let state = random_b64(24).ok_or("source aleatoire indisponible")?;
+    if !secure_url(&meta.authorization_endpoint) {
+        return Err("page de connexion non HTTPS refusee".into());
+    }
     let mut auth = Url::parse(&meta.authorization_endpoint).map_err(|e| e.to_string())?;
     {
         let mut q = auth.query_pairs_mut();
@@ -497,6 +563,8 @@ pub async fn interactive_login(server: &str, url: &str, www_authenticate: Option
         form.push(("resource", r.clone()));
     }
     let v = token_request(&meta, &client, form).await?;
+    let lock = server_lock(server);
+    let _g = lock.lock().await;
     stored.tokens = Some(parse_tokens(&v, None)?);
     stored.client = Some(client);
     stored.meta = Some(meta);
@@ -593,6 +661,30 @@ mod tests {
     }
 
     #[test]
+    fn urls_sures_et_ressource() {
+        assert!(secure_url("https://a.com/x"));
+        assert!(secure_url("http://localhost:3000/cb"));
+        assert!(!secure_url("http://a.com/x"));
+        assert!(!secure_url("file:///Applications/Evil.app"));
+        assert!(!secure_url("smb://host/share"));
+        assert!(resource_matches("https://mcp.sentry.dev/mcp", "https://mcp.sentry.dev/mcp"));
+        assert!(resource_matches("https://mcp.sentry.dev", "https://mcp.sentry.dev/mcp"));
+        assert!(!resource_matches("https://api.github.com", "https://mcp.sentry.dev/mcp"));
+        assert!(same_target("https://a.com/mcp/", "https://a.com/mcp"));
+        assert!(!same_target("https://a.com/mcp", "https://b.com/mcp"));
+    }
+
+    #[test]
+    fn options_mcp_remote_non_prises_en_charge() {
+        let ok = serde_json::json!(["-y", "mcp-remote@0.15.1", "https://x.com/mcp", "--header", "Authorization: Bearer ${T}"]);
+        let (u, h) = mcp_remote_args(ok.as_array().unwrap()).unwrap();
+        assert_eq!(u, "https://x.com/mcp");
+        assert_eq!(h[0].0, "Authorization");
+        let ko = serde_json::json!(["-y", "mcp-remote", "https://x.com/mcp", "--transport", "sse-only"]);
+        assert!(mcp_remote_args(ko.as_array().unwrap()).is_none());
+    }
+
+    #[test]
     fn jetons() {
         let v = serde_json::json!({"access_token":"a","expires_in":60,"scope":"x"});
         let t = parse_tokens(&v, Some("r".into())).unwrap();
@@ -633,6 +725,14 @@ fn describe(s: &Stored) -> String {
 fn mcp_remote_args(args: &[Value]) -> Option<(String, Vec<(String, String)>)> {
     let strs: Vec<&str> = args.iter().filter_map(|a| a.as_str()).collect();
     if !strs.iter().any(|a| a.contains("mcp-remote")) {
+        return None;
+    }
+    // Options de mcp-remote que McpHub ne reproduit pas : on ne migre pas ce serveur.
+    if strs
+        .iter()
+        .any(|a| a.starts_with("--") && *a != "--header" && !a.starts_with("--header="))
+    {
+        eprintln!("[McpHub] migration ignoree : options mcp-remote non prises en charge ({})", strs.join(" "));
         return None;
     }
     let url = strs.iter().find(|a| a.starts_with("http://") || a.starts_with("https://"))?.to_string();
@@ -714,15 +814,32 @@ pub async fn run_cli(args: &[String]) -> i32 {
                 eprintln!("Usage : McpHub oauth logout SERVEUR");
                 return 2;
             };
-            match forget(server) {
-                Ok(true) => println!("{} : jetons supprimes du Trousseau.", server),
-                Ok(false) => println!("{} : aucun jeton.", server),
-                Err(e) => {
+            // Passe par le démon pour qu'il oublie aussi sa copie en mémoire.
+            let token = crate::dashboard::get_auth_token();
+            let url = format!("http://127.0.0.1:{}/api/oauth/logout", crate::dashboard::HTTP_PORT);
+            let via_daemon = reqwest::Client::new()
+                .post(&url)
+                .bearer_auth(token)
+                .json(&serde_json::json!({ "server": server }))
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false);
+            let local = forget(server);
+            match (via_daemon, local) {
+                (_, Err(e)) => {
                     eprintln!("{}", e);
-                    return 1;
+                    1
+                }
+                (true, _) | (_, Ok(true)) => {
+                    println!("{} : deconnecte (jetons supprimes du Trousseau).", server);
+                    0
+                }
+                (false, Ok(false)) => {
+                    println!("{} : aucun jeton.", server);
+                    0
                 }
             }
-            0
         }
         "migrate" => {
             // Convertit les serveurs `npx mcp-remote URL` en serveurs distants natifs, en

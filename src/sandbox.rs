@@ -33,10 +33,13 @@ pub struct SandboxSpec {
     pub network: bool,
     pub allow_read: Vec<String>,
     pub allow_write: Vec<String>,
+    /// Programmes sensibles autorisés malgré tout (ex. "osascript", "open" pour un serveur
+    /// qui pilote le simulateur iOS).
+    pub allow_exec: Vec<String>,
 }
 
 /// Secrets jamais lisibles par un serveur isolé (relatifs au dossier personnel).
-const SECRET_DIRS: &[&str] = &[
+pub const SECRET_DIRS: &[&str] = &[
     ".ssh",
     ".gnupg",
     ".aws",
@@ -54,6 +57,20 @@ const SECRET_DIRS: &[&str] = &[
     ".claude",
     ".codeium",
     ".password-store",
+    ".supabase",
+    ".config/supabase",
+    ".config/stripe",
+    ".config/github-copilot",
+    ".config/git",
+    ".wrangler",
+    ".terraform.d",
+    ".codex",
+    ".gemini",
+    ".cargo/credentials.toml",
+    "Library/LaunchAgents",
+    "Library/Group Containers/2BUA8C4S2C.com.1password",
+    "Library/Application Support/Code/User",
+    "Library/Application Support/Zed",
     "Library/Application Support/BraveSoftware",
     "Library/Application Support/Google/Chrome",
     "Library/Application Support/Firefox",
@@ -68,7 +85,7 @@ const SECRET_DIRS: &[&str] = &[
     "Library/Mail",
 ];
 
-const SECRET_FILES: &[&str] = &[
+pub const SECRET_FILES: &[&str] = &[
     ".netrc",
     ".npmrc",
     ".pypirc",
@@ -76,6 +93,26 @@ const SECRET_FILES: &[&str] = &[
     ".claude.json",
     ".zsh_history",
     ".bash_history",
+    ".zshrc",
+    ".zprofile",
+    ".zshenv",
+    ".zlogin",
+    ".bashrc",
+    ".bash_profile",
+    ".profile",
+    ".gitconfig",
+    ".vault-token",
+];
+
+/// Programmes qui permettent de sortir du bac à sable ou de lire le Trousseau :
+/// interdits aux serveurs isolés (sauf `allowExec`).
+const BLOCKED_EXEC: &[(&str, &str)] = &[
+    ("security", "/usr/bin/security"),
+    ("launchctl", "/bin/launchctl"),
+    ("osascript", "/usr/bin/osascript"),
+    ("open", "/usr/bin/open"),
+    ("automator", "/usr/bin/automator"),
+    ("shortcuts", "/usr/bin/shortcuts"),
 ];
 
 /// Serveurs conçus pour tout faire sur la machine (shell, fichiers) : pas de bac à sable par
@@ -120,6 +157,7 @@ pub fn resolve(server_name: &str, server: &Value, global: Option<&Value>, comman
         network: true,
         allow_read: Vec::new(),
         allow_write: Vec::new(),
+        allow_exec: Vec::new(),
     };
     match &spec_value {
         Value::Bool(true) => {}
@@ -133,6 +171,7 @@ pub fn resolve(server_name: &str, server: &Value, global: Option<&Value>, comman
             }
             spec.allow_read = str_list(o.get("allowRead"));
             spec.allow_write = str_list(o.get("allowWrite"));
+            spec.allow_exec = str_list(o.get("allowExec"));
         }
         _ => return None,
     }
@@ -160,17 +199,42 @@ fn expand(p: &str, home: &str) -> String {
     }
 }
 
+/// Vrai si `p` contient un secret (ex. ~ ou /Users) : ne doit jamais être rouvert en bloc.
+fn is_ancestor_of_secret(p: &str, home: &str) -> bool {
+    let p = p.trim_end_matches('/');
+    SECRET_DIRS
+        .iter()
+        .chain(SECRET_FILES.iter())
+        .map(|d| format!("{}/{}", home, d))
+        .any(|d| d == p || d.starts_with(&format!("{}/", p)) || p.is_empty())
+}
+
 fn q(p: &str) -> String {
     format!("\"{}\"", p.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-/// Chemins absolus que le serveur référence (variables d'environnement, arguments).
+/// Chemin `p` strictement à l'intérieur d'un élément secret (ex. une clé .p8 dans
+/// ~/.private_keys). Jamais un dossier parent d'un secret (~, /Users...) ni le secret lui-même :
+/// sinon une variable `WORKSPACE=~` rouvrirait tout le bouclier.
+fn strictly_inside_secret(p: &str, home: &str) -> bool {
+    let p = p.trim_end_matches('/');
+    if p.contains("/../") || p.ends_with("/..") {
+        return false;
+    }
+    SECRET_DIRS
+        .iter()
+        .map(|d| format!("{}/{}", home, d))
+        .any(|d| p.len() > d.len() + 1 && p.starts_with(&d) && p.as_bytes()[d.len()] == b'/')
+}
+
+/// Chemins secrets que le serveur référence lui-même (variables d'environnement, arguments)
+/// et qui restent donc lisibles, en lecture seule et un par un.
 pub fn referenced_paths(env: &HashMap<String, String>, args: &[String], home: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut push = |v: &str| {
         for part in v.split(':') {
             let p = expand(part.trim(), home);
-            if p.starts_with('/') && p.len() > 1 && !out.contains(&p) {
+            if p.starts_with('/') && strictly_inside_secret(&p, home) && !out.contains(&p) {
                 out.push(p);
             }
         }
@@ -214,14 +278,24 @@ pub fn profile(spec: &SandboxSpec, home: &str, referenced: &[String]) -> String 
         }
         p.push_str(&format!("(allow file-write* {})\n", writable.join(" ")));
     }
-    if !spec.network {
-        p.push_str("(deny network-outbound (remote ip))\n");
+    // Sorties du bac à sable : lecture du Trousseau, lancement de tâches, pilotage d'apps.
+    let blocked: Vec<String> = BLOCKED_EXEC
+        .iter()
+        .filter(|(name, _)| !spec.allow_exec.iter().any(|a| a == name))
+        .map(|(_, path)| format!("(literal {})", q(path)))
+        .collect();
+    if !blocked.is_empty() {
+        p.push_str(&format!("(deny process-exec {})\n", blocked.join(" ")));
     }
+    if !spec.network {
+        p.push_str("(deny network*)\n");
+    }
+    // Exceptions en lecture : uniquement des chemins précis à l'intérieur d'un secret.
     let reads: Vec<String> = referenced
         .iter()
         .cloned()
         .chain(spec.allow_read.iter().map(|r| expand(r, home)))
-        .filter(|r| r.starts_with('/'))
+        .filter(|r| r.starts_with('/') && strictly_inside_secret(r, home))
         .map(|r| format!("(subpath {})", q(&r)))
         .collect();
     if !reads.is_empty() {
@@ -231,7 +305,11 @@ pub fn profile(spec: &SandboxSpec, home: &str, referenced: &[String]) -> String 
         .allow_write
         .iter()
         .map(|w| expand(w, home))
-        .filter(|w| w.starts_with('/'))
+        .filter(|w| {
+            w.starts_with('/')
+                && (!is_ancestor_of_secret(w, home)
+                    || SECRET_DIRS.iter().any(|d| *w == format!("{}/{}", home, d)))
+        })
         .map(|w| format!("(subpath {})", q(&w)))
         .collect();
     if !writes.is_empty() {
@@ -290,13 +368,19 @@ mod tests {
 
     #[test]
     fn profil_bouclier_et_exceptions() {
-        let spec = SandboxSpec { mode: SandboxMode::Shield, network: true, allow_read: vec![], allow_write: vec![] };
+        let spec = SandboxSpec { mode: SandboxMode::Shield, network: true, allow_read: vec![], allow_write: vec![], allow_exec: vec![] };
         let env = HashMap::from([("KEY".to_string(), "/Users/a/.private_keys/k.p8".to_string())]);
         let refs = referenced_paths(&env, &["--file=/Users/a/doc.txt".into()], "/Users/a");
         assert!(refs.contains(&"/Users/a/.private_keys/k.p8".to_string()));
-        assert!(refs.contains(&"/Users/a/doc.txt".to_string()));
+        assert!(!refs.contains(&"/Users/a/doc.txt".to_string()), "pas besoin, deja lisible");
+        // Un dossier parent d'un secret ne rouvre jamais le bouclier.
+        for evil in ["~", "/Users/a", "/Users", "/", "~/.config", "/Users/a/.ssh", "/Users/a/.ssh/../.ssh/id_rsa"] {
+            let env = HashMap::from([("W".to_string(), evil.to_string())]);
+            assert!(referenced_paths(&env, &[], "/Users/a").is_empty(), "{}", evil);
+        }
         let p = profile(&spec, "/Users/a", &refs);
         assert!(p.contains("(deny file-read* file-write* (subpath \"/Users/a/.ssh\")"));
+        assert!(p.contains("(deny process-exec (literal \"/usr/bin/security\")"));
         let deny_at = p.find("(deny file-read*").unwrap();
         let allow_at = p.find("(allow file-read* (subpath \"/Users/a/.private_keys/k.p8\")").unwrap();
         assert!(allow_at > deny_at, "l'exception doit suivre l'interdiction");
@@ -306,10 +390,12 @@ mod tests {
 
     #[test]
     fn profil_strict() {
-        let spec = SandboxSpec { mode: SandboxMode::Strict, network: false, allow_read: vec![], allow_write: vec!["~/out".into()] };
+        let spec = SandboxSpec { mode: SandboxMode::Strict, network: false, allow_read: vec![], allow_write: vec!["~/out".into(), "~".into()], allow_exec: vec!["open".into()] };
         let p = profile(&spec, "/Users/a", &[]);
         assert!(p.contains("(deny file-write*)\n"));
-        assert!(p.contains("(deny network-outbound (remote ip))"));
+        assert!(p.contains("(deny network*)"));
+        assert!(!p.contains("(subpath \"/Users/a\"))"), "~ ne doit pas etre rouvert");
+        assert!(!p.contains("/usr/bin/open"));
         assert!(p.contains("(allow file-read* file-write* (subpath \"/Users/a/out\"))"));
     }
 

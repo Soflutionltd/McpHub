@@ -1003,6 +1003,18 @@ async fn route(
                 }
             }
         }
+        ("POST", "/api/oauth/logout") => {
+            match serde_json::from_str::<Value>(&req.body)
+                .ok()
+                .and_then(|v| v.get("server").and_then(|s| s.as_str()).map(String::from))
+            {
+                None => json_err(400, "server requis"),
+                Some(server) => match crate::oauth::forget(&server) {
+                    Ok(_) => http_response(200, "OK", "application/json", "{\"ok\":true}"),
+                    Err(e) => json_err(500, &e),
+                },
+            }
+        }
         ("GET", "/login") => {
             // Lien à usage unique créé par `McpHub dashboard` : remet le secret de session au
             // tableau de bord (sessionStorage, propre à cette origine), puis efface l'URL.

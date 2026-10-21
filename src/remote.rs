@@ -132,6 +132,9 @@ impl RemoteClient {
                 crate::redaction::redact_text(&text.chars().take(300).collect::<String>())
             ));
         }
+        if resp.content_length().map_or(false, |l| l as usize > MAX_SSE_BYTES) {
+            return Err(format!("Read error: reponse de {} trop volumineuse", self.server));
+        }
         let message = if ctype.starts_with("text/event-stream") {
             read_sse_response(resp, id).await?
         } else {
@@ -143,7 +146,7 @@ impl RemoteClient {
             Value::Array(items) => items
                 .into_iter()
                 .find(|m| m.get("id").and_then(|v| v.as_u64()) == Some(id))
-                .unwrap_or(Value::Null),
+                .ok_or_else(|| format!("MCP error: reponse sans l'identifiant attendu de {}", self.server))?,
             m => m,
         };
         if let Some(err) = message.get("error") {
@@ -194,6 +197,21 @@ async fn read_sse_response(mut resp: reqwest::Response, id: u64) -> Result<Value
             .await
             .map_err(|e| format!("Read error: flux SSE : {}", e))?;
         let Some(chunk) = chunk else {
+            // Dernier événement sans ligne vide finale.
+            let tail = String::from_utf8_lossy(&buf).to_string();
+            for line in tail.lines() {
+                if let Some(d) = line.strip_prefix("data:") {
+                    if !data.is_empty() {
+                        data.push('\n');
+                    }
+                    data.push_str(d.strip_prefix(' ').unwrap_or(d));
+                }
+            }
+            if let Ok(v) = serde_json::from_str::<Value>(&data) {
+                if v.get("id").and_then(|x| x.as_u64()) == Some(id) {
+                    return Ok(v);
+                }
+            }
             return Err("Server closed connection: flux SSE termine sans reponse".into());
         };
         buf.extend_from_slice(&chunk);

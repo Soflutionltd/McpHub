@@ -29,8 +29,9 @@ function fmt(v) {
 }
 
 const capture = (...args) => {
-  const line = args.map(fmt).join(" ");
-  if (logSize < 20000) { logs.push(line); logSize += line.length; }
+  if (logSize >= 20000) return;
+  const line = args.map(fmt).join(" ").slice(0, 2000);
+  logs.push(line); logSize += line.length;
 };
 
 const mcp = Object.freeze({
@@ -57,7 +58,13 @@ rl.on("line", async (line) => {
     started = true;
     try {
       const result = await run(String(msg.code ?? ""));
-      send({ t: "done", result: result === undefined ? null : result, logs });
+      let out = result === undefined ? null : result;
+      const size = JSON.stringify(out ?? null)?.length ?? 0;
+      if (size > 1000000) {
+        send({ t: "error", message: "resultat trop volumineux (" + size + " caracteres) : renvoyer un resume", logs });
+      } else {
+        send({ t: "done", result: out, logs });
+      }
     } catch (e) {
       send({ t: "error", message: String(e && e.stack ? e.stack : e), logs });
     }

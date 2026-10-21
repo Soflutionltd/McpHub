@@ -22,6 +22,30 @@ use crate::untrusted;
 tokio::task_local! {
     /// Profil du client à l'origine de la requête en cours (ex. /mcp/cursor).
     static REQUEST_PROFILE: Option<String>;
+    /// Appel lancé depuis le code mode : nombre de fenêtres de confirmation déjà ouvertes.
+    static CODE_RUN: std::sync::Arc<std::sync::atomic::AtomicUsize>;
+}
+
+/// Fenêtres de confirmation au plus par exécution de `mcphub_run`.
+const MAX_DIALOGS_PER_RUN: usize = 3;
+
+/// Une fenêtre de confirmation est ouverte : les serveurs capables de piloter l'ordinateur
+/// (et donc de cliquer « Autoriser » à la place de l'utilisateur) sont mis en pause.
+static DIALOG_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn controls_computer(server: &str) -> bool {
+    let s = server.to_ascii_lowercase();
+    ["desktop-commander", "computer", "applescript", "osascript", "macos-automator", "peekaboo"]
+        .iter()
+        .any(|k| s.contains(k))
+}
+
+/// Refus récents (empreinte de l'appel) : on ne redemande pas la même chose pendant 5 minutes.
+fn recent_denials() -> std::sync::MutexGuard<'static, HashMap<String, Instant>> {
+    static D: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Instant>>> = std::sync::OnceLock::new();
+    D.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 /// Profil actif : celui de la requête HTTP, sinon la variable MCPHUB_PROFILE (mode stdio).
@@ -274,6 +298,16 @@ impl ProxyServer {
                 }),
             ));
         }
+        if DIALOG_OPEN.load(std::sync::atomic::Ordering::SeqCst) && controls_computer(server) {
+            return PolicyGate::Respond(JsonRpcResponse::error(
+                id.clone(),
+                -32001,
+                format!(
+                    "{} : en pause pendant qu'une confirmation McpHub attend l'utilisateur. Reessayer apres sa reponse.",
+                    server
+                ),
+            ));
+        }
         let declared_destructive = tool_def
             .as_ref()
             .map(|t| t.declared_destructive())
@@ -323,54 +357,119 @@ impl ProxyServer {
                 let fp = crate::permissions::fingerprint(server, tool, arguments);
                 // Confirmation humaine d'abord : fenêtre macOS que l'agent ne peut pas valider.
                 if permissions.confirm_via_dialog && confirmation_token.is_none() {
+                    let policy_src = decision.source.clone();
+                    let deny = |msg: String, decision_label: &'static str| {
+                        let entry = AuditEntry {
+                            decision: decision_label,
+                            status: "blocked",
+                            ..base_entry()
+                        };
+                        let policy_src = policy_src.clone();
+                        let rid = id.clone();
+                        async move {
+                        self.record_audit(entry).await;
+                        PolicyGate::Respond(JsonRpcResponse::error_with_data(
+                            rid,
+                            -32001,
+                            msg,
+                            serde_json::json!({
+                                "server": server,
+                                "tool": tool,
+                                "policy": policy_src,
+                                "hint": "Ne pas reessayer automatiquement : demander a l'utilisateur ce qu'il souhaite."
+                            }),
+                        ))
+                        }
+                    };
+                    // Même demande refusée il y a moins de 5 minutes : pas de harcèlement.
+                    let recently_denied = {
+                        let mut d = recent_denials();
+                        d.retain(|_, t| t.elapsed() < std::time::Duration::from_secs(300));
+                        d.contains_key(&fp)
+                    };
+                    if recently_denied {
+                        return deny(
+                            format!("{}/{} : refuse par l'utilisateur il y a moins de 5 minutes.", server, tool),
+                            "human_denied",
+                        )
+                        .await;
+                    }
+                    let in_code = CODE_RUN.try_with(|c| c.clone()).ok();
+                    if let Some(counter) = &in_code {
+                        if counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= MAX_DIALOGS_PER_RUN {
+                            return deny(
+                                format!("Code mode : plus de {} confirmations dans une meme execution, refuse.", MAX_DIALOGS_PER_RUN),
+                                "deny",
+                            )
+                            .await;
+                        }
+                    }
                     let reason = decision
                         .reason
                         .clone()
                         .unwrap_or_else(|| "action sensible".into());
-                    let origin = match current_profile() {
+                    let mut origin = match current_profile() {
                         Some(p) => format!("mode {}, profil {}", mode, p),
                         None => format!("mode {}", mode),
                     };
+                    if in_code.is_some() {
+                        origin.push_str(", code mode (mcphub_run)");
+                    }
                     let preview = crate::audit::safe_arguments(arguments);
-                    let preview = serde_json::to_string_pretty(&preview).unwrap_or_default();
                     let message =
                         crate::confirm_dialog::build_message(server, tool, &reason, &preview, &origin);
-                    match crate::confirm_dialog::ask(message, permissions.dialog_timeout_secs).await {
+                    DIALOG_OPEN.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let answer = crate::confirm_dialog::ask(message, permissions.dialog_timeout_secs).await;
+                    DIALOG_OPEN.store(false, std::sync::atomic::Ordering::SeqCst);
+                    match answer {
                         crate::confirm_dialog::DialogAnswer::Allow => {
                             return PolicyGate::Proceed {
                                 decision: "confirmed_human",
                                 policy: decision.source.clone(),
                             };
                         }
-                        answer @ (crate::confirm_dialog::DialogAnswer::Deny
-                        | crate::confirm_dialog::DialogAnswer::Timeout) => {
-                            let timeout = answer == crate::confirm_dialog::DialogAnswer::Timeout;
-                            self.record_audit(AuditEntry {
-                                decision: if timeout { "human_timeout" } else { "human_denied" },
-                                status: "blocked",
-                                ..base_entry()
-                            })
+                        crate::confirm_dialog::DialogAnswer::Deny => {
+                            recent_denials().insert(fp.clone(), Instant::now());
+                            return deny(
+                                format!("L'utilisateur a refuse {}/{} dans la fenetre de confirmation McpHub.", server, tool),
+                                "human_denied",
+                            )
                             .await;
-                            return PolicyGate::Respond(JsonRpcResponse::error_with_data(
-                                id.clone(),
-                                -32001,
-                                if timeout {
-                                    format!("Pas de reponse de l'utilisateur dans la fenetre de confirmation McpHub : {}/{} non execute.", server, tool)
-                                } else {
-                                    format!("L'utilisateur a refuse {}/{} dans la fenetre de confirmation McpHub.", server, tool)
-                                },
-                                serde_json::json!({
-                                    "server": server,
-                                    "tool": tool,
-                                    "policy": decision.source,
-                                    "hint": "Ne pas reessayer automatiquement : demander a l'utilisateur ce qu'il souhaite."
-                                }),
-                            ));
+                        }
+                        crate::confirm_dialog::DialogAnswer::Timeout => {
+                            return deny(
+                                format!("Pas de reponse de l'utilisateur dans la fenetre de confirmation McpHub : {}/{} non execute.", server, tool),
+                                "human_timeout",
+                            )
+                            .await;
                         }
                         crate::confirm_dialog::DialogAnswer::Unavailable => {
-                            // Pas d'écran (session sans interface) : repli sur le jeton ci-dessous.
+                            if !permissions.dialog_fallback_token {
+                                return deny(
+                                    format!("{}/{} demande une confirmation, mais aucune fenetre ne peut s'afficher (session sans ecran). Refuse.", server, tool),
+                                    "deny",
+                                )
+                                .await;
+                            }
+                            // confirmVia "auto" : repli sur le jeton ci-dessous.
                         }
                     }
+                } else if permissions.confirm_via_dialog
+                    && !permissions.dialog_fallback_token
+                    && confirmation_token.is_some()
+                {
+                    // Mode fenêtre seule : aucun jeton n'est jamais émis, donc aucun n'est valable.
+                    self.record_audit(AuditEntry {
+                        decision: "invalid_token",
+                        status: "blocked",
+                        ..base_entry()
+                    })
+                    .await;
+                    return PolicyGate::Respond(JsonRpcResponse::error(
+                        id.clone(),
+                        -32001,
+                        "Confirmation par jeton desactivee : rappeler sans jeton, une fenetre s'ouvrira pour l'utilisateur.".into(),
+                    ));
                 }
                 match confirmation_token {
                     Some(token) if self.confirmations.consume(token, &fp) => PolicyGate::Proceed {
@@ -1353,7 +1452,7 @@ impl ProxyServer {
         else {
             return JsonRpcResponse::error(id, -32000, "Code mode : flux indisponibles".into());
         };
-        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        let mut lines = tokio::io::BufReader::new(stdout);
         let stderr_task = tokio::spawn(async move {
             let mut buf = String::new();
             let mut r = tokio::io::BufReader::new(stderr).lines();
@@ -1370,19 +1469,33 @@ impl ProxyServer {
             return JsonRpcResponse::error(id, -32000, "Code mode : envoi du code impossible".into());
         }
         let started = Instant::now();
+        let run_state = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
         let mut calls = 0usize;
         let mut outcome: Result<serde_json::Value, String> = Err("le programme s'est arrete sans resultat".into());
         let mut logs = serde_json::Value::Array(vec![]);
         loop {
-            let line = match tokio::time::timeout_at(deadline, lines.next_line()).await {
+            let line = match tokio::time::timeout_at(
+                deadline,
+                crate::codemode::read_line_limited(&mut lines, crate::codemode::MAX_LINE),
+            )
+            .await
+            {
                 Err(_) => {
                     outcome = Err(format!("temps depasse ({} s)", timeout_secs));
                     break;
                 }
                 Ok(Ok(Some(l))) => l,
-                Ok(_) => break,
+                Ok(Err(e)) => {
+                    outcome = Err(format!("sortie du code refusee : {}", e));
+                    break;
+                }
+                Ok(Ok(None)) => break,
             };
+            if tokio::time::Instant::now() >= deadline {
+                outcome = Err(format!("temps depasse ({} s)", timeout_secs));
+                break;
+            }
             let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
             let kind = msg.get("t").and_then(|v| v.as_str()).unwrap_or("");
             let req_id = msg.get("id").cloned().unwrap_or(serde_json::Value::Null);
@@ -1397,7 +1510,9 @@ impl ProxyServer {
                             "tool": msg.get("tool").cloned().unwrap_or_default(),
                             "arguments": msg.get("args").cloned().unwrap_or(serde_json::json!({})),
                         });
-                        let resp = Box::pin(self.handle_execute(None, call_args)).await;
+                        let resp = CODE_RUN
+                            .scope(run_state.clone(), Box::pin(self.handle_execute(None, call_args)))
+                            .await;
                         match (resp.result, resp.error) {
                             (_, Some(err)) => serde_json::json!({"id": req_id, "ok": false, "error": err.message}),
                             (Some(res), None) => {

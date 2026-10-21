@@ -17,7 +17,77 @@ use serde_json::Value;
 
 pub const RUNNER: &str = include_str!("codemode_runner.mjs");
 
-const SANDBOX_PROFILE: &str = "(version 1)(allow default)(deny network*)(deny file-write*)(allow file-write-data (literal \"/dev/null\"))";
+/// Profil du processus de code : ni réseau, ni écriture, ni lecture des secrets, ni programmes
+/// d'évasion (en plus de `node --permission`).
+fn sandbox_profile() -> String {
+    let home = dirs::home_dir()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let q = |p: &str| format!("\"{}\"", p.replace('\\', "\\\\").replace('"', "\\\""));
+    let mut denied: Vec<String> = crate::sandbox::SECRET_DIRS
+        .iter()
+        .map(|d| format!("(subpath {})", q(&format!("{}/{}", home, d))))
+        .collect();
+    denied.extend(
+        crate::sandbox::SECRET_FILES
+            .iter()
+            .map(|f| format!("(literal {})", q(&format!("{}/{}", home, f)))),
+    );
+    denied.push(format!("(subpath {})", q(&format!("{}/Library/Keychains", home))));
+    format!(
+        "(version 1)(allow default)(deny network*)(deny file-write*)(allow file-write-data (literal \"/dev/null\"))(deny file-read* {})(deny process-exec (literal \"/usr/bin/security\") (literal \"/bin/launchctl\") (literal \"/usr/bin/osascript\") (literal \"/usr/bin/open\"))",
+        denied.join(" ")
+    )
+}
+
+/// Taille maximale d'une ligne de protocole venant du code (4 Mo).
+pub const MAX_LINE: usize = 4 * 1024 * 1024;
+
+/// Lit une ligne sans jamais dépasser `max` octets (protège la mémoire du démon).
+pub async fn read_line_limited<R: tokio::io::AsyncBufRead + Unpin>(
+    r: &mut R,
+    max: usize,
+) -> Result<Option<String>, String> {
+    use tokio::io::AsyncBufReadExt;
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        let buf = r.fill_buf().await.map_err(|e| e.to_string())?;
+        if buf.is_empty() {
+            return Ok(if out.is_empty() {
+                None
+            } else {
+                Some(String::from_utf8_lossy(&out).to_string())
+            });
+        }
+        if let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+            if out.len() + pos > max {
+                return Err("ligne trop longue".into());
+            }
+            out.extend_from_slice(&buf[..pos]);
+            r.consume(pos + 1);
+            return Ok(Some(String::from_utf8_lossy(&out).to_string()));
+        }
+        let n = buf.len();
+        if out.len() + n > max {
+            return Err("ligne trop longue".into());
+        }
+        out.extend_from_slice(buf);
+        r.consume(n);
+    }
+}
+
+/// Version de Node (majeure, mineure) via `node --version`.
+pub fn node_version(node: &PathBuf) -> Option<(u32, u32)> {
+    let out = std::process::Command::new(node).arg("--version").output().ok()?;
+    let v = String::from_utf8_lossy(&out.stdout);
+    let mut parts = v.trim().trim_start_matches('v').split('.');
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+}
+
+/// `--permission` (sans "experimental") existe depuis Node 22.13 / 23.5.
+pub fn node_supported(v: (u32, u32)) -> bool {
+    v.0 > 23 || (v.0 == 23 && v.1 >= 5) || (v.0 == 22 && v.1 >= 13)
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodeModeConfig {
@@ -75,7 +145,7 @@ fn node_major(path: &PathBuf) -> u32 {
 pub fn find_node(cfg: &CodeModeConfig) -> Option<PathBuf> {
     if let Some(n) = &cfg.node {
         let p = PathBuf::from(n);
-        return p.exists().then_some(p);
+        return (p.exists() && node_version(&p).map_or(false, node_supported)).then_some(p);
     }
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(home) = dirs::home_dir() {
@@ -87,24 +157,28 @@ pub fn find_node(cfg: &CodeModeConfig) -> Option<PathBuf> {
     }
     candidates.retain(|p| p.exists());
     candidates.sort_by_key(|p| std::cmp::Reverse(node_major(p)));
-    if let Some(best) = candidates.into_iter().find(|p| node_major(p) >= 20) {
-        return Some(best);
-    }
-    ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"]
-        .iter()
-        .map(PathBuf::from)
-        .find(|p| p.exists())
+    candidates.extend(
+        ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"]
+            .iter()
+            .map(PathBuf::from)
+            .filter(|p| p.exists()),
+    );
+    candidates
+        .into_iter()
+        .find(|p| node_version(p).map_or(false, node_supported))
 }
 
 pub fn spawn(node: &PathBuf) -> std::io::Result<tokio::process::Child> {
+    // Sans bac à sable système, pas de code mode (le réseau ne serait bloqué que par Node).
     let sandbox = PathBuf::from("/usr/bin/sandbox-exec");
-    let mut cmd = if cfg!(target_os = "macos") && sandbox.exists() {
-        let mut c = tokio::process::Command::new(sandbox);
-        c.arg("-p").arg(SANDBOX_PROFILE).arg(node);
-        c
-    } else {
-        tokio::process::Command::new(node)
-    };
+    if !(cfg!(target_os = "macos") && sandbox.exists()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "sandbox-exec indisponible : code mode refuse",
+        ));
+    }
+    let mut cmd = tokio::process::Command::new(sandbox);
+    cmd.arg("-p").arg(sandbox_profile()).arg(node);
     cmd.arg("--permission")
         .arg("--input-type=module")
         .arg("-e")
@@ -188,6 +262,26 @@ mod tests {
         let c = parse(Some(&json!({"codeMode": {"timeoutSecs": 1000, "maxCalls": 5}})));
         assert_eq!(c.timeout_secs, 300);
         assert_eq!(c.max_calls, 5);
+    }
+
+    #[test]
+    fn versions_node_acceptees() {
+        assert!(node_supported((25, 0)));
+        assert!(node_supported((22, 13)));
+        assert!(!node_supported((22, 12)));
+        assert!(!node_supported((20, 18)));
+        assert!(!node_supported((23, 4)));
+    }
+
+    #[tokio::test]
+    async fn ligne_bornee() {
+        let data = b"court\n".to_vec();
+        let mut r = tokio::io::BufReader::new(&data[..]);
+        assert_eq!(read_line_limited(&mut r, 10).await.unwrap().as_deref(), Some("court"));
+        assert_eq!(read_line_limited(&mut r, 10).await.unwrap(), None);
+        let big = vec![b'x'; 100];
+        let mut r = tokio::io::BufReader::new(&big[..]);
+        assert!(read_line_limited(&mut r, 10).await.is_err());
     }
 
     #[test]
