@@ -30,32 +30,41 @@ pub fn get_auth_token() -> String {
     let path = config_dir().join("auth-token");
     if let Ok(token) = fs::read_to_string(&path) {
         let token = token.trim().to_string();
-        if !token.is_empty() {
+        // Les anciens jetons (horodatage en hexadécimal) sont devinables : on les remplace.
+        if crate::http_guard::token_is_current(&token) {
             return token;
         }
     }
-
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let token = crate::http_guard::random_token().unwrap_or_else(|| format!("mcphub_{:x}", nanos));
+    let Some(token) = crate::http_guard::random_token() else {
+        // Sans source aléatoire, on garde l'existant plutôt que d'en fabriquer un faible.
+        return fs::read_to_string(&path)
+            .map(|t| t.trim().to_string())
+            .unwrap_or_default();
+    };
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-
-    let _ = fs::write(&path, &token);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(mut perms) = fs::metadata(&path).map(|m| m.permissions()) {
-            perms.set_mode(0o600);
-            let _ = fs::set_permissions(&path, perms);
+    // Écriture atomique, directement en mode 600 (jamais lisible par les autres, même un instant).
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let written = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
         }
+        let mut f = opts.open(&tmp)?;
+        f.write_all(token.as_bytes())?;
+        f.sync_all()?;
+        fs::rename(&tmp, &path)
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    } else {
+        eprintln!("[McpHub][SECURITY] Nouveau jeton d'authentification genere dans {}", path.display());
     }
-
     token
 }
 
@@ -203,21 +212,38 @@ async fn handle_streamable_http_message(
     proxy: &Arc<ProxyServer>,
     profile: Option<String>,
 ) -> Vec<u8> {
+    let rpc_error = |code: i64, msg: &str| {
+        http_response(
+            400,
+            "Bad Request",
+            "application/json",
+            &json!({"jsonrpc":"2.0","id":null,"error":{"code":code,"message":msg}}).to_string(),
+        )
+    };
     let parsed: Value = match serde_json::from_str(body) {
         Ok(v) => v,
-        Err(e) => return json_err(400, &format!("Invalid JSON-RPC: {}", e)),
+        Err(e) => return rpc_error(-32700, &format!("Parse error: {}", e)),
     };
     let (items, is_batch) = match parsed {
         Value::Array(a) if !a.is_empty() => (a, true),
-        Value::Array(_) => return json_err(400, "Empty batch"),
+        Value::Array(_) => return rpc_error(-32600, "Empty batch"),
         other => (vec![other], false),
     };
-    let mut responses = Vec::new();
+    // Validation complète AVANT d'exécuter quoi que ce soit.
+    let mut requests = Vec::new();
     for item in items {
-        let request: JsonRpcRequest = match serde_json::from_value(item) {
-            Ok(r) => r,
-            Err(e) => return json_err(400, &format!("Invalid JSON-RPC: {}", e)),
-        };
+        let is_client_response = item.get("method").is_none()
+            && (item.get("result").is_some() || item.get("error").is_some());
+        if is_client_response {
+            continue; // réponse du client (ex. à une sollicitation) : rien à renvoyer
+        }
+        match serde_json::from_value::<JsonRpcRequest>(item) {
+            Ok(r) => requests.push(r),
+            Err(e) => return rpc_error(-32600, &format!("Invalid Request: {}", e)),
+        }
+    }
+    let mut responses = Vec::new();
+    for request in requests {
         if let Some(resp) = proxy.handle_request_in_profile(request, profile.clone()).await {
             responses.push(resp);
         }
@@ -922,15 +948,35 @@ async fn route(
     }
 
     match (&req.method[..], path) {
-        ("GET", "/") => {
-            // Cookie de session HttpOnly + SameSite=Strict : le tableau de bord appelle /api
-            // sans exposer le jeton au JavaScript, et aucun site tiers ne peut le réutiliser.
-            let token = get_auth_token();
-            let extra = format!(
-                "{}X-Frame-Options: DENY\r\nContent-Security-Policy: frame-ancestors 'none'\r\nCache-Control: no-store\r\n",
-                crate::http_guard::session_cookie_header(&token)
-            );
-            http_response_with(200, "OK", "text/html; charset=utf-8", DASHBOARD_HTML, &extra)
+        ("GET", "/") => http_response_with(
+            200,
+            "OK",
+            "text/html; charset=utf-8",
+            DASHBOARD_HTML,
+            "X-Frame-Options: DENY\r\nContent-Security-Policy: frame-ancestors 'none'\r\nCache-Control: no-store\r\n",
+        ),
+        ("GET", "/login") => {
+            // Lien à usage unique créé par `McpHub dashboard` : remet le secret de session au
+            // tableau de bord (sessionStorage, propre à cette origine), puis efface l'URL.
+            let headers = "X-Frame-Options: DENY\r\nContent-Security-Policy: frame-ancestors 'none'\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\n";
+            let ok = query_param(&req.path, "nonce")
+                .map(|n| crate::http_guard::consume_login_nonce(&n))
+                .unwrap_or(false);
+            if ok {
+                let body = format!(
+                    "<!doctype html><meta charset=utf-8><title>McpHub</title><script>try{{sessionStorage.setItem('mcphub_session','{}')}}catch(e){{}}location.replace('/');</script>",
+                    crate::http_guard::session_secret()
+                );
+                http_response_with(200, "OK", "text/html; charset=utf-8", &body, headers)
+            } else {
+                http_response_with(
+                    403,
+                    "Forbidden",
+                    "text/html; charset=utf-8",
+                    "<!doctype html><meta charset=utf-8><title>McpHub</title><p style='font-family:system-ui;padding:40px'>Lien expire ou deja utilise. Relancer <code>McpHub dashboard</code>.</p>",
+                    headers,
+                )
+            }
         }
         ("GET", "/api/servers") => handle_get_servers(),
         ("POST", "/api/servers") => handle_add_server(&req.body),
@@ -941,7 +987,9 @@ async fn route(
         _ => {
             if path.starts_with("/api/servers/") {
                 let rest = &path["/api/servers/".len()..];
-                if rest.ends_with("/toggle") {
+                if (rest.ends_with("/toggle") || rest.ends_with("/repair")) && req.method != "POST" {
+                    json_err(405, "Method not allowed")
+                } else if rest.ends_with("/toggle") {
                     let name = &rest[..rest.len() - "/toggle".len()];
                     let decoded = urldecode(name);
                     handle_toggle_server(&decoded, &req.body)
@@ -986,7 +1034,28 @@ fn urldecode(s: &str) -> String {
 
 /// Start dashboard only (no SSE, no proxy). For `McpHub dashboard` command.
 pub async fn start_dashboard() {
+    // Démon déjà lancé : on ouvre simplement un lien de connexion à usage unique.
+    let addr = format!("127.0.0.1:{}", HTTP_PORT);
+    if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+        open_login_page();
+        println!("Tableau de bord ouvert dans le navigateur (lien valable 2 minutes).");
+        return;
+    }
     start_http(None, None, true).await;
+}
+
+fn open_login_page() {
+    let Some(nonce) = crate::http_guard::create_login_nonce() else {
+        eprintln!("[McpHub] Impossible de creer le lien de connexion.");
+        return;
+    };
+    let url = format!("http://127.0.0.1:{}/login?nonce={}", HTTP_PORT, nonce);
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(&url).spawn();
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("cmd").args(["/c", "start", &url]).spawn();
 }
 
 /// Start full server: dashboard + SSE transport. For `McpHub serve` and default mode.
@@ -1018,18 +1087,7 @@ async fn start_http(
     }
 
     if open_browser {
-        #[cfg(target_os = "macos")]
-        let _ = std::process::Command::new("open")
-            .arg(format!("http://{}", addr))
-            .spawn();
-        #[cfg(target_os = "linux")]
-        let _ = std::process::Command::new("xdg-open")
-            .arg(format!("http://{}", addr))
-            .spawn();
-        #[cfg(target_os = "windows")]
-        let _ = std::process::Command::new("cmd")
-            .args(["/c", "start", &format!("http://{}", addr)])
-            .spawn();
+        open_login_page();
     }
 
     loop {
@@ -1093,6 +1151,13 @@ async fn handle_connection(
             }
         }
 
+        // Corps limité à 16 Mo : un Content-Length géant ne doit pas faire planter le démon.
+        if content_length > 16 * 1024 * 1024 {
+            let resp = json_err(413, "Payload Too Large");
+            let _ = stream.write_all(&resp).await;
+            let _ = stream.shutdown().await;
+            return;
+        }
         // Read the rest of the body if needed
         let target_size = body_offset + content_length;
         if target_size > buf.len() {
@@ -1145,7 +1210,10 @@ async fn handle_connection(
     }
 
     // Toute l'API du tableau de bord exige le jeton (Bearer) ou le cookie de session.
-    if path.starts_with("/api/") && !crate::http_guard::is_authorized(&req.headers, &auth_token) {
+    let query_session = query_param(&req.path, "session");
+    if path.starts_with("/api/")
+        && !crate::http_guard::api_authorized(&req.headers, query_session.as_deref(), &auth_token)
+    {
         let resp = json_err(401, "Unauthorized");
         let _ = stream.write_all(&resp).await;
         let _ = stream.shutdown().await;

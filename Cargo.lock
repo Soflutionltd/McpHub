@@ -870,7 +870,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-hub"
-version = "5.6.0"
+version = "5.7.0"
 dependencies = [
  "dirs",
  "notify-rust",

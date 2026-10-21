@@ -230,20 +230,27 @@ impl ProxyServer {
         confirmation_token: Option<&str>,
     ) -> PolicyGate {
         let permissions = self.config.lock().await.permissions.clone();
-        let mut tool_def = {
-            let engine = self.search_engine.lock().await;
-            engine.find_tool(server, tool).map(|t| t.tool_def.clone())
+        // Toujours partir de la définition EN DIRECT : le serveur est démarré (ou réveillé)
+        // avant le contrôle, donc épinglé et analysé avant que l'appel parte. Démarrer un
+        // serveur déjà actif ne coûte qu'un verrou.
+        let live = self.child_manager.start_server(server).await;
+        let (tool_def, live_block) = match &live {
+            Ok(tools) => match tools.iter().find(|t| t.name == tool) {
+                Some(def) => (Some(def.clone()), None),
+                None => (
+                    None,
+                    Some(format!(
+                        "outil '{}' non annonce par le serveur (verifier le nom avec mcphub_search)",
+                        tool
+                    )),
+                ),
+            },
+            Err(e) => (None, Some(format!("serveur indisponible : {}", e))),
         };
-        if tool_def.is_none() {
-            // Outil hors catalogue : démarrer le serveur d'abord, pour que sa définition réelle
-            // soit épinglée et analysée AVANT l'appel (pas de contournement par un outil inconnu).
-            if let Ok(tools) = self.child_manager.start_server(server).await {
-                tool_def = tools.into_iter().find(|t| t.name == tool);
-            }
-        }
-        if let Some(reason) =
+        let reason = live_block.or_else(|| {
             crate::toolguard::block_reason(server, tool, tool_def.as_ref(), current_profile().as_deref())
-        {
+        });
+        if let Some(reason) = reason {
             self.record_audit(AuditEntry {
                 server: server.to_string(),
                 tool: tool.to_string(),
@@ -689,6 +696,7 @@ impl ProxyServer {
                 self.handle_cancel(req.params).await;
                 None
             }
+            _ if req.id.is_none() => None, // notification inconnue : jamais de réponse
             _ => {
                 eprintln!("[McpHub][WARN] Unknown method: {}", req.method);
                 Some(JsonRpcResponse::error(
@@ -1619,7 +1627,15 @@ impl ProxyServer {
         if parts.len() != 2 {
             return JsonRpcResponse::error(id, -32602, "Invalid prompt name format".into());
         }
-        let server = parts[0];
+        let canonical = self
+            .child_manager
+            .resolve_name(parts[0])
+            .await
+            .unwrap_or_else(|| parts[0].to_string());
+        if !crate::toolguard::server_visible(&canonical, current_profile().as_deref()) {
+            return JsonRpcResponse::error(id, -32001, format!("Serveur {} hors du profil McpHub", canonical));
+        }
+        let server = canonical.as_str();
         let prompt_name = parts[1];
 
         let mut new_args = args.clone();
@@ -1659,7 +1675,15 @@ impl ProxyServer {
         if parts.len() != 2 {
             return JsonRpcResponse::error(id, -32602, "Invalid resource uri format".into());
         }
-        let server = parts[0];
+        let canonical = self
+            .child_manager
+            .resolve_name(parts[0])
+            .await
+            .unwrap_or_else(|| parts[0].to_string());
+        if !crate::toolguard::server_visible(&canonical, current_profile().as_deref()) {
+            return JsonRpcResponse::error(id, -32001, format!("Serveur {} hors du profil McpHub", canonical));
+        }
+        let server = canonical.as_str();
         let actual_uri = parts[1];
 
         let mut new_args = args.clone();
@@ -1829,7 +1853,8 @@ fn indexed_tools_from_servers(servers: &HashMap<String, Vec<ToolDef>>) -> Vec<In
     let mut all_tools = Vec::new();
     for server_name in server_names {
         if let Some(raw_tools) = servers.get(&server_name) {
-            crate::toolguard::review(&server_name, raw_tools);
+            // Pas de revue ici : le cache peut être périmé. Seules les définitions annoncées
+            // en direct (démarrage d'un serveur) mettent à jour les épingles.
             let tools = crate::toolguard::present_tools(&server_name, raw_tools);
             for tool in &tools {
                 all_tools.push(IndexedTool {

@@ -304,9 +304,10 @@ impl ChildManager {
                 }
             }
 
+            // Épinglage / détection d'empoisonnement sur la définition réellement annoncée,
+            // pour chaque instance du pool.
+            crate::toolguard::review(name, &tools);
             if i == 0 {
-                // Épinglage / détection d'empoisonnement sur la définition réellement annoncée.
-                crate::toolguard::review(name, &tools);
                 let elapsed = start.elapsed();
                 eprintln!(
                     "[McpHub][INFO] Server '{}' ready: {} tools in {:.0}ms",
@@ -431,6 +432,13 @@ impl ChildManager {
                     server_name, e
                 );
                 self.restart_server(server_name).await?;
+                // Le serveur relancé a pu changer ses définitions : re-contrôle avant l'envoi.
+                if let Some(reason) = crate::toolguard::quarantined(server_name, tool_name) {
+                    return Err(format!(
+                        "Bloque par McpHub apres redemarrage de {} : outil {} en quarantaine ({})",
+                        server_name, tool_name, reason
+                    ));
+                }
 
                 let pool = {
                     let pools = self.pools.lock().await;

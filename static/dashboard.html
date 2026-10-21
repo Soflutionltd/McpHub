@@ -258,6 +258,13 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
   </div>
 </div>
 <script>
+// Session du tableau de bord : obtenue par le lien à usage unique de `McpHub dashboard`,
+// gardée dans sessionStorage (propre à cette origine) et envoyée en Authorization.
+const MCPHUB_SESSION = (()=>{try{return sessionStorage.getItem('mcphub_session')||''}catch(e){return ''}})();
+if(!MCPHUB_SESSION){document.addEventListener('DOMContentLoaded',()=>{document.body.innerHTML='<div style="font-family:system-ui;padding:40px;max-width:560px;margin:auto"><h2>McpHub</h2><p>Pour ouvrir le tableau de bord, lancez dans un Terminal :</p><pre style="background:#111;color:#eee;padding:12px;border-radius:8px">McpHub dashboard</pre><p>Le lien de connexion est à usage unique et valable 2 minutes.</p></div>';});}
+const __mcphubFetch = window.fetch.bind(window);
+window.fetch = (url, opts = {}) => { opts = Object.assign({}, opts); opts.headers = Object.assign({}, opts.headers || {}, { 'Authorization': 'Bearer ' + MCPHUB_SESSION }); return __mcphubFetch(url, opts); };
+
 let servers=[], settings={mode:'discover',idleTimeout:300}, totalTools=0, cacheExists=false;
 let currentView='servers', editingServerName=null;
 
@@ -618,7 +625,7 @@ function toggleLogs(){
     box.innerHTML+='<div style="color:var(--text-dim)">[Disconnected]</div>';
   }else{
     box.innerHTML='';
-    logsSource=new EventSource('/api/logs-stream');
+    logsSource=new EventSource('/api/logs-stream?session='+encodeURIComponent(MCPHUB_SESSION));
     logsSource.onmessage=e=>{
       try{
         const d=JSON.parse(e.data);
