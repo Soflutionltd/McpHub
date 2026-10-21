@@ -316,6 +316,10 @@ pub fn load_into_env() -> (usize, Vec<String>) {
     let mut loaded = 0;
     let mut missing = Vec::new();
     for name in list_names() {
+        // Les connexions OAuth (JSON) ne sont pas des variables d'environnement.
+        if name.starts_with(crate::oauth::VAULT_PREFIX) {
+            continue;
+        }
         if std::env::var(&name).is_ok() {
             continue;
         }

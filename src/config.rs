@@ -17,6 +17,12 @@ pub struct ServerConfig {
     /// Variables du démon explicitement transmises à ce serveur (`inheritEnv`). Par défaut un
     /// serveur ne reçoit que l'environnement système de base et son propre `env`.
     pub inherit_env: Vec<String>,
+    /// Serveur distant (Streamable HTTP natif) au lieu d'une commande.
+    pub url: Option<String>,
+    /// En-têtes HTTP fixes du serveur distant (${VAR} résolus).
+    pub headers: HashMap<String, String>,
+    /// OAuth géré par McpHub (jetons au Trousseau).
+    pub oauth: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -261,6 +267,43 @@ fn parse_servers(json: &Value) -> HashMap<String, ServerConfig> {
                         .and_then(|v| v.as_array())
                         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
                         .unwrap_or_default(),
+                    url: None,
+                    headers: HashMap::new(),
+                    oauth: false,
+                },
+            );
+        } else if let Some(url) = config.get("url").and_then(|v| v.as_str()) {
+            // Serveur distant natif : {"url": "...", "headers": {...}, "auth": "oauth" | "none"}
+            let headers: HashMap<String, String> = config
+                .get("headers")
+                .and_then(|v| v.as_object())
+                .map(|obj| {
+                    obj.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), expand_vars(s))))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let has_auth_header = headers.keys().any(|k| k.eq_ignore_ascii_case("authorization"));
+            let oauth = match config.get("auth").and_then(|v| v.as_str()) {
+                Some(a) => a.eq_ignore_ascii_case("oauth"),
+                None => !has_auth_header,
+            };
+            result.insert(
+                name.clone(),
+                ServerConfig {
+                    command: String::new(),
+                    args: Vec::new(),
+                    env: HashMap::new(),
+                    pool: config.get("pool").and_then(|v| v.as_u64()).unwrap_or(1) as usize,
+                    request_timeout_secs: config
+                        .get("requestTimeoutSecs")
+                        .or_else(|| config.get("requestTimeout"))
+                        .and_then(|v| v.as_u64()),
+                    sandbox: None,
+                    inherit_env: Vec::new(),
+                    url: Some(expand_vars(url)),
+                    headers,
+                    oauth,
                 },
             );
         }

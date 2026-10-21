@@ -955,6 +955,54 @@ async fn route(
             DASHBOARD_HTML,
             "X-Frame-Options: DENY\r\nContent-Security-Policy: frame-ancestors 'none'\r\nCache-Control: no-store\r\n",
         ),
+        ("GET", "/oauth/callback") => {
+            // Retour du navigateur après connexion OAuth d'un serveur distant.
+            let headers = "Cache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nX-Frame-Options: DENY\r\n";
+            let state = query_param(&req.path, "state").unwrap_or_default();
+            let outcome = match (query_param(&req.path, "code"), query_param(&req.path, "error")) {
+                (Some(code), _) => Ok(code),
+                (None, Some(err)) => Err(err),
+                _ => Err("reponse incomplete".to_string()),
+            };
+            let ok = outcome.is_ok();
+            let known = crate::oauth::complete_callback(&state, outcome);
+            let msg = if known && ok {
+                "Connexion reussie. Vous pouvez fermer cet onglet."
+            } else if known {
+                "Connexion refusee. Vous pouvez fermer cet onglet."
+            } else {
+                "Lien de connexion inconnu ou expire. Relancer : McpHub oauth login SERVEUR"
+            };
+            http_response_with(
+                if known { 200 } else { 400 },
+                if known { "OK" } else { "Bad Request" },
+                "text/html; charset=utf-8",
+                &format!("<!doctype html><meta charset=utf-8><title>McpHub</title><p style='font-family:system-ui;padding:40px'>{}</p>", msg),
+                headers,
+            )
+        }
+        ("POST", "/api/oauth/login") => {
+            let server = serde_json::from_str::<Value>(&req.body)
+                .ok()
+                .and_then(|v| v.get("server").and_then(|s| s.as_str()).map(String::from));
+            match server {
+                None => json_err(400, "server requis"),
+                Some(server) => {
+                    let cfg = crate::config::auto_detect();
+                    match cfg.servers.get(&server).and_then(|s| s.url.clone()) {
+                        None => json_err(404, "serveur distant inconnu (pas d'url dans la config)"),
+                        Some(url) => {
+                            tokio::spawn(async move {
+                                if let Err(e) = crate::oauth::interactive_login(&server, &url, None).await {
+                                    eprintln!("[McpHub][OAUTH] {} : echec de connexion : {}", server, e);
+                                }
+                            });
+                            http_response(202, "Accepted", "application/json", "{\"ok\":true}")
+                        }
+                    }
+                }
+            }
+        }
         ("GET", "/login") => {
             // Lien à usage unique créé par `McpHub dashboard` : remet le secret de session au
             // tableau de bord (sessionStorage, propre à cette origine), puis efface l'URL.

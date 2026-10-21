@@ -13,17 +13,46 @@ pub use crate::config::ServerConfig;
 use crate::protocol::ToolDef;
 use crate::redaction::redact_text;
 
-#[derive(Debug)]
+enum Link {
+    Stdio {
+        child: Child,
+        stdin: tokio::process::ChildStdin,
+        stdout_lines: Arc<Mutex<tokio::io::Lines<BufReader<tokio::process::ChildStdout>>>>,
+    },
+    Http(Arc<crate::remote::RemoteClient>),
+}
+
 struct ChildProcess {
-    child: Child,
-    stdin: tokio::process::ChildStdin,
-    stdout_lines: Arc<Mutex<tokio::io::Lines<BufReader<tokio::process::ChildStdout>>>>,
+    link: Link,
     next_id: u64,
     tools: Vec<ToolDef>,
     last_used: Instant,
     server_name: String,
     protocol_version: String,
     request_timeout_secs: u64,
+}
+
+impl ChildProcess {
+    async fn kill(&mut self) {
+        match &mut self.link {
+            Link::Stdio { child, .. } => {
+                let _ = child.kill().await;
+            }
+            Link::Http(remote) => remote.close().await,
+        }
+    }
+
+    /// Processus terminé ? (toujours vivant pour un serveur distant)
+    fn exited(&mut self) -> Result<Option<String>, String> {
+        match &mut self.link {
+            Link::Stdio { child, .. } => match child.try_wait() {
+                Ok(Some(status)) => Ok(Some(status.to_string())),
+                Ok(None) => Ok(None),
+                Err(e) => Err(e.to_string()),
+            },
+            Link::Http(_) => Ok(None),
+        }
+    }
 }
 
 struct ServerPool {
@@ -240,46 +269,61 @@ impl ChildManager {
                 eprintln!("[McpHub][INFO] Starting server: {}", name);
             }
 
-            let (program, program_args) = crate::sandbox::wrap(
-                name,
-                config.sandbox.as_ref(),
-                &config.command,
-                &config.args,
-                &config.env,
-            );
-            if i == 0 && config.sandbox.is_some() {
-                eprintln!("[McpHub][SANDBOX] {} : isole ({:?})", name, config.sandbox.as_ref().map(|s| s.mode));
-            }
-            let mut cmd = Command::new(&program);
-            cmd.args(&program_args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(child_stderr(name));
+            let link = if let Some(url) = &config.url {
+                if i == 0 {
+                    eprintln!("[McpHub][INFO] {} : serveur distant {}", name, url);
+                }
+                Link::Http(Arc::new(crate::remote::RemoteClient::new(
+                    name,
+                    url,
+                    &config.headers,
+                    config.oauth,
+                )))
+            } else {
+                let (program, program_args) = crate::sandbox::wrap(
+                    name,
+                    config.sandbox.as_ref(),
+                    &config.command,
+                    &config.args,
+                    &config.env,
+                );
+                if i == 0 && config.sandbox.is_some() {
+                    eprintln!("[McpHub][SANDBOX] {} : isole ({:?})", name, config.sandbox.as_ref().map(|s| s.mode));
+                }
+                let mut cmd = Command::new(&program);
+                cmd.args(&program_args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(child_stderr(name));
 
-            // Environnement minimal : les secrets chargés dans le démon (Trousseau, plist) ne
-            // doivent jamais fuiter vers TOUS les serveurs. Chacun ne reçoit que la base système,
-            // ses propres variables (`env`) et celles qu'il demande nommément (`inheritEnv`).
-            cmd.env_clear();
-            for (k, v) in base_child_env(config.sandbox.is_none(), &config.inherit_env) {
-                cmd.env(k, v);
-            }
-            for (k, v) in &config.env {
-                cmd.env(k, v);
-            }
+                // Environnement minimal : les secrets chargés dans le démon (Trousseau, plist) ne
+                // doivent jamais fuiter vers TOUS les serveurs. Chacun ne reçoit que la base système,
+                // ses propres variables (`env`) et celles qu'il demande nommément (`inheritEnv`).
+                cmd.env_clear();
+                for (k, v) in base_child_env(config.sandbox.is_none(), &config.inherit_env) {
+                    cmd.env(k, v);
+                }
+                for (k, v) in &config.env {
+                    cmd.env(k, v);
+                }
 
-            let mut child = cmd
-                .spawn()
-                .map_err(|e| format!("Failed to spawn {}: {}", name, e))?;
-            let stdin = child.stdin.take().ok_or("No stdin")?;
-            let stdout = child.stdout.take().ok_or("No stdout")?;
+                let mut child = cmd
+                    .spawn()
+                    .map_err(|e| format!("Failed to spawn {}: {}", name, e))?;
+                let stdin = child.stdin.take().ok_or("No stdin")?;
+                let stdout = child.stdout.take().ok_or("No stdout")?;
 
-            let reader = BufReader::new(stdout);
-            let lines = Arc::new(Mutex::new(reader.lines()));
+                let reader = BufReader::new(stdout);
+                let lines = Arc::new(Mutex::new(reader.lines()));
+                Link::Stdio {
+                    child,
+                    stdin,
+                    stdout_lines: lines,
+                }
+            };
 
             let mut proc = ChildProcess {
-                child,
-                stdin,
-                stdout_lines: lines,
+                link,
                 next_id: 1,
                 tools: Vec::new(),
                 last_used: Instant::now(),
@@ -518,7 +562,7 @@ impl ChildManager {
         if let Some(pool) = pools.remove(name) {
             for proc_arc in &pool.procs {
                 let mut proc = proc_arc.lock().await;
-                let _ = proc.child.kill().await;
+                proc.kill().await;
             }
             eprintln!("[McpHub][INFO] Stopped server: {}", name);
         }
@@ -529,7 +573,7 @@ impl ChildManager {
         for (name, pool) in pools.drain() {
             for proc_arc in &pool.procs {
                 let mut proc = proc_arc.lock().await;
-                let _ = proc.child.kill().await;
+                proc.kill().await;
             }
             eprintln!("[McpHub][INFO] Stopped server: {}", name);
         }
@@ -617,7 +661,7 @@ impl ChildManager {
             if let Some(pool) = pools.remove(&name) {
                 for proc_arc in &pool.procs {
                     let mut proc = proc_arc.lock().await;
-                    let _ = proc.child.kill().await;
+                    proc.kill().await;
                 }
                 eprintln!("[McpHub][INFO] Idle-stopped server: {}", name);
             }
@@ -641,7 +685,7 @@ impl ChildManager {
             for proc_arc in &pool.procs {
                 let mut proc = proc_arc.lock().await;
 
-                match proc.child.try_wait() {
+                match proc.exited() {
                     Ok(Some(status)) => {
                         pool_dead = true;
                         reason = format!("Process exited: {}", status);
@@ -682,7 +726,7 @@ impl ChildManager {
                 if let Some(pool) = pools.remove(&name) {
                     for proc_arc in &pool.procs {
                         let mut proc = proc_arc.lock().await;
-                        let _ = proc.child.kill().await;
+                        proc.kill().await;
                     }
                 }
             }
@@ -697,7 +741,7 @@ impl ChildManager {
             if let Some(pool) = pools.remove(name) {
                 for proc_arc in &pool.procs {
                     let mut proc = proc_arc.lock().await;
-                    let _ = proc.child.kill().await;
+                    proc.kill().await;
                 }
             }
         }
@@ -735,6 +779,13 @@ async fn send_request_inner(
     method: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    let (stdin, stdout_lines) = match &mut proc.link {
+        Link::Http(remote) => {
+            let remote = remote.clone();
+            return remote.request(method, params).await;
+        }
+        Link::Stdio { stdin, stdout_lines, .. } => (stdin, stdout_lines.clone()),
+    };
     let id = proc.next_id;
     proc.next_id += 1;
 
@@ -748,16 +799,16 @@ async fn send_request_inner(
     let mut msg = serde_json::to_string(&request).map_err(|e| e.to_string())?;
     msg.push('\n');
 
-    proc.stdin
+    stdin
         .write_all(msg.as_bytes())
         .await
         .map_err(|e| format!("Write error: {}", e))?;
-    proc.stdin
+    stdin
         .flush()
         .await
         .map_err(|e| format!("Flush error: {}", e))?;
 
-    let mut lines = proc.stdout_lines.lock().await;
+    let mut lines = stdout_lines.lock().await;
     loop {
         let line = lines
             .next_line()
@@ -814,6 +865,13 @@ async fn send_notification(
     method: &str,
     params: serde_json::Value,
 ) -> Result<(), String> {
+    let stdin = match &mut proc.link {
+        Link::Http(remote) => {
+            let remote = remote.clone();
+            return remote.notify(method, params).await;
+        }
+        Link::Stdio { stdin, .. } => stdin,
+    };
     let notification = serde_json::json!({
         "jsonrpc": "2.0",
         "method": method,
@@ -823,11 +881,11 @@ async fn send_notification(
     let mut msg = serde_json::to_string(&notification).map_err(|e| e.to_string())?;
     msg.push('\n');
 
-    proc.stdin
+    stdin
         .write_all(msg.as_bytes())
         .await
         .map_err(|e| format!("Write error: {}", e))?;
-    proc.stdin
+    stdin
         .flush()
         .await
         .map_err(|e| format!("Flush error: {}", e))?;

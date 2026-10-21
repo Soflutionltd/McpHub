@@ -16,9 +16,11 @@ mod http_guard;
 mod install;
 mod logs;
 mod permissions;
+mod oauth;
 mod protocol;
 mod proxy;
 mod redaction;
+mod remote;
 mod response_cache;
 mod sandbox;
 mod search;
@@ -61,6 +63,7 @@ USAGE:
   McpHub policy       Show tool permissions; 'policy test SERVER TOOL' to check one
   McpHub audit        Show the audit log (--tail N, --server S, --tool T, --decision D, --json)
   McpHub sandbox      Server isolation (macOS sandbox): list, or 'sandbox show SERVER'
+  McpHub oauth        Remote servers: status, login SERVER, logout SERVER, migrate [--apply] (from mcp-remote)
   McpHub pins         Tool pinning (anti rug-pull): list, status, approve SERVER [TOOL], reset SERVER, scan
   McpHub update       Self-update to the latest version on GitHub
   McpHub version      Show version
@@ -373,6 +376,7 @@ async fn main() {
             }
         }
         Some("pins") => std::process::exit(toolguard::cmd_pins(&args[2..])),
+        Some("oauth") => std::process::exit(oauth::run_cli(&args[2..]).await),
         _ => {
             // Default: stdio proxy + HTTP server with SSE
             eprintln!("McpHub v{} — starting...", VERSION);

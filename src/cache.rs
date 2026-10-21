@@ -85,6 +85,11 @@ pub fn server_config_hash(config: &ServerConfig) -> String {
     config.request_timeout_secs.hash(&mut hasher);
     format!("{:?}", config.sandbox).hash(&mut hasher);
     config.inherit_env.hash(&mut hasher);
+    config.url.hash(&mut hasher);
+    config.oauth.hash(&mut hasher);
+    let mut header_pairs: Vec<(&String, &String)> = config.headers.iter().collect();
+    header_pairs.sort();
+    header_pairs.hash(&mut hasher);
 
     let mut env_pairs: Vec<(&String, &String)> = config.env.iter().collect();
     env_pairs.sort_by(|left, right| left.0.cmp(right.0));
@@ -119,6 +124,9 @@ mod tests {
             request_timeout_secs: None,
             sandbox: None,
             inherit_env: Vec::new(),
+            url: None,
+            headers: HashMap::new(),
+            oauth: false,
         }
     }
 
