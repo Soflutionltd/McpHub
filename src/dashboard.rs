@@ -262,6 +262,47 @@ async fn handle_streamable_http_message(
     }
 }
 
+#[derive(Clone, Copy)]
+enum OauthPage {
+    Connected,
+    Denied,
+    Expired,
+}
+
+/// Premier code de langue de l'en-tête Accept-Language (ex. « fr-FR,fr;q=0.9,en;q=0.8 » donne le français).
+fn prefers_french(accept_language: &str) -> bool {
+    accept_language
+        .split(',')
+        .next()
+        .map(|tag| tag.trim().to_ascii_lowercase())
+        .is_some_and(|tag| tag == "fr" || tag.starts_with("fr-") || tag.starts_with("fr;"))
+}
+
+fn oauth_callback_page(page: OauthPage, french: bool) -> String {
+    let (tone, icon) = match page {
+        OauthPage::Connected => ("ok", r#"<path pathLength="1" d="M5 12.5l4.5 4.5L19 7.5"/>"#),
+        OauthPage::Denied => ("denied", r#"<path pathLength="1" d="M7 7l10 10"/><path pathLength="1" d="M17 7L7 17"/>"#),
+        OauthPage::Expired => (
+            "expired",
+            r#"<path pathLength="1" d="M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z"/><path pathLength="1" d="M12 7v5l3 2"/>"#,
+        ),
+    };
+    let (title, message) = match (page, french) {
+        (OauthPage::Connected, true) => ("Connexion réussie", "Le serveur est maintenant relié à McpHub. Vous pouvez fermer cet onglet."),
+        (OauthPage::Connected, false) => ("You're connected", "The server is now linked to McpHub. You can close this tab."),
+        (OauthPage::Denied, true) => ("Connexion refusée", "L'autorisation n'a pas été accordée. Fermez cet onglet et relancez la connexion."),
+        (OauthPage::Denied, false) => ("Connection declined", "Access was not granted. Close this tab and start the sign-in again."),
+        (OauthPage::Expired, true) => ("Lien expiré", "Ce lien de connexion est inconnu ou a expiré. Relancez <code>McpHub oauth login SERVEUR</code>."),
+        (OauthPage::Expired, false) => ("Link expired", "This sign-in link is unknown or has expired. Run <code>McpHub oauth login SERVER</code> again."),
+    };
+    OAUTH_CALLBACK_HTML
+        .replace("{{lang}}", if french { "fr" } else { "en" })
+        .replace("{{tone}}", tone)
+        .replace("{{icon}}", icon)
+        .replace("{{title}}", title)
+        .replace("{{message}}", message)
+}
+
 fn query_param(full_path: &str, key: &str) -> Option<String> {
     let query = full_path.split_once('?')?.1;
     query.split('&').find_map(|kv| {
@@ -968,18 +1009,17 @@ async fn route(
             };
             let ok = outcome.is_ok();
             let known = crate::oauth::complete_callback(&state, outcome);
-            let msg = if known && ok {
-                "Connexion reussie. Vous pouvez fermer cet onglet."
-            } else if known {
-                "Connexion refusee. Vous pouvez fermer cet onglet."
-            } else {
-                "Lien de connexion inconnu ou expire. Relancer : McpHub oauth login SERVEUR"
+            let page = match (known, ok) {
+                (true, true) => OauthPage::Connected,
+                (true, false) => OauthPage::Denied,
+                (false, _) => OauthPage::Expired,
             };
+            let french = req.headers.get("accept-language").is_some_and(|langs| prefers_french(langs));
             http_response_with(
                 if known { 200 } else { 400 },
                 if known { "OK" } else { "Bad Request" },
                 "text/html; charset=utf-8",
-                &format!("<!doctype html><meta charset=utf-8><title>McpHub</title><p style='font-family:system-ui;padding:40px'>{}</p>", msg),
+                &oauth_callback_page(page, french),
                 headers,
             )
         }
@@ -1449,3 +1489,32 @@ async fn handle_connection(
 // ─── Embedded HTML ───────────────────────────────────────────
 
 const DASHBOARD_HTML: &str = include_str!("../static/dashboard.html");
+const OAUTH_CALLBACK_HTML: &str = include_str!("../static/oauth-callback.html");
+
+#[cfg(test)]
+mod oauth_page_tests {
+    use super::*;
+
+    #[test]
+    fn french_only_when_first_language_is_french() {
+        assert!(prefers_french("fr-FR,fr;q=0.9,en;q=0.8"));
+        assert!(prefers_french("fr"));
+        assert!(!prefers_french("en-US,en;q=0.9,fr;q=0.8"));
+        assert!(!prefers_french("fy-NL"));
+        assert!(!prefers_french(""));
+    }
+
+    #[test]
+    fn every_page_is_fully_rendered() {
+        for page in [OauthPage::Connected, OauthPage::Denied, OauthPage::Expired] {
+            for french in [true, false] {
+                let html = oauth_callback_page(page, french);
+                assert!(!html.contains("{{"), "repère non remplacé");
+                assert!(html.contains(if french { "lang=\"fr\"" } else { "lang=\"en\"" }));
+            }
+        }
+        assert!(oauth_callback_page(OauthPage::Connected, true).contains("Connexion réussie"));
+        assert!(oauth_callback_page(OauthPage::Connected, false).contains("You're connected"));
+        assert!(oauth_callback_page(OauthPage::Expired, false).contains("McpHub oauth login SERVER"));
+    }
+}
