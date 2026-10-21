@@ -20,6 +20,7 @@ mod redaction;
 mod response_cache;
 mod search;
 mod sse;
+mod toolguard;
 mod untrusted;
 mod update;
 mod vault;
@@ -56,6 +57,7 @@ USAGE:
   McpHub vault        Secrets in the macOS Keychain (status, list, set, get, rm, migrate)
   McpHub policy       Show tool permissions; 'policy test SERVER TOOL' to check one
   McpHub audit        Show the audit log (--tail N, --server S, --tool T, --decision D, --json)
+  McpHub pins         Tool pinning (anti rug-pull): list, status, approve SERVER [TOOL], reset SERVER, scan
   McpHub update       Self-update to the latest version on GitHub
   McpHub version      Show version
   McpHub help         Show this help
@@ -66,7 +68,9 @@ TRANSPORT MODES:
     Starts stdio proxy AND HTTP server on :24680 (dashboard + SSE)
 
   Serve (HTTP only, recommended):
-    Cursor config: {{"mcpServers": {{"McpHub": {{"url": "http://127.0.0.1:24680/sse", "headers": {{"Authorization": "Bearer <token>"}}}}}}}}
+    Cursor config: {{"mcpServers": {{"McpHub": {{"url": "http://127.0.0.1:24680/mcp", "headers": {{"Authorization": "Bearer <token>"}}}}}}}}
+    Profile per client: http://127.0.0.1:24680/mcp/<profile> (settings.profiles in config.json)
+    Legacy SSE: http://127.0.0.1:24680/sse (optional ?profile=<profile>)
     Run 'McpHub install' to auto-start, then configure Cursor with URL and token.
     Survives Cursor restarts. Single process for everything.
 
@@ -332,6 +336,7 @@ async fn main() {
             permissions::run_cli(&args[2..], &config.permissions);
         }
         Some("audit") => audit::run_cli(&args[2..]),
+        Some("pins") => std::process::exit(toolguard::cmd_pins(&args[2..])),
         _ => {
             // Default: stdio proxy + HTTP server with SSE
             eprintln!("McpHub v{} — starting...", VERSION);

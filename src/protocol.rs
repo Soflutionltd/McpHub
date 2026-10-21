@@ -194,13 +194,37 @@ fn is_inline_mime_type_allowed(mime_type: &str, media_profile: &MediaProfile) ->
 
 // ─── MCP Tool Types ──────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolDef {
     pub name: String,
     #[serde(default)]
     pub description: String,
     #[serde(rename = "inputSchema", default)]
     pub input_schema: Value,
+    /// Titre lisible (MCP 2025-06-18), relayé tel quel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Annotations (readOnlyHint, destructiveHint, idempotentHint, openWorldHint...).
+    /// Auparavant perdues à la désérialisation : elles servent maintenant aux permissions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Value>,
+    /// Schéma de sortie (structuredContent), relayé tel quel.
+    #[serde(rename = "outputSchema", default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+}
+
+impl ToolDef {
+    fn hint(&self, key: &str) -> Option<bool> {
+        self.annotations.as_ref()?.get(key)?.as_bool()
+    }
+    /// Le serveur déclare explicitement l'outil en lecture seule.
+    pub fn read_only_hint(&self) -> Option<bool> {
+        self.hint("readOnlyHint")
+    }
+    /// Le serveur déclare explicitement l'outil destructeur (et pas en lecture seule).
+    pub fn declared_destructive(&self) -> bool {
+        self.hint("destructiveHint") == Some(true) && self.read_only_hint() != Some(true)
+    }
 }
 
 #[derive(Debug, Serialize)]

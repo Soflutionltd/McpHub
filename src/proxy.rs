@@ -19,6 +19,25 @@ use crate::response_cache::ResponseCache;
 use crate::search::{IndexedTool, SearchEngine};
 use crate::untrusted;
 
+tokio::task_local! {
+    /// Profil du client à l'origine de la requête en cours (ex. /mcp/cursor).
+    static REQUEST_PROFILE: Option<String>;
+}
+
+/// Profil actif : celui de la requête HTTP, sinon la variable MCPHUB_PROFILE (mode stdio).
+pub fn current_profile() -> Option<String> {
+    REQUEST_PROFILE
+        .try_with(|p| p.clone())
+        .ok()
+        .flatten()
+        .or_else(|| {
+            std::env::var("MCPHUB_PROFILE")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ServerMetrics {
     pub call_count: u64,
@@ -171,6 +190,7 @@ enum PolicyGate {
 
 impl ProxyServer {
     pub fn new(config: ProxyConfig) -> Self {
+        crate::toolguard::configure(config.guard.clone());
         let child_manager = Arc::new(ChildManager::new(
             config.servers.clone(),
             config.idle_timeout_ms,
@@ -210,7 +230,48 @@ impl ProxyServer {
         confirmation_token: Option<&str>,
     ) -> PolicyGate {
         let permissions = self.config.lock().await.permissions.clone();
-        let decision = permissions.decide(server, tool);
+        let mut tool_def = {
+            let engine = self.search_engine.lock().await;
+            engine.find_tool(server, tool).map(|t| t.tool_def.clone())
+        };
+        if tool_def.is_none() {
+            // Outil hors catalogue : démarrer le serveur d'abord, pour que sa définition réelle
+            // soit épinglée et analysée AVANT l'appel (pas de contournement par un outil inconnu).
+            if let Ok(tools) = self.child_manager.start_server(server).await {
+                tool_def = tools.into_iter().find(|t| t.name == tool);
+            }
+        }
+        if let Some(reason) =
+            crate::toolguard::block_reason(server, tool, tool_def.as_ref(), current_profile().as_deref())
+        {
+            self.record_audit(AuditEntry {
+                server: server.to_string(),
+                tool: tool.to_string(),
+                mode,
+                decision: "deny",
+                status: "blocked",
+                policy: "toolguard".into(),
+                arguments: Some(arguments.clone()),
+                ..Default::default()
+            })
+            .await;
+            return PolicyGate::Respond(JsonRpcResponse::error_with_data(
+                id.clone(),
+                -32001,
+                format!("Bloque par McpHub : {}/{} : {}", server, tool, reason),
+                serde_json::json!({
+                    "server": server,
+                    "tool": tool,
+                    "policy": "toolguard",
+                    "hint": "Ne pas reessayer ni chercher a contourner : le signaler a l'utilisateur."
+                }),
+            ));
+        }
+        let declared_destructive = tool_def
+            .as_ref()
+            .map(|t| t.declared_destructive())
+            .unwrap_or(false);
+        let decision = permissions.decide_with(server, tool, declared_destructive);
         let base_entry = || AuditEntry {
             server: server.to_string(),
             tool: tool.to_string(),
@@ -599,6 +660,15 @@ impl ProxyServer {
         self.child_manager.stop_all().await;
     }
 
+    /// Traite une requête dans le contexte d'un profil client (HTTP /mcp/<profil>, SSE ?profile=).
+    pub async fn handle_request_in_profile(
+        &self,
+        req: JsonRpcRequest,
+        profile: Option<String>,
+    ) -> Option<JsonRpcResponse> {
+        REQUEST_PROFILE.scope(profile, self.handle_request(req)).await
+    }
+
     pub async fn handle_request(&self, req: JsonRpcRequest) -> Option<JsonRpcResponse> {
         match req.method.as_str() {
             "initialize" => Some(self.handle_initialize(req.id, req.params).await),
@@ -721,6 +791,8 @@ impl ProxyServer {
             config.servers.keys().cloned().collect()
         };
         server_names.sort();
+        let profile = current_profile();
+        server_names.retain(|s| crate::toolguard::server_visible(s, profile.as_deref()));
         let server_enum: Vec<serde_json::Value> = server_names
             .iter()
             .map(|s| serde_json::Value::String(s.clone()))
@@ -803,8 +875,20 @@ impl ProxyServer {
 
         // Expose all tools with prefixed names
         let mut tools = Vec::new();
+        let profile = current_profile();
         for entry in &catalog {
             if let Some(indexed) = engine.find_tool(&entry.server, &entry.name) {
+                if profile.is_some()
+                    && crate::toolguard::block_reason(
+                        &indexed.server_name,
+                        &indexed.original_name,
+                        Some(&indexed.tool_def),
+                        profile.as_deref(),
+                    )
+                    .is_some()
+                {
+                    continue;
+                }
                 let mut tool_json = serde_json::to_value(&indexed.tool_def).unwrap();
                 if let Some(obj) = tool_json.as_object_mut() {
                     obj.insert(
@@ -891,6 +975,8 @@ impl ProxyServer {
             config.servers.keys().cloned().collect()
         };
         all_server_names.sort();
+        let profile = current_profile();
+        all_server_names.retain(|s| crate::toolguard::server_visible(s, profile.as_deref()));
         let engine = self.search_engine.lock().await;
         let (effective_server_filter, filter_source) = infer_discover_server_filter(
             query,
@@ -915,7 +1001,7 @@ impl ProxyServer {
             .unwrap_or(false);
 
         if engine.tool_count() > 0 && !should_try_live_discovery {
-            let allowed_servers = if effective_server_filter.is_some() {
+            let allowed_servers = if effective_server_filter.is_some() || profile.is_some() {
                 Some(
                     visible_server_names
                         .iter()
@@ -933,6 +1019,22 @@ impl ProxyServer {
                 allowed_servers.as_ref(),
                 &usage_boost,
             );
+            let results: Vec<&IndexedTool> = if profile.is_some() {
+                results
+                    .into_iter()
+                    .filter(|t| {
+                        crate::toolguard::block_reason(
+                            &t.server_name,
+                            &t.original_name,
+                            Some(&t.tool_def),
+                            profile.as_deref(),
+                        )
+                        .is_none()
+                    })
+                    .collect()
+            } else {
+                results
+            };
             let total_matched = results.len();
 
             // Apply pagination offset.
@@ -1027,6 +1129,13 @@ impl ProxyServer {
         if let Some(filter) = effective_server_filter.as_ref() {
             match self.child_manager.start_server(filter).await {
                 Ok(tools) => {
+                    let tools: Vec<ToolDef> = crate::toolguard::present_tools(filter, &tools)
+                        .into_iter()
+                        .filter(|t| {
+                            crate::toolguard::block_reason(filter, &t.name, Some(t), profile.as_deref())
+                                .is_none()
+                        })
+                        .collect();
                     let live_results = live_discover_results(filter, &tools, query, top_k);
                     let text = serde_json::to_string(&serde_json::json!({
                         "query": query,
@@ -1076,6 +1185,7 @@ impl ProxyServer {
             config.servers.keys().cloned().collect()
         };
         server_names.sort();
+        server_names.retain(|s| crate::toolguard::server_visible(s, profile.as_deref()));
         if let Some(filter) = effective_server_filter.as_ref() {
             server_names.retain(|server_name| server_matches_filter(server_name, filter));
         }
@@ -1215,6 +1325,18 @@ impl ProxyServer {
                         untrusted,
                     )
                 } else {
+                    if let Some(reason) = crate::toolguard::block_reason(
+                        &indexed_server_name,
+                        &tool,
+                        None,
+                        current_profile().as_deref(),
+                    ) {
+                        return JsonRpcResponse::error(
+                            id,
+                            -32001,
+                            format!("Bloque par McpHub : {}/{} : {}", indexed_server_name, tool, reason),
+                        );
+                    }
                     self.record_execute_route(ExecuteRouteStrategy::UnknownToolError)
                         .await;
                     // Help the caller: list available tools on this server.
@@ -1706,8 +1828,10 @@ fn indexed_tools_from_servers(servers: &HashMap<String, Vec<ToolDef>>) -> Vec<In
 
     let mut all_tools = Vec::new();
     for server_name in server_names {
-        if let Some(tools) = servers.get(&server_name) {
-            for tool in tools {
+        if let Some(raw_tools) = servers.get(&server_name) {
+            crate::toolguard::review(&server_name, raw_tools);
+            let tools = crate::toolguard::present_tools(&server_name, raw_tools);
+            for tool in &tools {
                 all_tools.push(IndexedTool {
                     name: format!("{}__{}", server_name, tool.name),
                     original_name: tool.name.clone(),
@@ -1963,8 +2087,26 @@ async fn config_and_cache_watcher(
         .and_then(|p| p.metadata().ok())
         .and_then(|m| m.modified().ok());
 
+    let pins_path = crate::toolguard::pins_path();
+    let mut last_pins_modified: Option<SystemTime> =
+        pins_path.metadata().ok().and_then(|m| m.modified().ok());
+
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+        // Épingles modifiées (ex. `McpHub pins approve`) : un outil sorti de quarantaine
+        // doit réapparaître dans le catalogue.
+        let pins_modified = pins_path.metadata().ok().and_then(|m| m.modified().ok());
+        if pins_modified != last_pins_modified {
+            if let Some(cached) = crate::cache::load_cache() {
+                let all_tools = indexed_tools_from_servers(&cached.servers);
+                let mut eng = engine.lock().await;
+                eng.build_index(all_tools);
+                eprintln!("[McpHub][GUARD] Catalogue reconstruit (epingles modifiees) : {} outils", eng.tool_count());
+            }
+            // L'index peut lui-même avoir réécrit le fichier (premier contact) : on suit.
+            last_pins_modified = pins_path.metadata().ok().and_then(|m| m.modified().ok());
+        }
 
         // Check Cache
         if let Some(cache_path) = &cache_path_opt {
@@ -2019,9 +2161,15 @@ async fn config_and_cache_watcher(
                                 .collect();
                         }
 
+                        crate::toolguard::configure(new_config.guard.clone());
                         {
                             let mut cfg = config_store.lock().await;
                             *cfg = new_config;
+                        }
+                        // Filtres et descriptions peuvent avoir changé sans redémarrage de serveur.
+                        if let Some(cached) = crate::cache::load_cache() {
+                            let all_tools = indexed_tools_from_servers(&cached.servers);
+                            engine.lock().await.build_index(all_tools);
                         }
 
                         child_manager.update_configs(new_servers).await;
@@ -2061,11 +2209,13 @@ mod tests {
                 name: "deploy".to_string(),
                 description: "Deploy a worker".to_string(),
                 input_schema: json!({}),
+                ..Default::default()
             },
             ToolDef {
                 name: "deploy_worker".to_string(),
                 description: "Deploy a worker with more options".to_string(),
                 input_schema: json!({}),
+                ..Default::default()
             },
         ];
 
@@ -2079,6 +2229,7 @@ mod tests {
             name: "create_issue".to_string(),
             description: "Create a GitHub issue".to_string(),
             input_schema: json!({}),
+            ..Default::default()
         }];
 
         let results = live_discover_results("github", &tools, "", 10);
@@ -2098,6 +2249,7 @@ mod tests {
                 name: "execute_sql".to_string(),
                 description: "Execute SQL".to_string(),
                 input_schema: json!({}),
+                ..Default::default()
             },
             untrusted_output: false,
         }]);
@@ -2134,6 +2286,7 @@ mod tests {
                 name: "search_cloudflare_documentation".to_string(),
                 description: "Search Cloudflare documentation".to_string(),
                 input_schema: json!({}),
+                ..Default::default()
             },
             untrusted_output: false,
         }]);

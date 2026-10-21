@@ -417,6 +417,7 @@ mod tests {
                 name: name.to_string(),
                 description: desc.to_string(),
                 input_schema: json!({"type": "object"}),
+                ..Default::default()
             },
             untrusted_output: false,
         }
@@ -481,6 +482,7 @@ mod tests {
                     name: "create_issue".to_string(),
                     description: "Create a GitHub issue".to_string(),
                 input_schema: json!({"type": "object"}),
+                ..Default::default()
             },
             untrusted_output: false,
         },
@@ -493,6 +495,7 @@ mod tests {
                     name: "execute_sql".to_string(),
                     description: "Execute SQL on Supabase".to_string(),
                 input_schema: json!({"type": "object"}),
+                ..Default::default()
             },
             untrusted_output: false,
         },
@@ -518,6 +521,7 @@ mod tests {
                     name: "recall".to_string(),
                     description: "Recall memories".to_string(),
                 input_schema: json!({"type": "object"}),
+                ..Default::default()
             },
             untrusted_output: false,
         },
@@ -530,6 +534,7 @@ mod tests {
                     name: "execute_sql".to_string(),
                     description: "Execute SQL".to_string(),
                 input_schema: json!({"type": "object"}),
+                ..Default::default()
             },
             untrusted_output: false,
         },
@@ -542,6 +547,7 @@ mod tests {
                     name: "create_issue".to_string(),
                     description: "Create issue".to_string(),
                 input_schema: json!({"type": "object"}),
+                ..Default::default()
             },
             untrusted_output: false,
         },
@@ -570,6 +576,7 @@ mod tests {
                     name: "search".to_string(),
                     description: "Search GitHub".to_string(),
                 input_schema: json!({"type": "object"}),
+                ..Default::default()
             },
             untrusted_output: false,
         },
@@ -582,6 +589,7 @@ mod tests {
                     name: "search".to_string(),
                     description: "Search web".to_string(),
                 input_schema: json!({"type": "object"}),
+                ..Default::default()
             },
             untrusted_output: false,
         },
@@ -603,6 +611,7 @@ mod tests {
                     name: "browser_navigate".to_string(),
                     description: "Navigate browser".to_string(),
                 input_schema: json!({"type": "object"}),
+                ..Default::default()
             },
             untrusted_output: false,
         },
@@ -615,6 +624,7 @@ mod tests {
                     name: "browser_navigate".to_string(),
                     description: "Navigate browser".to_string(),
                 input_schema: json!({"type": "object"}),
+                ..Default::default()
             },
             untrusted_output: false,
         },

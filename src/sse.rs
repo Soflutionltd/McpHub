@@ -21,6 +21,8 @@ use crate::proxy::ProxyServer;
 struct SseSession {
     tx: mpsc::Sender<String>,
     last_activity: Instant,
+    /// Profil client choisi à la connexion (GET /sse?profile=...).
+    profile: Option<String>,
 }
 
 /// Manages all active SSE sessions.
@@ -50,7 +52,7 @@ impl SseManager {
 
     /// Handle GET /sse — establish long-lived SSE connection.
     /// Sends endpoint event, then streams responses until client disconnects.
-    pub async fn handle_connect(&self, mut stream: TcpStream) {
+    pub async fn handle_connect(&self, mut stream: TcpStream, profile: Option<String>) {
         let session_id = generate_session_id();
 
         // Enable TCP keepalive to detect half-open connections.
@@ -92,6 +94,7 @@ impl SseManager {
                 SseSession {
                     tx,
                     last_activity: Instant::now(),
+                    profile,
                 },
             );
         }
@@ -153,7 +156,11 @@ impl SseManager {
         let has_id = request.id.is_some();
 
         // Process through proxy
-        let response = proxy.handle_request(request).await;
+        let profile = {
+            let sessions = self.sessions.lock().await;
+            sessions.get(session_id).and_then(|s| s.profile.clone())
+        };
+        let response = proxy.handle_request_in_profile(request, profile).await;
 
         // Send response through SSE stream
         if let Some(resp) = response {
@@ -316,6 +323,7 @@ mod tests {
                 tx,
                 last_activity: Instant::now()
                     - std::time::Duration::from_secs(SESSION_TIMEOUT_SECS + 10),
+                profile: None,
             },
         )])));
 

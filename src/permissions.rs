@@ -146,6 +146,13 @@ impl PermissionsConfig {
     }
 
     pub fn decide(&self, server: &str, tool: &str) -> Decision {
+        self.decide_with(server, tool, false)
+    }
+
+    /// Comme `decide`, en tenant compte de l'annotation MCP `destructiveHint` déclarée par
+    /// le serveur. Une annotation ne peut que durcir la décision (jamais l'assouplir) :
+    /// `readOnlyHint` est déclaratif et ne doit pas permettre de contourner une règle.
+    pub fn decide_with(&self, server: &str, tool: &str, declared_destructive: bool) -> Decision {
         for (i, rule) in self.rules.iter().enumerate() {
             if glob_match(&rule.server, server) && glob_match(&rule.tool, tool) {
                 return Decision {
@@ -160,6 +167,13 @@ impl PermissionsConfig {
                 action: Action::Confirm,
                 source: "auto:destructive".into(),
                 reason: Some("nom d'outil destructeur".into()),
+            };
+        }
+        if self.auto_classify && declared_destructive && self.default != Action::Deny {
+            return Decision {
+                action: Action::Confirm,
+                source: "auto:annotation".into(),
+                reason: Some("le serveur declare cet outil destructeur (destructiveHint)".into()),
             };
         }
         Decision {
@@ -385,6 +399,22 @@ mod tests {
         assert!(!is_destructive("list_deleted_items"));
         assert!(!is_destructive("get_issue"));
         assert!(!is_destructive("format_document"));
+    }
+
+    #[test]
+    fn annotation_durcit_mais_n_assouplit_pas() {
+        let mut cfg = PermissionsConfig::default();
+        cfg.auto_classify = true;
+        let d = cfg.decide_with("srv", "apply_changes", true);
+        assert_eq!(d.action, Action::Confirm);
+        assert_eq!(d.source, "auto:annotation");
+        assert_eq!(cfg.decide_with("srv", "apply_changes", false).action, Action::Allow);
+        // Une regle explicite reste prioritaire.
+        cfg.rules.push(Rule { server: "srv".into(), tool: "apply_*".into(), action: Action::Allow, reason: None });
+        assert_eq!(cfg.decide_with("srv", "apply_changes", true).action, Action::Allow);
+        // Sans auto_classify, pas d'effet.
+        let cfg2 = PermissionsConfig::default();
+        assert_eq!(cfg2.decide_with("srv", "x", true).action, Action::Allow);
     }
 
     #[test]

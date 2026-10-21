@@ -41,6 +41,8 @@ pub struct ProxyConfig {
     pub health_notifications: bool,
     pub permissions: crate::permissions::PermissionsConfig,
     pub audit: crate::audit::AuditConfig,
+    /// Épinglage, détection d'empoisonnement, filtres d'outils et profils.
+    pub guard: crate::toolguard::GuardConfig,
 }
 
 impl Default for ProxyConfig {
@@ -58,6 +60,7 @@ impl Default for ProxyConfig {
             health_notifications: true,
             permissions: crate::permissions::PermissionsConfig::default(),
             audit: crate::audit::AuditConfig::default(),
+            guard: crate::toolguard::GuardConfig::default(),
         }
     }
 }
@@ -243,6 +246,13 @@ fn parse_servers(json: &Value) -> HashMap<String, ServerConfig> {
     result
 }
 
+/// Réglages de garde des outils de la config dédiée (pour la commande `McpHub pins`).
+pub fn load_guard_config() -> crate::toolguard::GuardConfig {
+    load_dedicated_config()
+        .map(|c| c.guard)
+        .unwrap_or_default()
+}
+
 fn load_dedicated_config() -> Option<ProxyConfig> {
     let home = dirs::home_dir()?;
     let path = home.join(".McpHub").join("config.json");
@@ -273,6 +283,7 @@ fn config_from_json(json: &Value, source_path: Option<&Path>) -> Option<ProxyCon
 
     let mut config = ProxyConfig {
         servers,
+        guard: crate::toolguard::parse_guard_config(json),
         ..Default::default()
     };
     if let Some(settings) = json.get("settings") {

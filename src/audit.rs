@@ -240,6 +240,14 @@ fn rotate(path: &PathBuf, keep: usize) {
     let _ = fs::rename(path, rotated_name(path, 1));
 }
 
+/// Date ISO 8601 UTC courante.
+pub fn iso_utc_now() -> String {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    iso_utc(d.as_secs(), d.subsec_millis())
+}
+
 /// Date ISO 8601 UTC sans dépendance (algorithme de Howard Hinnant).
 pub fn iso_utc(secs: u64, millis: u32) -> String {
     let days = (secs / 86_400) as i64;

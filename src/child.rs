@@ -31,6 +31,43 @@ struct ServerPool {
     next_idx: AtomicUsize,
 }
 
+/// Version de protocole proposée aux serveurs enfants (ils répondent avec la leur).
+const CHILD_PROTOCOL_VERSION: &str = "2025-06-18";
+
+/// Sortie d'erreur d'un serveur enfant : ~/.McpHub/logs/<serveur>.stderr.log (remise à zéro
+/// au-delà de 1 Mo). Auparavant jetée, ce qui rendait les pannes de démarrage illisibles.
+fn child_stderr(name: &str) -> Stdio {
+    let Some(home) = dirs::home_dir() else {
+        return Stdio::null();
+    };
+    let dir = home.join(".McpHub").join("logs");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return Stdio::null();
+    }
+    let safe: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let path = dir.join(format!("{}.stderr.log", safe));
+    let too_big = std::fs::metadata(&path).map(|m| m.len() > 1_000_000).unwrap_or(false);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true);
+    if too_big {
+        opts.write(true).truncate(true);
+    } else {
+        opts.append(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    match opts.open(&path) {
+        Ok(f) => Stdio::from(f),
+        Err(_) => Stdio::null(),
+    }
+}
+
 pub struct ChildManager {
     configs: Arc<Mutex<HashMap<String, ServerConfig>>>,
     pools: Arc<Mutex<HashMap<String, Arc<ServerPool>>>>,
@@ -179,7 +216,7 @@ impl ChildManager {
             cmd.args(&config.args)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null());
+                .stderr(child_stderr(name));
 
             for (k, v) in &config.env {
                 cmd.env(k, v);
@@ -213,7 +250,7 @@ impl ChildManager {
                 &mut proc,
                 "initialize",
                 serde_json::json!({
-                    "protocolVersion": "2024-11-05",
+                    "protocolVersion": CHILD_PROTOCOL_VERSION,
                     "capabilities": {},
                     "clientInfo": { "name": "McpHub", "version": "4.0.0" }
                 }),
@@ -236,13 +273,40 @@ impl ChildManager {
                 serde_json::json!({}),
             )
             .await?;
-            let tools_result = send_request(&mut proc, "tools/list", serde_json::json!({})).await?;
-            let tools: Vec<ToolDef> = tools_result
-                .get("tools")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
+            // tools/list est paginé (nextCursor) : on lit toutes les pages.
+            let mut tools: Vec<ToolDef> = Vec::new();
+            let mut cursor: Option<String> = None;
+            for _page in 0..50 {
+                let params = match &cursor {
+                    Some(c) => serde_json::json!({ "cursor": c }),
+                    None => serde_json::json!({}),
+                };
+                let tools_result = send_request(&mut proc, "tools/list", params).await?;
+                if let Some(arr) = tools_result.get("tools").and_then(|v| v.as_array()) {
+                    for t in arr {
+                        // Un outil mal formé n'empêche plus de lire les autres.
+                        match serde_json::from_value::<ToolDef>(t.clone()) {
+                            Ok(def) => tools.push(def),
+                            Err(e) => eprintln!(
+                                "[McpHub][WARN] {} : outil ignore (definition invalide : {})",
+                                name, e
+                            ),
+                        }
+                    }
+                }
+                cursor = tools_result
+                    .get("nextCursor")
+                    .and_then(|v| v.as_str())
+                    .filter(|c| !c.is_empty())
+                    .map(String::from);
+                if cursor.is_none() {
+                    break;
+                }
+            }
 
             if i == 0 {
+                // Épinglage / détection d'empoisonnement sur la définition réellement annoncée.
+                crate::toolguard::review(name, &tools);
                 let elapsed = start.elapsed();
                 eprintln!(
                     "[McpHub][INFO] Server '{}' ready: {} tools in {:.0}ms",

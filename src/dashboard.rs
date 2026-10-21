@@ -195,18 +195,72 @@ fn json_err(status: u16, msg: &str) -> Vec<u8> {
     )
 }
 
-async fn handle_streamable_http_message(body: &str, proxy: &Arc<ProxyServer>) -> Vec<u8> {
-    let request: JsonRpcRequest = match serde_json::from_str(body) {
-        Ok(request) => request,
+/// Streamable HTTP sans état (spec MCP 2025-06-18 et 2026-07-28) : un POST = un message
+/// JSON-RPC, réponse JSON directe ; une notification seule reçoit 202 sans corps.
+/// Les lots (tableau JSON, ancienne spec 2025-03-26) restent acceptés.
+async fn handle_streamable_http_message(
+    body: &str,
+    proxy: &Arc<ProxyServer>,
+    profile: Option<String>,
+) -> Vec<u8> {
+    let parsed: Value = match serde_json::from_str(body) {
+        Ok(v) => v,
         Err(e) => return json_err(400, &format!("Invalid JSON-RPC: {}", e)),
     };
+    let (items, is_batch) = match parsed {
+        Value::Array(a) if !a.is_empty() => (a, true),
+        Value::Array(_) => return json_err(400, "Empty batch"),
+        other => (vec![other], false),
+    };
+    let mut responses = Vec::new();
+    for item in items {
+        let request: JsonRpcRequest = match serde_json::from_value(item) {
+            Ok(r) => r,
+            Err(e) => return json_err(400, &format!("Invalid JSON-RPC: {}", e)),
+        };
+        if let Some(resp) = proxy.handle_request_in_profile(request, profile.clone()).await {
+            responses.push(resp);
+        }
+    }
+    if responses.is_empty() {
+        return http_response_with(202, "Accepted", "text/plain", "", "");
+    }
+    let out = if is_batch {
+        serde_json::to_string(&responses)
+    } else {
+        serde_json::to_string(&responses[0])
+    };
+    match out {
+        Ok(body) => http_response(200, "OK", "application/json", &body),
+        Err(e) => json_err(500, &format!("Serialize failed: {}", e)),
+    }
+}
 
-    match proxy.handle_request(request).await {
-        Some(response) => match serde_json::to_string(&response) {
-            Ok(body) => http_response(200, "OK", "application/json", &body),
-            Err(e) => json_err(500, &format!("Serialize failed: {}", e)),
-        },
-        None => http_response(202, "Accepted", "application/json", "{\"ok\":true}"),
+fn query_param(full_path: &str, key: &str) -> Option<String> {
+    let query = full_path.split_once('?')?.1;
+    query.split('&').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        if k == key {
+            Some(urldecode(v))
+        } else {
+            None
+        }
+    })
+}
+
+/// Profil demandé par le client : /mcp/<profil> ou ?profile=<profil>. Profil inconnu = 404.
+fn requested_profile(full_path: &str) -> Result<Option<String>, Vec<u8>> {
+    let path = full_path.split('?').next().unwrap_or(full_path);
+    let from_path = path
+        .strip_prefix("/mcp/")
+        .map(|p| urldecode(p.trim_matches('/')))
+        .filter(|p| !p.is_empty());
+    let name = from_path.or_else(|| query_param(full_path, "profile").filter(|p| !p.is_empty()));
+    match name {
+        Some(n) if !crate::toolguard::profile_exists(&n) => {
+            Err(json_err(404, &format!("Profil McpHub inconnu : {}", n)))
+        }
+        other => Ok(other),
     }
 }
 
@@ -1112,8 +1166,16 @@ async fn handle_connection(
             return;
         }
 
+        let profile = match requested_profile(&req.path) {
+            Ok(p) => p,
+            Err(resp) => {
+                let _ = stream.write_all(&resp).await;
+                let _ = stream.shutdown().await;
+                return;
+            }
+        };
         if let Some(sse_mgr) = &sse {
-            sse_mgr.handle_connect(stream).await;
+            sse_mgr.handle_connect(stream, profile).await;
             return; // Connection handled, don't close
         } else {
             let resp = json_err(503, "SSE not available in dashboard-only mode");
@@ -1123,8 +1185,25 @@ async fn handle_connection(
         }
     }
 
+    let is_mcp_path = path == "/mcp" || path.starts_with("/mcp/");
+
+    // Streamable HTTP : pas de flux serveur ni de session à fermer (mode sans état).
+    if is_mcp_path && (req.method == "GET" || req.method == "DELETE") {
+        let resp = http_response_with(
+            405,
+            "Method Not Allowed",
+            "application/json",
+            "{\"error\":\"Streamable HTTP sans etat : utiliser POST\"}",
+            "Allow: POST\r\n",
+        );
+        let _ = stream.write_all(&resp).await;
+        let _ = stream.shutdown().await;
+        return;
+    }
+
     // Streamable HTTP endpoint: Cursor V2 first POSTs JSON-RPC to the configured URL.
-    if path == "/sse" && req.method == "POST" {
+    // /mcp (et /mcp/<profil>) est l'adresse standard ; /sse en POST reste accepté.
+    if (path == "/sse" || is_mcp_path) && req.method == "POST" {
         let auth = req
             .headers
             .get("authorization")
@@ -1138,7 +1217,10 @@ async fn handle_connection(
         }
 
         let response = if let Some(proxy_ref) = &proxy {
-            handle_streamable_http_message(&req.body, proxy_ref).await
+            match requested_profile(&req.path) {
+                Ok(profile) => handle_streamable_http_message(&req.body, proxy_ref, profile).await,
+                Err(resp) => resp,
+            }
         } else {
             json_err(503, "MCP proxy not available in dashboard-only mode")
         };
