@@ -92,13 +92,15 @@ fn base_child_env(unsandboxed: bool, inherit: &[String]) -> Vec<(String, String)
 /// Version de protocole proposée aux serveurs enfants (ils répondent avec la leur).
 const CHILD_PROTOCOL_VERSION: &str = "2025-06-18";
 
-/// Sortie d'erreur d'un serveur enfant : ~/.McpHub/logs/<serveur>.stderr.log (remise à zéro
+/// Sortie d'erreur d'un serveur enfant : ~/Library/Logs/McpHub/<serveur>.stderr.log (remise à zéro
 /// au-delà de 1 Mo). Auparavant jetée, ce qui rendait les pannes de démarrage illisibles.
 fn child_stderr(name: &str) -> Stdio {
     let Some(home) = dirs::home_dir() else {
         return Stdio::null();
     };
-    let dir = home.join(".McpHub").join("logs");
+    // Hors de ~/.McpHub : ce dossier est interdit aux serveurs isolés, et un serveur dont la
+    // sortie d'erreur pointe vers un fichier interdit plante au démarrage (Node).
+    let dir = home.join("Library").join("Logs").join("McpHub");
     if std::fs::create_dir_all(&dir).is_err() {
         return Stdio::null();
     }

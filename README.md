@@ -237,7 +237,7 @@ McpHub implements the full MCP protocol as a proxy:
 - **Version negotiation**: Adapts to each server's supported protocol version
 - **Tool metadata**: `title`, `annotations` and `outputSchema` are relayed as declared by each server
 - **Pagination**: child `tools/list` pages (`nextCursor`) are all read
-- **Child logs**: each server's stderr goes to `~/.McpHub/logs/<server>.stderr.log`
+- **Child logs**: each server's stderr goes to `~/Library/Logs/McpHub/<server>.stderr.log`
 
 ## Configuration
 
