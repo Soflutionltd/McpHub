@@ -61,7 +61,6 @@ pub const SECRET_DIRS: &[&str] = &[
     ".config/supabase",
     ".config/stripe",
     ".config/github-copilot",
-    ".config/git",
     ".wrangler",
     ".terraform.d",
     ".codex",
@@ -100,9 +99,12 @@ pub const SECRET_FILES: &[&str] = &[
     ".bashrc",
     ".bash_profile",
     ".profile",
-    ".gitconfig",
     ".vault-token",
 ];
+
+/// Lisibles (git, flutter... en ont besoin) mais jamais modifiables : un alias ou un hook git
+/// ajouté par un serveur s'exécuterait plus tard hors du bac à sable.
+const WRITE_PROTECTED: &[&str] = &[".gitconfig", ".config/git", ".gitignore_global"];
 
 /// Programmes qui permettent de sortir du bac à sable ou de lire le Trousseau :
 /// interdits aux serveurs isolés (sauf `allowExec`).
@@ -265,6 +267,11 @@ pub fn profile(spec: &SandboxSpec, home: &str, referenced: &[String]) -> String 
             .map(|f| format!("(literal {})", q(&format!("{}/{}", home, f)))),
     );
     p.push_str(&format!("(deny file-read* file-write* {})\n", denied.join(" ")));
+    let protected: Vec<String> = WRITE_PROTECTED
+        .iter()
+        .map(|f| format!("(subpath {})", q(&format!("{}/{}", home, f))))
+        .collect();
+    p.push_str(&format!("(deny file-write* {})\n", protected.join(" ")));
 
     if spec.mode == SandboxMode::Strict {
         p.push_str("(deny file-write*)\n");
