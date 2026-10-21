@@ -12,6 +12,8 @@ pub struct ServerConfig {
     pub env: HashMap<String, String>,
     pub pool: usize,
     pub request_timeout_secs: Option<u64>,
+    /// Isolation macOS (sandbox-exec), None = sans isolation.
+    pub sandbox: Option<crate::sandbox::SandboxSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -234,14 +236,23 @@ fn parse_servers(json: &Value) -> HashMap<String, ServerConfig> {
                 .get("requestTimeoutSecs")
                 .or_else(|| config.get("requestTimeout"))
                 .and_then(|v| v.as_u64());
+            let command = expand_vars(cmd);
+            let sandbox = crate::sandbox::resolve(
+                name,
+                config,
+                json.get("settings").and_then(|s| s.get("sandbox")),
+                &command,
+                &args,
+            );
             result.insert(
                 name.clone(),
                 ServerConfig {
-                    command: expand_vars(cmd),
+                    command,
                     args,
                     env,
                     pool,
                     request_timeout_secs,
+                    sandbox,
                 },
             );
         }

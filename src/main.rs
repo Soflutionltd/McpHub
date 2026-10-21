@@ -20,6 +20,7 @@ mod protocol;
 mod proxy;
 mod redaction;
 mod response_cache;
+mod sandbox;
 mod search;
 mod sse;
 mod toolguard;
@@ -59,6 +60,7 @@ USAGE:
   McpHub vault        Secrets in the macOS Keychain (status, list, set, get, rm, migrate)
   McpHub policy       Show tool permissions; 'policy test SERVER TOOL' to check one
   McpHub audit        Show the audit log (--tail N, --server S, --tool T, --decision D, --json)
+  McpHub sandbox      Server isolation (macOS sandbox): list, or 'sandbox show SERVER'
   McpHub pins         Tool pinning (anti rug-pull): list, status, approve SERVER [TOOL], reset SERVER, scan
   McpHub update       Self-update to the latest version on GitHub
   McpHub version      Show version
@@ -338,6 +340,38 @@ async fn main() {
             permissions::run_cli(&args[2..], &config.permissions);
         }
         Some("audit") => audit::run_cli(&args[2..]),
+        Some("sandbox") => {
+            // McpHub sandbox [show SERVEUR] : isolation effective (diagnostic).
+            let config = auto_detect();
+            match (args.get(2).map(|s| s.as_str()), args.get(3)) {
+                (Some("show"), Some(name)) => match config.servers.get(name.as_str()) {
+                    Some(sc) => match &sc.sandbox {
+                        Some(spec) => {
+                            let home = dirs::home_dir()
+                                .map(|h| h.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            let refs = sandbox::referenced_paths(&sc.env, &sc.args, &home);
+                            println!("{}", sandbox::profile(spec, &home, &refs));
+                        }
+                        None => println!("{} : pas d'isolation", name),
+                    },
+                    None => eprintln!("Serveur inconnu : {}", name),
+                },
+                _ => {
+                    let mut names: Vec<_> = config.servers.keys().cloned().collect();
+                    names.sort();
+                    for n in names {
+                        let sc = &config.servers[&n];
+                        let label = sc
+                            .sandbox
+                            .as_ref()
+                            .map(|s| format!("{:?}{}", s.mode, if s.network { "" } else { ", sans reseau" }))
+                            .unwrap_or_else(|| "sans isolation".into());
+                        println!("{:28} {}", n, label);
+                    }
+                }
+            }
+        }
         Some("pins") => std::process::exit(toolguard::cmd_pins(&args[2..])),
         _ => {
             // Default: stdio proxy + HTTP server with SSE

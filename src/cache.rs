@@ -83,6 +83,7 @@ pub fn server_config_hash(config: &ServerConfig) -> String {
     config.args.hash(&mut hasher);
     config.pool.hash(&mut hasher);
     config.request_timeout_secs.hash(&mut hasher);
+    format!("{:?}", config.sandbox).hash(&mut hasher);
 
     let mut env_pairs: Vec<(&String, &String)> = config.env.iter().collect();
     env_pairs.sort_by(|left, right| left.0.cmp(right.0));
@@ -115,6 +116,7 @@ mod tests {
             ]),
             pool: 1,
             request_timeout_secs: None,
+            sandbox: None,
         }
     }
 

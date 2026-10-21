@@ -212,8 +212,18 @@ impl ChildManager {
                 eprintln!("[McpHub][INFO] Starting server: {}", name);
             }
 
-            let mut cmd = Command::new(&config.command);
-            cmd.args(&config.args)
+            let (program, program_args) = crate::sandbox::wrap(
+                name,
+                config.sandbox.as_ref(),
+                &config.command,
+                &config.args,
+                &config.env,
+            );
+            if i == 0 && config.sandbox.is_some() {
+                eprintln!("[McpHub][SANDBOX] {} : isole ({:?})", name, config.sandbox.as_ref().map(|s| s.mode));
+            }
+            let mut cmd = Command::new(&program);
+            cmd.args(&program_args)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(child_stderr(name));
