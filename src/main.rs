@@ -10,6 +10,7 @@ mod description_compressor;
 mod doctor;
 mod export;
 mod health;
+mod http_guard;
 mod install;
 mod logs;
 mod permissions;

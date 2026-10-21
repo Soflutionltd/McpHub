@@ -62,7 +62,6 @@ impl SseManager {
              Content-Type: text/event-stream\r\n\
              Cache-Control: no-cache\r\n\
              Connection: keep-alive\r\n\
-             Access-Control-Allow-Origin: *\r\n\
              \r\n";
 
         if stream.write_all(headers.as_bytes()).await.is_err() {
@@ -293,9 +292,6 @@ fn http_response(status: u16, status_text: &str, body: &str) -> Vec<u8> {
         "HTTP/1.1 {} {}\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-         Access-Control-Allow-Headers: Content-Type\r\n\
          Connection: close\r\n\
          \r\n\
          {}",

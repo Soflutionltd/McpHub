@@ -40,7 +40,7 @@ pub fn get_auth_token() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let token = format!("mcphub_{:x}", nanos);
+    let token = crate::http_guard::random_token().unwrap_or_else(|| format!("mcphub_{:x}", nanos));
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -102,6 +102,9 @@ fn read_cache() -> Option<Value> {
         .and_then(|s| serde_json::from_str(&s).ok())
 }
 
+/// Port du serveur HTTP local (tableau de bord, SSE, Streamable HTTP).
+pub const HTTP_PORT: u16 = 24680;
+
 // ─── HTTP Parsing ────────────────────────────────────────────
 
 struct HttpRequest {
@@ -159,8 +162,22 @@ fn parse_request(raw: &str) -> Option<HttpRequest> {
 
 fn http_response(status: u16, status_text: &str, content_type: &str, body: &str) -> Vec<u8> {
     format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n{}",
         status, status_text, content_type, body.len(), body
+    )
+    .into_bytes()
+}
+
+fn http_response_with(
+    status: u16,
+    status_text: &str,
+    content_type: &str,
+    body: &str,
+    extra_headers: &str,
+) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\n{}Connection: close\r\n\r\n{}",
+        status, status_text, content_type, body.len(), extra_headers, body
     )
     .into_bytes()
 }
@@ -851,7 +868,16 @@ async fn route(
     }
 
     match (&req.method[..], path) {
-        ("GET", "/") => http_response(200, "OK", "text/html; charset=utf-8", DASHBOARD_HTML),
+        ("GET", "/") => {
+            // Cookie de session HttpOnly + SameSite=Strict : le tableau de bord appelle /api
+            // sans exposer le jeton au JavaScript, et aucun site tiers ne peut le réutiliser.
+            let token = get_auth_token();
+            let extra = format!(
+                "{}X-Frame-Options: DENY\r\nContent-Security-Policy: frame-ancestors 'none'\r\nCache-Control: no-store\r\n",
+                crate::http_guard::session_cookie_header(&token)
+            );
+            http_response_with(200, "OK", "text/html; charset=utf-8", DASHBOARD_HTML, &extra)
+        }
         ("GET", "/api/servers") => handle_get_servers(),
         ("POST", "/api/servers") => handle_add_server(&req.body),
         ("GET", "/api/settings") => handle_get_settings(),
@@ -919,7 +945,8 @@ async fn start_http(
     sse: Option<Arc<SseManager>>,
     open_browser: bool,
 ) {
-    let addr = "127.0.0.1:24680";
+    let addr = format!("127.0.0.1:{}", HTTP_PORT);
+    let addr = addr.as_str();
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
@@ -982,7 +1009,8 @@ async fn handle_connection(
 
     // Check if it's an OPTIONS request early
     if total_read >= 7 && &buf[..7] == b"OPTIONS" {
-        let resp = b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nAccess-Control-Max-Age: 86400\r\nContent-Length: 0\r\n\r\n";
+        // Pas d'en-têtes CORS : aucun site tiers n'est autorisé à appeler le hub.
+        let resp = b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let _ = stream.write_all(resp).await;
         return;
     }
@@ -1039,7 +1067,36 @@ async fn handle_connection(
 
     let path = req.path.split('?').next().unwrap_or(&req.path).to_string();
 
-    let expected_auth = format!("Bearer {}", get_auth_token());
+    let auth_token = get_auth_token();
+    let expected_auth = format!("Bearer {}", auth_token);
+
+    // Anti DNS rebinding et anti requêtes envoyées par des sites tiers.
+    if !crate::http_guard::host_allowed(req.headers.get("host").map(|s| s.as_str()), HTTP_PORT)
+        || !crate::http_guard::origin_allowed(
+            req.headers.get("origin").map(|s| s.as_str()),
+            HTTP_PORT,
+        )
+    {
+        eprintln!(
+            "[McpHub][SECURITY] Requete refusee (Host={:?}, Origin={:?}) {} {}",
+            req.headers.get("host"),
+            req.headers.get("origin"),
+            req.method,
+            path
+        );
+        let resp = json_err(403, "Forbidden");
+        let _ = stream.write_all(&resp).await;
+        let _ = stream.shutdown().await;
+        return;
+    }
+
+    // Toute l'API du tableau de bord exige le jeton (Bearer) ou le cookie de session.
+    if path.starts_with("/api/") && !crate::http_guard::is_authorized(&req.headers, &auth_token) {
+        let resp = json_err(401, "Unauthorized");
+        let _ = stream.write_all(&resp).await;
+        let _ = stream.shutdown().await;
+        return;
+    }
 
     // SSE endpoint: long-lived connection, don't close
     if path == "/sse" && req.method == "GET" {
@@ -1048,7 +1105,7 @@ async fn handle_connection(
             .get("authorization")
             .map(|s| s.as_str())
             .unwrap_or("");
-        if auth != expected_auth {
+        if !crate::http_guard::token_matches(auth, &expected_auth) {
             let resp = json_err(401, "Unauthorized");
             let _ = stream.write_all(&resp).await;
             let _ = stream.shutdown().await;
@@ -1073,7 +1130,7 @@ async fn handle_connection(
             .get("authorization")
             .map(|s| s.as_str())
             .unwrap_or("");
-        if auth != expected_auth {
+        if !crate::http_guard::token_matches(auth, &expected_auth) {
             let resp = json_err(401, "Unauthorized");
             let _ = stream.write_all(&resp).await;
             let _ = stream.shutdown().await;
@@ -1097,7 +1154,7 @@ async fn handle_connection(
             .get("authorization")
             .map(|s| s.as_str())
             .unwrap_or("");
-        if auth != expected_auth {
+        if !crate::http_guard::token_matches(auth, &expected_auth) {
             let resp = json_err(401, "Unauthorized");
             let _ = stream.write_all(&resp).await;
             let _ = stream.shutdown().await;
@@ -1125,7 +1182,6 @@ async fn handle_connection(
              Content-Type: text/event-stream\r\n\
              Cache-Control: no-cache\r\n\
              Connection: keep-alive\r\n\
-             Access-Control-Allow-Origin: *\r\n\
              \r\n";
         if stream.write_all(headers.as_bytes()).await.is_err() {
             return;
