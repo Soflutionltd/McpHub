@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="{{lang}}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>{{title}} · McpHub</title>
+<style>
+:root{--bg:#fafafa;--card:#ffffff;--border:rgba(0,0,0,.06);--text:#18181b;--dim:#52525b;--code:rgba(0,0,0,.05);
+--ok:#16a34a;--denied:#dc2626;--expired:#d97706;
+--shadow:0 1px 2px rgba(0,0,0,.05),0 4px 12px rgba(0,0,0,.08),0 12px 40px rgba(0,0,0,.06)}
+@media (prefers-color-scheme:dark){:root{--bg:#0a0a0f;--card:#12121a;--border:rgba(255,255,255,.08);--text:#e4e4e7;--dim:#a1a1aa;--code:rgba(255,255,255,.06);
+--ok:#22c55e;--denied:#f87171;--expired:#fbbf24;--shadow:0 1px 2px rgba(0,0,0,.4),0 12px 40px rgba(0,0,0,.5)}}
+*{box-sizing:border-box;margin:0}
+body{min-height:100vh;display:grid;place-items:center;padding:24px;background:var(--bg);color:var(--text);
+font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,sans-serif;
+font-feature-settings:"kern" 1,"liga" 1;-webkit-font-smoothing:antialiased}
+main{width:min(100%,26rem);padding:48px 32px 40px;text-align:center;background:var(--card);
+border:1px solid var(--border);border-radius:24px;box-shadow:var(--shadow);animation:rise .5s cubic-bezier(.16,1,.3,1) both}
+.icon{width:64px;height:64px;margin:0 auto 24px;border-radius:50%;display:grid;place-items:center;
+color:var(--tone);background:color-mix(in srgb,var(--tone) 12%,transparent);animation:pop .45s cubic-bezier(.34,1.56,.64,1) .15s both}
+.icon svg{width:30px;height:30px}
+.icon path{stroke-dasharray:1;stroke-dashoffset:1;animation:draw .45s cubic-bezier(.65,0,.35,1) .4s forwards}
+.ok{--tone:var(--ok)}.denied{--tone:var(--denied)}.expired{--tone:var(--expired)}
+h1{font-size:24px;font-weight:700;letter-spacing:-.02em;line-height:1.2}
+p{margin-top:12px;font-size:15px;line-height:1.6;color:var(--dim);text-wrap:balance}
+code{font:13px/1.4 "SF Mono",ui-monospace,Menlo,monospace;padding:2px 6px;border-radius:6px;background:var(--code);color:var(--text);white-space:nowrap}
+footer{margin-top:32px;font-size:12px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);opacity:.7}
+@keyframes rise{from{opacity:0;transform:translateY(12px)}}
+@keyframes pop{from{opacity:0;transform:scale(.6)}}
+@keyframes draw{to{stroke-dashoffset:0}}
+@media (prefers-reduced-motion:reduce){main,.icon{animation:none}.icon path{animation:none;stroke-dashoffset:0}}
+</style>
+</head>
+<body>
+<main class="{{tone}}">
+<div class="icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">{{icon}}</svg></div>
+<h1>{{title}}</h1>
+<p>{{message}}</p>
+<footer>McpHub</footer>
+</main>
+</body>
+</html>
