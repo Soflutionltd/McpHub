@@ -162,6 +162,53 @@ McpHub generates a random auth token on first run, stored in `~/.McpHub/auth-tok
 - Secrets live in the macOS Keychain (`McpHub vault`), referenced as `${NAME}` in `config.json`.
 - Permissions per server/tool (`settings.permissions`: allow / confirm / deny), with optional auto-classification of destructive tools (by name and by the MCP `destructiveHint` annotation). Every call is written to `~/.McpHub/audit.jsonl` with secrets redacted.
 
+### Human confirmation
+
+With `settings.permissions.autoClassify: true`, destructive tools (by name, or declared with the MCP `destructiveHint` annotation) need approval. McpHub opens a native macOS dialog (Allow / Deny) that only a person at the screen can answer; the agent cannot confirm by itself. A refusal is remembered for 5 minutes, dialogs are queued one at a time, and servers able to drive the computer (desktop-commander...) are paused while a dialog is open.
+
+```json
+"permissions": { "autoClassify": true, "confirmVia": "dialog", "dialogTimeoutSecs": 120 }
+```
+
+`confirmVia`: `dialog` (default, refuses when no screen is available), `auto` (dialog, then a one-time token without a screen) or `token`.
+
+### Code mode (`mcphub_run`)
+
+Agents can send a short JavaScript program that chains several tool calls and returns only the final result, which saves tokens on multi-step or bulk work:
+
+```js
+const projects = await mcp.call("supabase", "list_projects", {});
+return projects.filter(p => p.status !== "ACTIVE_HEALTHY").map(p => p.name);
+```
+
+The code runs in a separate Node process (Node >= 22.13) started with `--permission` (no files, network or subprocesses) inside a macOS sandbox. Its only way out is `mcp.call` / `mcp.search`, which go through every McpHub guard (permissions, quarantine, profiles, audit). Limits: `settings.codeMode` `{ "timeoutSecs": 60, "maxCalls": 100 }`, at most 3 confirmation dialogs per run.
+
+### Server isolation (macOS sandbox)
+
+```json
+"settings": { "sandbox": "shield" }
+```
+
+`shield` runs every local server under `sandbox-exec`: it keeps working normally but can no longer read or write secrets (SSH and GPG keys, cloud and GitHub credentials, browser profiles and cookies, Claude/Cursor configs, shell rc files, LaunchAgents, McpHub's own files) nor run `security`, `launchctl`, `osascript` or `open`. A secret file a server references in its own `env` or `args` (e.g. an App Store `.p8` key) stays readable. Per server: `"sandbox": false`, `"strict"` (no writes outside temp and caches), or `{"mode": "strict", "network": false, "allowWrite": [...], "allowExec": ["open"]}`. `McpHub sandbox` lists the effective isolation, `McpHub sandbox show SERVER` prints the profile. It is a strong barrier against casual credential theft, not a full container.
+
+Every child server also starts with a minimal environment: only system variables, its own `env` and the names listed in `inheritEnv`. Secrets loaded in the daemon are never passed to all servers.
+
+### Remote servers and shared OAuth
+
+```json
+"sentry": { "url": "https://mcp.sentry.dev/mcp" },
+"aqara": { "url": "https://agent.aqara.com/open/mcp", "headers": { "Authorization": "Bearer ${AQARA_API_KEY}" } }
+```
+
+Remote servers are spoken to directly over Streamable HTTP (no `mcp-remote` process). OAuth is handled by McpHub: discovery (RFC 9728 / 8414), dynamic client registration, PKCE, resource indicators, automatic refresh, HTTPS only, tokens in the macOS Keychain and bound to the server URL.
+
+```bash
+McpHub oauth status            # connection state of every remote server
+McpHub oauth login sentry      # sign in through the browser
+McpHub oauth logout sentry
+McpHub oauth migrate --apply   # convert `npx mcp-remote URL` entries, importing their tokens
+```
+
 ### Tool pinning and poisoning detection
 
 The first time McpHub sees a server, it records a SHA-256 fingerprint of every tool (name, description, schema, annotations) in `~/.McpHub/tool-pins.json`. If a server later changes a tool definition (a "rug pull", easy with `npx -y package@latest`), that tool is quarantined: hidden from the catalog and refused on call, until you check it and run `McpHub pins approve SERVER [TOOL]`.
