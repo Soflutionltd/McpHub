@@ -43,6 +43,8 @@ pub struct ProxyConfig {
     pub audit: crate::audit::AuditConfig,
     /// Épinglage, détection d'empoisonnement, filtres d'outils et profils.
     pub guard: crate::toolguard::GuardConfig,
+    /// Code mode (`mcphub_run`).
+    pub code_mode: crate::codemode::CodeModeConfig,
 }
 
 impl Default for ProxyConfig {
@@ -61,6 +63,7 @@ impl Default for ProxyConfig {
             permissions: crate::permissions::PermissionsConfig::default(),
             audit: crate::audit::AuditConfig::default(),
             guard: crate::toolguard::GuardConfig::default(),
+            code_mode: crate::codemode::CodeModeConfig::default(),
         }
     }
 }
@@ -284,6 +287,7 @@ fn config_from_json(json: &Value, source_path: Option<&Path>) -> Option<ProxyCon
     let mut config = ProxyConfig {
         servers,
         guard: crate::toolguard::parse_guard_config(json),
+        code_mode: crate::codemode::parse(json.get("settings")),
         ..Default::default()
     };
     if let Some(settings) = json.get("settings") {

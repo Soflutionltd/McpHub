@@ -859,7 +859,7 @@ impl ProxyServer {
 
         // Cursor V2 (MCP 2025-11-25) is strict: descriptions must be short, no `default` keyword,
         // use `integer` not `number` when applicable. The server list goes into `enum`, not the description.
-        serde_json::json!([
+        let mut tools = serde_json::json!([
             {
                 "name": "mcphub_search",
                 "description": "Search MCP tools across all connected servers using BM25. Call FIRST to find the right tool, then use `mcphub_call`. Compact by default (no schemas) — set expand=true to get inputSchemas.",
@@ -925,7 +925,13 @@ impl ProxyServer {
                     "required": ["server", "tool"]
                 }
             }
-        ])
+        ]);
+        if self.config.lock().await.code_mode.enabled {
+            if let Some(arr) = tools.as_array_mut() {
+                arr.push(crate::codemode::tool_definition());
+            }
+        }
+        tools
     }
 
     async fn get_passthrough_tools(&self) -> serde_json::Value {
@@ -959,6 +965,10 @@ impl ProxyServer {
             }
         }
 
+        drop(engine);
+        if self.config.lock().await.code_mode.enabled {
+            tools.push(crate::codemode::tool_definition());
+        }
         serde_json::Value::Array(tools)
     }
 
@@ -982,6 +992,7 @@ impl ProxyServer {
             Mode::Discover => match tool_name {
                 "mcphub_search" | "discover" => self.handle_discover(id, arguments).await,
                 "mcphub_call" | "execute" => self.handle_execute(id, arguments).await,
+                "mcphub_run" => self.handle_run(id, arguments).await,
                 "crawl" => self.handle_crawl(id, arguments).await,
                 _ => JsonRpcResponse::error(
                     id,
@@ -992,6 +1003,8 @@ impl ProxyServer {
             Mode::Passthrough => {
                 if tool_name == "crawl" {
                     self.handle_crawl(id, arguments).await
+                } else if tool_name == "mcphub_run" {
+                    self.handle_run(id, arguments).await
                 } else {
                     self.handle_passthrough_call(id, tool_name, arguments).await
                 }
@@ -1301,6 +1314,172 @@ impl ProxyServer {
             serde_json::json!({
                 "content": [{ "type": "text", "text": text }]
             }),
+        )
+    }
+
+    /// Code mode : exécute le JavaScript de l'agent dans un Node isolé ; chaque `mcp.call`
+    /// repasse par `handle_execute`, donc par toutes les gardes.
+    async fn handle_run(
+        &self,
+        id: Option<serde_json::Value>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let cfg = self.config.lock().await.code_mode.clone();
+        if !cfg.enabled {
+            return JsonRpcResponse::error(id, -32001, "Code mode desactive (settings.codeMode)".into());
+        }
+        let Some(code) = args.get("code").and_then(|v| v.as_str()).map(String::from) else {
+            return JsonRpcResponse::error(id, -32602, "Missing 'code' parameter".into());
+        };
+        let timeout_secs = args
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(cfg.timeout_secs)
+            .clamp(5, 300);
+        let Some(node) = crate::codemode::find_node(&cfg) else {
+            return JsonRpcResponse::error(
+                id,
+                -32000,
+                "Code mode : Node.js >= 20 introuvable (settings.codeMode.node)".into(),
+            );
+        };
+        let mut child = match crate::codemode::spawn(&node) {
+            Ok(c) => c,
+            Err(e) => return JsonRpcResponse::error(id, -32000, format!("Code mode : lancement impossible : {}", e)),
+        };
+        let (Some(mut stdin), Some(stdout), Some(stderr)) =
+            (child.stdin.take(), child.stdout.take(), child.stderr.take())
+        else {
+            return JsonRpcResponse::error(id, -32000, "Code mode : flux indisponibles".into());
+        };
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = String::new();
+            let mut r = tokio::io::BufReader::new(stderr).lines();
+            while let Ok(Some(l)) = r.next_line().await {
+                if buf.len() < 4000 {
+                    buf.push_str(&l);
+                    buf.push('\n');
+                }
+            }
+            buf
+        });
+        let start = serde_json::json!({ "t": "start", "code": code }).to_string() + "\n";
+        if stdin.write_all(start.as_bytes()).await.is_err() {
+            return JsonRpcResponse::error(id, -32000, "Code mode : envoi du code impossible".into());
+        }
+        let started = Instant::now();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        let mut calls = 0usize;
+        let mut outcome: Result<serde_json::Value, String> = Err("le programme s'est arrete sans resultat".into());
+        let mut logs = serde_json::Value::Array(vec![]);
+        loop {
+            let line = match tokio::time::timeout_at(deadline, lines.next_line()).await {
+                Err(_) => {
+                    outcome = Err(format!("temps depasse ({} s)", timeout_secs));
+                    break;
+                }
+                Ok(Ok(Some(l))) => l,
+                Ok(_) => break,
+            };
+            let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+            let kind = msg.get("t").and_then(|v| v.as_str()).unwrap_or("");
+            let req_id = msg.get("id").cloned().unwrap_or(serde_json::Value::Null);
+            let reply = match kind {
+                "call" => {
+                    calls += 1;
+                    if calls > cfg.max_calls {
+                        serde_json::json!({"id": req_id, "ok": false, "error": format!("limite de {} appels atteinte", cfg.max_calls)})
+                    } else {
+                        let call_args = serde_json::json!({
+                            "server": msg.get("server").cloned().unwrap_or_default(),
+                            "tool": msg.get("tool").cloned().unwrap_or_default(),
+                            "arguments": msg.get("args").cloned().unwrap_or(serde_json::json!({})),
+                        });
+                        let resp = Box::pin(self.handle_execute(None, call_args)).await;
+                        match (resp.result, resp.error) {
+                            (_, Some(err)) => serde_json::json!({"id": req_id, "ok": false, "error": err.message}),
+                            (Some(res), None) => {
+                                if res.get("_mcphub").and_then(|m| m.get("status")).and_then(|s| s.as_str()) == Some("confirmation_required") {
+                                    serde_json::json!({"id": req_id, "ok": false, "error": "confirmation par jeton impossible dans le code : appeler cet outil directement avec mcphub_call"})
+                                } else if res.get("isError").and_then(|v| v.as_bool()) == Some(true) {
+                                    serde_json::json!({"id": req_id, "ok": false, "error": crate::codemode::simplify_result(&res)})
+                                } else {
+                                    serde_json::json!({"id": req_id, "ok": true, "result": crate::codemode::simplify_result(&res)})
+                                }
+                            }
+                            (None, None) => serde_json::json!({"id": req_id, "ok": true, "result": null}),
+                        }
+                    }
+                }
+                "search" => {
+                    let mut search_args = serde_json::json!({
+                        "query": msg.get("query").cloned().unwrap_or_default(),
+                        "top_k": 10,
+                        "expand": true,
+                    });
+                    if let Some(server) = msg.get("server").filter(|v| v.is_string()) {
+                        search_args["server"] = server.clone();
+                    }
+                    let resp = Box::pin(self.handle_discover(None, search_args)).await;
+                    let result = resp
+                        .result
+                        .as_ref()
+                        .map(crate::codemode::simplify_result)
+                        .unwrap_or_default();
+                    serde_json::json!({"id": req_id, "ok": true, "result": result.get("results").cloned().unwrap_or(result)})
+                }
+                "done" => {
+                    logs = msg.get("logs").cloned().unwrap_or(logs);
+                    outcome = Ok(msg.get("result").cloned().unwrap_or_default());
+                    break;
+                }
+                "error" => {
+                    logs = msg.get("logs").cloned().unwrap_or(logs);
+                    outcome = Err(msg.get("message").and_then(|v| v.as_str()).unwrap_or("erreur").to_string());
+                    break;
+                }
+                _ => continue,
+            };
+            let line = reply.to_string() + "\n";
+            if stdin.write_all(line.as_bytes()).await.is_err() {
+                break;
+            }
+        }
+        let _ = child.kill().await;
+        let stderr_text = stderr_task.await.unwrap_or_default();
+        let elapsed = started.elapsed().as_millis() as u64;
+        self.record_audit(AuditEntry {
+            server: "mcphub".into(),
+            tool: "mcphub_run".into(),
+            mode: "code",
+            decision: "allow",
+            policy: "codemode".into(),
+            status: if outcome.is_ok() { "ok" } else { "error" },
+            duration_ms: Some(elapsed),
+            arguments: Some(serde_json::json!({ "code": code, "calls": calls })),
+            error: outcome.as_ref().err().cloned(),
+        })
+        .await;
+        let mut payload = serde_json::json!({ "calls": calls, "duration_ms": elapsed, "logs": logs });
+        let is_error = outcome.is_err();
+        match outcome {
+            Ok(v) => payload["result"] = v,
+            Err(e) => {
+                payload["error"] = serde_json::json!(e);
+                if !stderr_text.trim().is_empty() {
+                    payload["stderr"] = serde_json::json!(stderr_text.trim());
+                }
+            }
+        }
+        let mut text = serde_json::to_string(&payload).unwrap_or_default();
+        if text.chars().count() > 100_000 {
+            text = text.chars().take(100_000).collect::<String>() + " [tronque]";
+        }
+        JsonRpcResponse::success(
+            id,
+            serde_json::json!({ "content": [{ "type": "text", "text": text }], "isError": is_error }),
         )
     }
 

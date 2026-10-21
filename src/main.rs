@@ -2,6 +2,7 @@ mod add;
 mod audit;
 mod benchmark;
 mod cache;
+mod codemode;
 pub mod child;
 mod config;
 mod confirm_dialog;
