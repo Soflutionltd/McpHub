@@ -4,3 +4,4 @@ mcp.json.full-backup
 *.bak
 dashboard/node_modules/
 dashboard/.svelte-kit/
+*.bak-*
