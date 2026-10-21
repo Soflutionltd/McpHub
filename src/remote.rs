@@ -179,9 +179,14 @@ impl RemoteClient {
     }
 }
 
+/// Taille maximale d'une réponse (flux SSE) : 64 Mo.
+const MAX_SSE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Lit un flux SSE jusqu'au message JSON-RPC portant l'identifiant attendu.
 async fn read_sse_response(mut resp: reqwest::Response, id: u64) -> Result<Value, String> {
-    let mut buf = String::new();
+    // Octets bruts : un caractère UTF-8 peut être coupé entre deux morceaux réseau, on ne
+    // décode donc que des lignes complètes.
+    let mut buf: Vec<u8> = Vec::new();
     let mut data = String::new();
     loop {
         let chunk = resp
@@ -191,10 +196,15 @@ async fn read_sse_response(mut resp: reqwest::Response, id: u64) -> Result<Value
         let Some(chunk) = chunk else {
             return Err("Server closed connection: flux SSE termine sans reponse".into());
         };
-        buf.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(pos) = buf.find('\n') {
-            let line: String = buf[..pos].trim_end_matches('\r').to_string();
-            buf.drain(..=pos);
+        buf.extend_from_slice(&chunk);
+        if buf.len() + data.len() > MAX_SSE_BYTES {
+            return Err("Read error: reponse SSE trop volumineuse".into());
+        }
+        while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+            let raw: Vec<u8> = buf.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&raw[..raw.len() - 1])
+                .trim_end_matches('\r')
+                .to_string();
             if line.is_empty() {
                 if !data.is_empty() {
                     if let Ok(v) = serde_json::from_str::<Value>(&data) {
