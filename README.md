@@ -122,7 +122,8 @@ Features:
 
 | Mode | Command | Editor config | Survives editor crash |
 |---|---|---|---|
-| **SSE (recommended)** | `McpHub serve` or `McpHub install` | `"url": "http://127.0.0.1:24680/sse"` | Yes |
+| **Streamable HTTP (recommended)** | `McpHub serve` or `McpHub install` | `"url": "http://127.0.0.1:24680/mcp"` (or `/mcp/<profile>`) | Yes |
+| **SSE (legacy)** | `McpHub serve` or `McpHub install` | `"url": "http://127.0.0.1:24680/sse"` (optional `?profile=<profile>`) | Yes |
 | **stdio** | `McpHub` (default) | `"command": "/path/to/McpHub"` | No |
 
 SSE uses TCP keepalive (15s probe, 5s interval, 3 retries), a session reaper for stale connections, and non-blocking sends to prevent slow clients from blocking the server.
@@ -145,12 +146,63 @@ McpHub benchmark        # Measure start time, ping latency, tool count, RAM
 McpHub export           # Export config as encrypted bundle for sharing
 McpHub import <file>    # Import config bundle
 McpHub update           # Self-update from GitHub Releases
+McpHub vault            # Secrets in the macOS Keychain (status, list, set, get, rm, migrate)
+McpHub policy           # Tool permissions (allow / confirm / deny)
+McpHub audit            # Audit log of every tool call
+McpHub pins             # Tool pinning: list, status, approve SERVER [TOOL], reset SERVER, scan
 McpHub version          # Show version
 ```
 
 ## Security
 
-McpHub generates a unique auth token on first run, stored in `~/.McpHub/auth-token`. All HTTP endpoints (SSE, API, dashboard) require `Authorization: Bearer <token>`. CORS preflight is handled automatically.
+McpHub generates a random auth token on first run, stored in `~/.McpHub/auth-token` (mode 600).
+
+- `/mcp`, `/sse`, `/message` and every `/api/*` route require `Authorization: Bearer <token>`. The dashboard (`/`) gets an `HttpOnly; SameSite=Strict` session cookie instead, so its JavaScript never sees the token and no third-party site can reuse it.
+- Requests whose `Host` is not `127.0.0.1` / `localhost` / `[::1]` are refused (DNS rebinding), as are requests carrying a foreign `Origin`. No CORS headers are sent: browsers cannot call the hub from another site.
+- Secrets live in the macOS Keychain (`McpHub vault`), referenced as `${NAME}` in `config.json`.
+- Permissions per server/tool (`settings.permissions`: allow / confirm / deny), with optional auto-classification of destructive tools (by name and by the MCP `destructiveHint` annotation). Every call is written to `~/.McpHub/audit.jsonl` with secrets redacted.
+
+### Tool pinning and poisoning detection
+
+The first time McpHub sees a server, it records a SHA-256 fingerprint of every tool (name, description, schema, annotations) in `~/.McpHub/tool-pins.json`. If a server later changes a tool definition (a "rug pull", easy with `npx -y package@latest`), that tool is quarantined: hidden from the catalog and refused on call, until you check it and run `McpHub pins approve SERVER [TOOL]`.
+
+Descriptions are also scanned for invisible Unicode characters and classic injection phrases ("ignore previous instructions", "do not tell the user", `~/.ssh/id_rsa`, `mcp.json`...). `McpHub pins scan` checks the whole cache without changing anything.
+
+```json
+"settings": {
+  "toolSecurity": { "pinning": "block", "scan": "block", "newTools": "warn" }
+}
+```
+
+Each value is `block`, `warn` or `off`. `newTools: "block"` also holds back tools that appear on an already approved server.
+
+### Per-server tool filters
+
+```json
+"mcpServers": {
+  "supabase": {
+    "command": "npx", "args": ["-y", "@supabase/mcp-server-supabase"],
+    "tools": { "exclude": ["delete_*", "pause_project"] },
+    "toolDescriptions": { "list_projects": "List my Supabase projects" }
+  },
+  "github": { "command": "...", "readOnly": true }
+}
+```
+
+`tools.include` / `tools.exclude` take globs; `readOnly: true` only exposes tools that read (`readOnlyHint`, or a read verb such as get/list/search, never a destructive name).
+
+### Profiles per client
+
+```json
+"settings": {
+  "profiles": {
+    "cursor": { "servers": ["supabase", "git*", "context7"], "excludeTools": ["supabase/execute_sql"] },
+    "review": { "readOnly": true }
+  }
+}
+```
+
+Use `http://127.0.0.1:24680/mcp/cursor`, `/sse?profile=cursor`, or `MCPHUB_PROFILE=cursor` in stdio mode. Each client then only sees, searches and calls what its profile allows.
 
 If a server crashes during a `tools/call`, McpHub auto-restarts it and retries the call once before returning an error.
 
@@ -183,6 +235,9 @@ McpHub implements the full MCP protocol as a proxy:
 - **Cancellation**: `notifications/cancelled` forwarded to child servers
 - **Logging**: `notifications/message` captured and forwarded
 - **Version negotiation**: Adapts to each server's supported protocol version
+- **Tool metadata**: `title`, `annotations` and `outputSchema` are relayed as declared by each server
+- **Pagination**: child `tools/list` pages (`nextCursor`) are all read
+- **Child logs**: each server's stderr goes to `~/.McpHub/logs/<server>.stderr.log`
 
 ## Configuration
 
