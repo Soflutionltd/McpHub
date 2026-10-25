@@ -193,6 +193,44 @@ cd client && npm ci
 
 `npm test` runs smoke tests against the local daemon (MemoryPilot and supabase configured), with a throwaway project file.
 
+### Working on client accounts
+
+Connecting to a client's Stripe (or Supabase, Cloudflare…) should not log you out of your own, and your own agent should never reach theirs by mistake. Two levels, from light to strict:
+
+**1. Client-owned servers (same McpHub).** Add the client's server under its own name (`stripe-acme`, with its own OAuth token or restricted key, since tokens are stored per server name) and list it in the client project's `ownedServers`:
+
+```json
+"acme": {
+  "workspaces": ["/Users/you/Clients/Acme"],
+  "aliases": { "product": "Acme" },
+  "allowedServers": ["MemoryPilot", "context7"],
+  "ownedServers": ["stripe-acme"]
+}
+```
+
+An owned server only answers, appears in `mcphub_search` and in `mcphub_status` when `working_dir` is inside that client's workspace; the `project` argument alone is not enough. A server owned by two projects is a start-up error. This guard lives in the Node client: an editor connected straight to the daemon still sees every server, so give it a profile with `"excludeServers": ["*-acme"]`.
+
+**2. A separate instance (nothing shared).** For clients who require it, run a second McpHub with its own folder, port, Keychain service, auth token and LaunchAgent:
+
+```bash
+export MCPHUB_INSTANCE=acme MCPHUB_PORT=24690
+McpHub add                 # writes ~/.McpHub-acme/config.json
+McpHub oauth login stripe  # token stored under Keychain service McpHub-acme
+McpHub install             # LaunchAgent com.soflution.mcphub.acme
+```
+
+A named instance never imports the servers declared in your editors, refuses the main port (24680), and its token is rejected by the main daemon (and the other way round). Point the editor of that client's workspace at it with the same variables:
+
+```json
+"McpHub": {
+  "command": "node",
+  "args": ["/path/to/McpHub/client/index.js"],
+  "env": { "MCPHUB_INSTANCE": "acme", "MCPHUB_PORT": "24690" }
+}
+```
+
+`MCPHUB_HOME` and `MCPHUB_VAULT_SERVICE` override the folder and the Keychain service. Sandboxed servers of every instance are denied all `~/.McpHub*` folders. Automatic start of a named instance is supported on macOS and Linux.
+
 ---
 
 ## 🧭 How it works
@@ -438,7 +476,7 @@ McpHub audit --tail 50    # recent calls
 McpHub update | version | help
 ```
 
-Files: `~/.McpHub/` (config, cache, pins, audit log, token) and `~/Library/Logs/McpHub/<server>.stderr.log` (each server's error output).
+Files: `~/.McpHub/` (config, cache, pins, audit log, token; `~/.McpHub-<name>/` for a [named instance](#working-on-client-accounts)) and `~/Library/Logs/McpHub/<server>.stderr.log` (each server's error output).
 
 ---
 
