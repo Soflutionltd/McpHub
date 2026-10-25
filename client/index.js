@@ -6,19 +6,41 @@ import { join, normalize, sep } from 'node:path';
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import {
+  getDefaultEnvironment,
+  StdioClientTransport
+} from '@modelcontextprotocol/sdk/client/stdio.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 
-const hubDirectory = join(homedir(), '.McpHub');
+// Instance nommée (un McpHub par client) : mêmes règles que le moteur Rust.
+const instanceName = process.env.MCPHUB_INSTANCE || undefined;
+if (instanceName && !/^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/.test(instanceName)) {
+  throw new Error(
+    `MCPHUB_INSTANCE="${instanceName}" is invalid: use 1 to 32 lowercase letters, digits or dashes.`
+  );
+}
+if (instanceName && !process.env.MCPHUB_PORT) {
+  throw new Error('MCPHUB_PORT is required with MCPHUB_INSTANCE (each instance has its own port).');
+}
+const instanceEnv = Object.fromEntries(
+  ['MCPHUB_INSTANCE', 'MCPHUB_PORT', 'MCPHUB_HOME', 'MCPHUB_VAULT_SERVICE']
+    .filter((key) => process.env[key])
+    .map((key) => [key, process.env[key]])
+);
+
+const hubDirectory =
+  process.env.MCPHUB_HOME ||
+  join(homedir(), instanceName ? `.McpHub-${instanceName}` : '.McpHub');
 const projectsPath = process.env.MCPHUB_PROJECTS ?? join(hubDirectory, 'projects.json');
 const usagePath = join(hubDirectory, 'client-usage-stats.json');
 const schemaCachePath = join(hubDirectory, 'schema-cache.json');
 const authTokenPath = join(hubDirectory, 'auth-token');
 const hubBinaryPath = join(homedir(), '.local', 'bin', 'McpHub');
-const daemonBaseUrl = process.env.MCPHUB_DAEMON_URL ?? 'http://127.0.0.1:24680';
+const daemonBaseUrl =
+  process.env.MCPHUB_DAEMON_URL ?? `http://127.0.0.1:${process.env.MCPHUB_PORT || 24680}`;
 const daemonSseUrl = new URL('/sse', daemonBaseUrl);
 const daemonApiUrl = new URL('/api/servers', daemonBaseUrl);
 
@@ -35,6 +57,7 @@ const hubExposedCatalogBytes = 3_600;
 const cursorCatalogDescriptionLimit = 200;
 
 const projectsConfig = await readProjects(projectsPath);
+const serverOwners = buildServerOwners(projectsConfig.projects);
 
 /** @type {{ client: Client, transport: 'daemon' | 'stdio' } | undefined} */
 let hubConnection;
@@ -71,6 +94,28 @@ async function readProjects(path) {
     if (error.code === 'ENOENT') return { projects: {} };
     throw new Error(`Invalid McpHub projects file ${path}: ${error.message}`);
   }
+}
+
+// Un serveur rattaché à un client (ownedServers) n'appartient qu'à un projet :
+// deux propriétaires rendraient la règle ambiguë.
+function buildServerOwners(projects) {
+  const owners = new Map();
+  for (const [name, config] of Object.entries(projects)) {
+    const owned = config.ownedServers ?? [];
+    if (!Array.isArray(owned)) {
+      throw new Error(`Invalid McpHub projects file ${projectsPath}: "${name}".ownedServers must be an array.`);
+    }
+    for (const server of owned) {
+      const previous = owners.get(server);
+      if (previous) {
+        throw new Error(
+          `Invalid McpHub projects file ${projectsPath}: server "${server}" is owned by both "${previous}" and "${name}".`
+        );
+      }
+      owners.set(server, name);
+    }
+  }
+  return owners;
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +224,7 @@ async function connectStdio() {
   const transport = new StdioClientTransport({
     command: hubBinaryPath,
     args: ['stdio'],
+    env: { ...getDefaultEnvironment(), ...instanceEnv },
     stderr: 'ignore'
   });
   await client.connect(transport);
@@ -283,9 +329,39 @@ function resolveProject(projectName, workingDirectory) {
   );
 }
 
-function enforceProjectPolicy({ projectName, projectConfig, server, tool, args }) {
+function allowedServersOf(projectConfig) {
+  return new Set([
+    ...(projectConfig.allowedServers ?? []),
+    ...(projectConfig.ownedServers ?? [])
+  ]);
+}
+
+// Un serveur rattaché à un client ne répond que si working_dir est dans le
+// dossier de ce client : ni le paramètre `project` (que le modèle peut se
+// tromper à passer) ni le dossier courant du processus ne suffisent.
+function ownerAllows(server, workingDirectory) {
+  const owner = serverOwners.get(server);
+  if (!owner) return true;
+  return Boolean(workingDirectory) && resolveProject(undefined, workingDirectory)[0] === owner;
+}
+
+function assertOwnership(server, workingDirectory) {
+  if (ownerAllows(server, workingDirectory)) return;
+  throw new Error(
+    `Server "${server}" belongs to project "${serverOwners.get(server)}": it only answers when working_dir is inside that project's workspace.`
+  );
+}
+
+function serverVisibility(projectConfig, workingDirectory) {
+  const allowed = projectConfig ? allowedServersOf(projectConfig) : null;
+  return (server) =>
+    (!allowed || allowed.has(server)) && ownerAllows(server, workingDirectory);
+}
+
+function enforceProjectPolicy({ projectName, projectConfig, server, tool, args, workingDirectory }) {
+  assertOwnership(server, workingDirectory);
   if (!projectConfig) return { ...args };
-  if (!projectConfig.allowedServers.includes(server)) {
+  if (!allowedServersOf(projectConfig).has(server)) {
     throw new Error(
       `Server "${server}" is not allowed for project "${projectName}".`
     );
@@ -365,18 +441,18 @@ function parseSearchPayload(result) {
   }
 }
 
-function filterSearchResult(result, projectName, projectConfig) {
-  if (!projectConfig) return result;
+function filterSearchResult(result, projectName, projectConfig, workingDirectory) {
+  if (result.isError || (!projectConfig && serverOwners.size === 0)) return result;
   const payload = parseSearchPayload(result);
-  if (!payload) return result;
+  if (!payload) {
+    // Sans pouvoir filtrer, on ne renvoie pas les outils des autres clients.
+    return textResult('McpHub search returned an unreadable payload; results withheld by the project policy.', true);
+  }
 
-  const allowed = new Set(projectConfig.allowedServers);
-  payload.results = (payload.results ?? []).filter((item) =>
-    allowed.has(item.server)
-  );
-  payload.available_servers = (payload.available_servers ?? []).filter(
-    (server) => allowed.has(server)
-  );
+  const visible = serverVisibility(projectConfig, workingDirectory);
+  payload.results = (payload.results ?? []).filter((item) => visible(item.server));
+  payload.available_servers = (payload.available_servers ?? []).filter(visible);
+  if (!projectConfig) return textResult(payload);
   payload.project = {
     name: projectName,
     aliases: projectConfig.aliases,
@@ -400,7 +476,7 @@ function errorToResult(error) {
   return textResult(errorMessage(error), true);
 }
 
-async function callChildWithSuggestions({ server, tool, args, bypass_cache, projectConfig }) {
+async function callChildWithSuggestions({ server, tool, args, bypass_cache, visible }) {
   let result;
   try {
     result = await callHubTool('mcphub_call', {
@@ -413,7 +489,7 @@ async function callChildWithSuggestions({ server, tool, args, bypass_cache, proj
     if (!(error instanceof McpError)) throw error;
     result = errorToResult(error);
   }
-  return withUnknownSuggestions(result, { server, tool, projectConfig });
+  return withUnknownSuggestions(result, { server, tool, visible });
 }
 
 // Cache de schémas du hub, relu seulement quand le fichier change.
@@ -490,9 +566,9 @@ function shortDescription(description) {
   return text.length > 120 ? `${text.slice(0, 120)}…` : text;
 }
 
-function rankTools(candidates, query, allowed) {
+function rankTools(candidates, query, visible) {
   return candidates
-    .filter((item) => !allowed || allowed.has(item.server))
+    .filter((item) => visible(item.server))
     .map((item) => ({ ...item, score: nameSimilarity(query, item.tool) }))
     .filter((item) => item.score >= 0.4)
     .sort((left, right) => right.score - left.score)
@@ -500,7 +576,7 @@ function rankTools(candidates, query, allowed) {
     .map(({ server, tool, description }) => ({ server, tool, description }));
 }
 
-async function withUnknownSuggestions(result, { server, tool, projectConfig }) {
+async function withUnknownSuggestions(result, { server, tool, visible }) {
   if (!result.isError) return result;
   const text = extractText(result);
   const unknownTool = unknownToolPattern.test(text);
@@ -509,7 +585,6 @@ async function withUnknownSuggestions(result, { server, tool, projectConfig }) {
 
   try {
     const servers = await readSchemaServers();
-    const allowed = projectConfig ? new Set(projectConfig.allowedServers) : null;
     const payload = { error: text };
 
     if (unknownTool) {
@@ -520,11 +595,11 @@ async function withUnknownSuggestions(result, { server, tool, projectConfig }) {
           description: shortDescription(item.description)
         })),
         tool,
-        allowed
+        visible
       );
     } else {
       payload.similarServers = Object.keys(servers)
-        .filter((name) => !allowed || allowed.has(name))
+        .filter(visible)
         .map((name) => ({ server: name, score: nameSimilarity(server, name) }))
         .filter((item) => item.score >= 0.4)
         .sort((left, right) => right.score - left.score)
@@ -539,7 +614,7 @@ async function withUnknownSuggestions(result, { server, tool, projectConfig }) {
           }))
         ),
         tool,
-        allowed
+        visible
       );
     }
 
@@ -633,7 +708,11 @@ server.registerTool(
       project: projectName,
       workspace,
       ...(projectConfig
-        ? { aliases: projectConfig.aliases, allowedServers: projectConfig.allowedServers }
+        ? {
+            aliases: projectConfig.aliases,
+            allowedServers: projectConfig.allowedServers,
+            ...(projectConfig.ownedServers?.length ? { ownedServers: projectConfig.ownedServers } : {})
+          }
         : { policy: 'none: no McpHub project mapping for this folder, every server is reachable' }),
       ...context
     });
@@ -656,10 +735,16 @@ server.registerTool(
   },
   async ({ project, working_dir, ...args }) => {
     const [projectName, projectConfig] = resolveProject(project, working_dir);
+    if (args.server && !ownerAllows(args.server, working_dir)) {
+      return textResult(
+        `Server "${args.server}" belongs to project "${serverOwners.get(args.server)}": it only answers when working_dir is inside that project's workspace.`,
+        true
+      );
+    }
     if (
       projectConfig &&
       args.server &&
-      !projectConfig.allowedServers.includes(args.server)
+      !allowedServersOf(projectConfig).has(args.server)
     ) {
       return textResult(
         `Server "${args.server}" is not allowed for project "${projectName}".`,
@@ -670,7 +755,7 @@ server.registerTool(
     markUsageDirty();
     try {
       const result = await callHubTool('mcphub_search', args);
-      return filterSearchResult(result, projectName, projectConfig);
+      return filterSearchResult(result, projectName, projectConfig, working_dir);
     } catch (error) {
       return textResult(errorMessage(error), true);
     }
@@ -705,7 +790,8 @@ server.registerTool(
         projectConfig,
         server: childServer,
         tool,
-        args
+        args,
+        workingDirectory: working_dir
       });
       usage.calls += 1;
       markUsageDirty();
@@ -714,7 +800,7 @@ server.registerTool(
         tool,
         args: securedArgs,
         bypass_cache,
-        projectConfig
+        visible: serverVisibility(projectConfig, working_dir)
       });
     } catch (error) {
       return textResult(errorMessage(error), true);
@@ -757,14 +843,15 @@ server.registerTool(
             projectConfig,
             server: call.server,
             tool: call.tool,
-            args: call.arguments ?? {}
+            args: call.arguments ?? {},
+            workingDirectory: working_dir
           });
           const result = await callChildWithSuggestions({
             server: call.server,
             tool: call.tool,
             args: securedArgs,
             bypass_cache: call.bypass_cache,
-            projectConfig
+            visible: serverVisibility(projectConfig, working_dir)
           });
           return {
             id: call.id,
@@ -790,17 +877,18 @@ server.registerTool(
     description:
       'Show redacted child-server health, authentication state and the active hub transport. Never returns commands, arguments, environment variables, or secrets.',
     inputSchema: {
-      server: z.string().optional()
+      server: z.string().optional(),
+      working_dir: projectFields.working_dir
     }
   },
-  async ({ server: serverFilter }) => {
+  async ({ server: serverFilter, working_dir }) => {
     try {
       const status = await readDaemonStatus();
-      if (serverFilter) {
-        status.servers = status.servers.filter(
-          (child) => child.name === serverFilter
-        );
-      }
+      status.servers = status.servers.filter(
+        (child) =>
+          (!serverFilter || child.name === serverFilter) &&
+          ownerAllows(child.name, working_dir)
+      );
       return textResult(status);
     } catch (error) {
       return textResult(errorMessage(error), true);

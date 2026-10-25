@@ -2,9 +2,11 @@
 // running, with the MemoryPilot and supabase servers configured. The project
 // policy under test is a throwaway file, never the user's own projects.json.
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -12,6 +14,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 const sandbox = await mkdtemp(join(tmpdir(), 'mcphub-client-test-'));
 const demoWorkspace = join(sandbox, 'demo');
 const unmappedWorkspace = join(sandbox, 'unmapped');
+const acmeWorkspace = join(sandbox, 'acme');
 const projectsPath = join(sandbox, 'projects.json');
 await writeFile(
   projectsPath,
@@ -27,6 +30,13 @@ await writeFile(
           cloudflareProject: 'demo-web'
         },
         allowedServers: ['MemoryPilot', 'supabase']
+      },
+      // A client project: context7 stands in for the client's own Stripe.
+      acme: {
+        workspaces: [acmeWorkspace],
+        aliases: { product: 'Acme' },
+        allowedServers: ['MemoryPilot'],
+        ownedServers: ['context7']
       }
     }
   })
@@ -186,6 +196,74 @@ try {
   });
   assert.equal(JSON.parse(text(sibling)).project, null);
 
+  // A client-owned server only answers from that client's folder.
+  const ownedCall = (workingDir) =>
+    client.callTool({
+      name: 'mcphub_call',
+      arguments: {
+        ...(workingDir ? { working_dir: workingDir } : {}),
+        server: 'context7',
+        tool: 'no-such-tool',
+        arguments: {}
+      }
+    });
+  for (const outsider of [demoWorkspace, unmappedWorkspace, undefined]) {
+    const refused = await ownedCall(outsider);
+    assert.equal(refused.isError, true);
+    assert.match(text(refused), /belongs to project \\?"acme\\?"/);
+  }
+  const fromAcme = JSON.parse(text(await ownedCall(join(acmeWorkspace, 'src'))));
+  assert.match(fromAcme.error, /Unknown tool/);
+  assert(fromAcme.suggestions.every((item) => item.server === 'context7'));
+
+  const outsiderSearch = JSON.parse(
+    text(
+      await client.callTool({
+        name: 'mcphub_search',
+        arguments: { working_dir: unmappedWorkspace, query: 'library documentation', top_k: 20 }
+      })
+    )
+  );
+  assert(!outsiderSearch.results.some((item) => item.server === 'context7'));
+  assert(!(outsiderSearch.available_servers ?? []).includes('context7'));
+
+  const outsiderScopedSearch = await client.callTool({
+    name: 'mcphub_search',
+    arguments: { working_dir: demoWorkspace, server: 'context7', query: 'docs' }
+  });
+  assert.equal(outsiderScopedSearch.isError, true);
+
+  const acmeSearch = JSON.parse(
+    text(
+      await client.callTool({
+        name: 'mcphub_search',
+        arguments: { working_dir: acmeWorkspace, server: 'context7', query: 'library documentation' }
+      })
+    )
+  );
+  assert(acmeSearch.results.some((item) => item.server === 'context7'));
+
+  const statusFor = async (workingDir) =>
+    JSON.parse(
+      text(
+        await client.callTool({
+          name: 'mcphub_status',
+          arguments: { server: 'context7', working_dir: workingDir }
+        })
+      )
+    ).servers;
+  assert.equal((await statusFor(unmappedWorkspace)).length, 0);
+  assert.equal((await statusFor(acmeWorkspace)).length, 1);
+
+  const acmeBatch = await client.callTool({
+    name: 'mcphub_batch',
+    arguments: {
+      working_dir: demoWorkspace,
+      calls: [{ id: 'foreign', server: 'context7', tool: 'resolve-library-id', arguments: {} }]
+    }
+  });
+  assert.match(text(acmeBatch), /belongs to project/);
+
   const noFolder = await client.callTool({ name: 'mcphub_bootstrap', arguments: {} });
   assert.equal(noFolder.isError, true);
 
@@ -197,6 +275,36 @@ try {
   const savingsPayload = JSON.parse(text(savings));
   assert.equal(typeof savingsPayload.versusCursorDeferredLoading.savedPercent, 'number');
   process.stdout.write(`Transport: ${savingsPayload.process.transport}\n`);
+
+  // Two owners for one server is a configuration error, raised at start-up.
+  const conflictPath = join(sandbox, 'conflict.json');
+  await writeFile(
+    conflictPath,
+    JSON.stringify({
+      projects: {
+        one: { workspaces: [join(sandbox, 'one')], aliases: {}, ownedServers: ['stripe-client'] },
+        two: { workspaces: [join(sandbox, 'two')], aliases: {}, ownedServers: ['stripe-client'] }
+      }
+    })
+  );
+  await assert.rejects(
+    promisify(execFile)(process.execPath, ['index.js'], {
+      cwd: new URL('.', import.meta.url).pathname,
+      env: { ...process.env, MCPHUB_PROJECTS: conflictPath },
+      timeout: 10_000
+    }),
+    /owned by both "one" and "two"/
+  );
+
+  // A named instance without its own port is refused before anything starts.
+  await assert.rejects(
+    promisify(execFile)(process.execPath, ['index.js'], {
+      cwd: new URL('.', import.meta.url).pathname,
+      env: { ...process.env, MCPHUB_INSTANCE: 'acme', MCPHUB_PORT: '' },
+      timeout: 10_000
+    }),
+    /MCPHUB_PORT is required/
+  );
 
   process.stdout.write('McpHub client smoke tests passed.\n');
 } finally {
