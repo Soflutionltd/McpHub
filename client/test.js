@@ -179,6 +179,13 @@ try {
   assert.equal(unmappedPayload.allowedServers, undefined);
   assert.equal(typeof unmappedPayload.memory, 'string', unmappedPayload.memoryError);
 
+  // A sibling folder sharing the prefix is not inside the project.
+  const sibling = await client.callTool({
+    name: 'mcphub_bootstrap',
+    arguments: { working_dir: `${demoWorkspace}2`, hints: 'McpHub smoke test' }
+  });
+  assert.equal(JSON.parse(text(sibling)).project, null);
+
   const noFolder = await client.callTool({ name: 'mcphub_bootstrap', arguments: {} });
   assert.equal(noFolder.isError, true);
 

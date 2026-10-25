@@ -2,7 +2,7 @@
 
 import { readFile, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join, normalize } from 'node:path';
+import { join, normalize, sep } from 'node:path';
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
@@ -264,6 +264,12 @@ async function callHubTool(name, args, retry = true) {
 // Politique projet
 // ---------------------------------------------------------------------------
 
+// `/Clients/Acme2` n'est pas dans le dossier `/Clients/Acme`.
+function insideWorkspace(candidate, workspace) {
+  const root = normalize(workspace).replace(/[\\/]+$/, '');
+  return candidate === root || candidate.startsWith(root + sep);
+}
+
 function resolveProject(projectName, workingDirectory) {
   if (projectName && projectsConfig.projects[projectName]) {
     return [projectName, projectsConfig.projects[projectName]];
@@ -272,9 +278,7 @@ function resolveProject(projectName, workingDirectory) {
   const candidate = normalize(workingDirectory || process.cwd());
   return (
     Object.entries(projectsConfig.projects).find(([, config]) =>
-      config.workspaces.some((workspace) =>
-        candidate.startsWith(normalize(workspace))
-      )
+      config.workspaces.some((workspace) => insideWorkspace(candidate, workspace))
     ) ?? [null, null]
   );
 }
