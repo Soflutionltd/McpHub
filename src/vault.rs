@@ -413,7 +413,10 @@ pub fn run_cli(args: &[String]) {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("status");
     if !is_available() && sub != "help" {
         eprintln!("Le coffre utilise le Trousseau macOS : indisponible sur ce systeme.");
-        eprintln!("McpHub continue d'utiliser ~/.McpHub/secrets.env.");
+        eprintln!(
+            "McpHub continue d'utiliser {}.",
+            crate::instance::hub_dir().join("secrets.env").display()
+        );
         return;
     }
     match sub {
