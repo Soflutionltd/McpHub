@@ -6,3 +6,4 @@ dashboard/node_modules/
 dashboard/.svelte-kit/
 *.bak-*
 dist/
+client/node_modules/

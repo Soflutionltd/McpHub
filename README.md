@@ -168,6 +168,31 @@ Use `http://127.0.0.1:24680/sse` with the same `Authorization` header.
 
 **One profile per client.** Give each editor its own view: `http://127.0.0.1:24680/mcp/cursor` only shows what the `cursor` profile allows (see [Profiles](#profiles-per-client)).
 
+### Project-aware client (optional)
+
+`client/` is a small Node MCP server that sits between your editor and the daemon. It talks to the running daemon (SSE, token from `~/.McpHub/auth-token`) and falls back to `McpHub stdio`. It exposes six tools:
+
+- `mcphub_bootstrap`: call once per conversation. Resolves the project from the workspace, returns its aliases and allowed servers, and recalls compact [MemoryPilot](https://github.com/Soflutionltd/MemoryPilot) context, also for folders without a project entry.
+- `mcphub_search`, `mcphub_call`: same as the daemon, plus suggestions on a misspelled tool or server, and the input schema on argument errors.
+- `mcphub_batch`: up to 20 independent calls in one round-trip.
+- `mcphub_status`, `mcphub_savings`: server health and an honest context-size comparison.
+
+Per-project policy lives in `~/.McpHub/projects.json` (or the path in `MCPHUB_PROJECTS`), see [`client/projects.example.json`](client/projects.example.json). For a workspace listed there, only its `allowedServers` are reachable, and a call aimed at another Supabase project, App Store app or Cloudflare project is refused. Without the file there is no policy; an unreadable file is an error, never silently ignored.
+
+```bash
+cd client && npm ci
+```
+
+```json
+{
+  "mcpServers": {
+    "McpHub": { "command": "node", "args": ["/path/to/McpHub/client/index.js"] }
+  }
+}
+```
+
+`npm test` runs smoke tests against the local daemon (MemoryPilot and supabase configured), with a throwaway project file.
+
 ---
 
 ## 🧭 How it works

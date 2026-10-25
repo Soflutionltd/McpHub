@@ -1,0 +1,15 @@
+{
+  "projects": {
+    "demo": {
+      "workspaces": ["/Users/you/Code/demo"],
+      "aliases": {
+        "product": "Demo",
+        "supabaseProjectId": "your-supabase-project-ref",
+        "appStoreAppId": "1234567890",
+        "iosBundleId": "com.example.demo",
+        "cloudflareProject": "demo-web"
+      },
+      "allowedServers": ["MemoryPilot", "supabase", "cloudflare", "context7", "github"]
+    }
+  }
+}
