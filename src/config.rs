@@ -319,8 +319,7 @@ pub fn load_guard_config() -> crate::toolguard::GuardConfig {
 }
 
 fn load_dedicated_config() -> Option<ProxyConfig> {
-    let home = dirs::home_dir()?;
-    let path = home.join(".McpHub").join("config.json");
+    let path = crate::instance::hub_dir().join("config.json");
     load_dedicated_config_from_path(&path)
 }
 
@@ -459,6 +458,13 @@ pub fn auto_detect() -> ProxyConfig {
     }
 
     let mut config = ProxyConfig::default();
+    if crate::instance::current().name.is_some() {
+        eprintln!(
+            "[McpHub][WARN] No config in {}: a named instance never imports the editors' MCP servers.",
+            crate::instance::hub_dir().display()
+        );
+        return config;
+    }
     for path in &get_config_paths() {
         if path.exists() {
             if let Ok(content) = fs::read_to_string(path) {

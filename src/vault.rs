@@ -14,10 +14,8 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-const DEFAULT_SERVICE: &str = "McpHub";
-
 fn service() -> String {
-    std::env::var("MCPHUB_VAULT_SERVICE").unwrap_or_else(|_| DEFAULT_SERVICE.to_string())
+    crate::instance::current().vault_service.clone()
 }
 
 /// Trousseau explicite (tests, ou trousseau dédié). Par défaut : trousseau de session.
@@ -30,10 +28,7 @@ fn keychain_args() -> Vec<String> {
 }
 
 fn mcphub_dir() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("MCPHUB_HOME") {
-        return Some(PathBuf::from(dir));
-    }
-    dirs::home_dir().map(|h| h.join(".McpHub"))
+    Some(crate::instance::hub_dir())
 }
 
 fn index_path() -> Option<PathBuf> {

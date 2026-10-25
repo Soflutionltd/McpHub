@@ -19,7 +19,7 @@ use serde_json::Value;
 pub const CALLBACK_PATH: &str = "/oauth/callback";
 
 pub fn redirect_uri() -> String {
-    format!("http://localhost:{}{}", crate::dashboard::HTTP_PORT, CALLBACK_PATH)
+    format!("http://localhost:{}{}", crate::instance::port(), CALLBACK_PATH)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -776,7 +776,7 @@ pub async fn run_cli(args: &[String]) -> i32 {
                 return 2;
             };
             let token = crate::dashboard::get_auth_token();
-            let url = format!("http://127.0.0.1:{}/api/oauth/login", crate::dashboard::HTTP_PORT);
+            let url = format!("http://127.0.0.1:{}/api/oauth/login", crate::instance::port());
             let r = reqwest::Client::new()
                 .post(&url)
                 .bearer_auth(token)
@@ -816,7 +816,7 @@ pub async fn run_cli(args: &[String]) -> i32 {
             };
             // Passe par le démon pour qu'il oublie aussi sa copie en mémoire.
             let token = crate::dashboard::get_auth_token();
-            let url = format!("http://127.0.0.1:{}/api/oauth/logout", crate::dashboard::HTTP_PORT);
+            let url = format!("http://127.0.0.1:{}/api/oauth/logout", crate::instance::port());
             let via_daemon = reqwest::Client::new()
                 .post(&url)
                 .bearer_auth(token)
@@ -846,7 +846,7 @@ pub async fn run_cli(args: &[String]) -> i32 {
             // reprenant leurs jetons. Sauvegarde de config.json avant toute écriture.
             let dry = !args.iter().any(|a| a == "--apply");
             let only: Vec<&String> = args.iter().skip(1).filter(|a| !a.starts_with("--")).collect();
-            let path = dirs::home_dir().unwrap_or_default().join(".McpHub/config.json");
+            let path = crate::instance::hub_dir().join("config.json");
             let raw = match std::fs::read_to_string(&path) {
                 Ok(r) => r,
                 Err(e) => {

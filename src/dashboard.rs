@@ -15,7 +15,7 @@ use tokio::net::TcpListener;
 // ─── Config I/O ──────────────────────────────────────────────
 
 fn config_dir() -> PathBuf {
-    dirs::home_dir().unwrap_or_default().join(".McpHub")
+    crate::instance::hub_dir()
 }
 
 fn config_path() -> PathBuf {
@@ -110,9 +110,6 @@ fn read_cache() -> Option<Value> {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
 }
-
-/// Port du serveur HTTP local (tableau de bord, SSE, Streamable HTTP).
-pub const HTTP_PORT: u16 = 24680;
 
 // ─── HTTP Parsing ────────────────────────────────────────────
 
@@ -1097,7 +1094,7 @@ fn urldecode(s: &str) -> String {
 /// Start dashboard only (no SSE, no proxy). For `McpHub dashboard` command.
 pub async fn start_dashboard() {
     // Démon déjà lancé : on ouvre simplement un lien de connexion à usage unique.
-    let addr = format!("127.0.0.1:{}", HTTP_PORT);
+    let addr = format!("127.0.0.1:{}", crate::instance::port());
     if tokio::net::TcpStream::connect(&addr).await.is_ok() {
         open_login_page();
         println!("Tableau de bord ouvert dans le navigateur (lien valable 2 minutes).");
@@ -1111,7 +1108,7 @@ fn open_login_page() {
         eprintln!("[McpHub] Impossible de creer le lien de connexion.");
         return;
     };
-    let url = format!("http://127.0.0.1:{}/login?nonce={}", HTTP_PORT, nonce);
+    let url = format!("http://127.0.0.1:{}/login?nonce={}", crate::instance::port(), nonce);
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(&url).spawn();
     #[cfg(target_os = "linux")]
@@ -1130,7 +1127,7 @@ async fn start_http(
     sse: Option<Arc<SseManager>>,
     open_browser: bool,
 ) {
-    let addr = format!("127.0.0.1:{}", HTTP_PORT);
+    let addr = format!("127.0.0.1:{}", crate::instance::port());
     let addr = addr.as_str();
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => l,
@@ -1252,10 +1249,10 @@ async fn handle_connection(
     let expected_auth = format!("Bearer {}", auth_token);
 
     // Anti DNS rebinding et anti requêtes envoyées par des sites tiers.
-    if !crate::http_guard::host_allowed(req.headers.get("host").map(|s| s.as_str()), HTTP_PORT)
+    if !crate::http_guard::host_allowed(req.headers.get("host").map(|s| s.as_str()), crate::instance::port())
         || !crate::http_guard::origin_allowed(
             req.headers.get("origin").map(|s| s.as_str()),
-            HTTP_PORT,
+            crate::instance::port(),
         )
     {
         eprintln!(

@@ -34,6 +34,7 @@ fn sandbox_profile() -> String {
             .map(|f| format!("(literal {})", q(&format!("{}/{}", home, f)))),
     );
     denied.push(format!("(subpath {})", q(&format!("{}/Library/Keychains", home))));
+    denied.extend(crate::instance::sandbox_hub_rules(&home));
     format!(
         "(version 1)(allow default)(deny network*)(deny file-write*)(allow file-write-data (literal \"/dev/null\"))(deny file-read* {})(deny process-exec (literal \"/usr/bin/security\") (literal \"/bin/launchctl\") (literal \"/usr/bin/osascript\") (literal \"/usr/bin/open\"))",
         denied.join(" ")

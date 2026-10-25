@@ -6,9 +6,7 @@ use std::time::Duration;
 use crate::redaction::redact_text;
 
 pub fn run(server_filter: Option<&str>, level_filter: Option<&str>) {
-    let log_path = dirs::home_dir()
-        .unwrap_or_default()
-        .join(".McpHub/mcphub.log");
+    let log_path = crate::instance::hub_dir().join("mcphub.log");
     if !log_path.exists() {
         eprintln!("Log file not found at {}", log_path.display());
         return;

@@ -14,6 +14,7 @@ mod export;
 mod health;
 mod http_guard;
 mod install;
+mod instance;
 mod logs;
 mod permissions;
 mod oauth;
@@ -136,7 +137,10 @@ fn cmd_status() {
 async fn cmd_generate() {
     let config = auto_detect();
     if config.servers.is_empty() {
-        eprintln!("No servers found. Add servers to ~/.McpHub/config.json");
+        eprintln!(
+            "No servers found. Add servers to {}",
+            instance::hub_dir().join("config.json").display()
+        );
         return;
     }
 
@@ -203,7 +207,10 @@ async fn cmd_generate() {
         fail,
         engine.tool_count()
     );
-    eprintln!("Cache saved to ~/.McpHub/schema-cache.json");
+    eprintln!(
+        "Cache saved to {}",
+        instance::hub_dir().join("schema-cache.json").display()
+    );
     eprintln!("Proxy will now start instantly from cache.");
 }
 
@@ -266,7 +273,10 @@ async fn cmd_serve() {
     let config = auto_detect();
     let proxy = std::sync::Arc::new(ProxyServer::new(config));
     proxy.init().await;
-    eprintln!("[McpHub][SERVE] Ready. Waiting for SSE connections on http://127.0.0.1:24680/sse");
+    eprintln!(
+        "[McpHub][SERVE] Ready. Waiting for SSE connections on http://127.0.0.1:{}/sse",
+        instance::port()
+    );
 
     let proxy_shutdown = proxy.clone();
     tokio::spawn(async move {
@@ -294,6 +304,10 @@ async fn cmd_serve() {
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if let Err(error) = instance::init() {
+        eprintln!("[McpHub] {}", error);
+        std::process::exit(2);
+    }
 
     match args.get(1).map(|s| s.as_str()) {
         Some("help") | Some("--help") | Some("-h") => print_help(),

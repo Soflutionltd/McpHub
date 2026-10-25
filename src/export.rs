@@ -4,10 +4,7 @@ use std::io::Write;
 use crate::redaction::redact_json_value;
 
 pub fn run_export(raw: bool) {
-    let path = dirs::home_dir()
-        .unwrap_or_default()
-        .join(".McpHub")
-        .join("config.json");
+    let path = crate::instance::hub_dir().join("config.json");
     if let Ok(content) = std::fs::read_to_string(&path) {
         if raw {
             println!("{}", content);
@@ -32,10 +29,7 @@ pub fn run_export(raw: bool) {
 }
 
 pub fn run_import(file: &str) {
-    let dest = dirs::home_dir()
-        .unwrap_or_default()
-        .join(".McpHub")
-        .join("config.json");
+    let dest = crate::instance::hub_dir().join("config.json");
     if let Ok(content) = std::fs::read_to_string(file) {
         if let Ok(mut json) = serde_json::from_str::<Value>(&content) {
             let mut servers_opt = json.get_mut("mcpServers");
@@ -76,7 +70,7 @@ pub fn run_import(file: &str) {
             if std::fs::write(&dest, serde_json::to_string_pretty(&json).unwrap()).is_ok() {
                 println!("Imported successfully. Run 'McpHub generate' to rebuild cache.");
             } else {
-                eprintln!("Failed to write to ~/.McpHub/config.json");
+                eprintln!("Failed to write to {}", dest.display());
             }
         } else {
             eprintln!("Invalid JSON in {}", file);

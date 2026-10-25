@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 fn mcphub_dir() -> PathBuf {
-    dirs::home_dir().unwrap_or_default().join(".McpHub")
+    crate::instance::hub_dir()
 }
 
 pub async fn run() {
@@ -86,6 +86,6 @@ pub async fn run() {
     }
     fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
 
-    println!("✓ Added '{}' to ~/.McpHub/config.json", name);
+    println!("✓ Added '{}' to {}", name, path.display());
     println!("Run 'McpHub generate' to rebuild cache if needed.");
 }

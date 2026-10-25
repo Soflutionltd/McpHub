@@ -18,8 +18,7 @@ pub struct SchemaCache {
 }
 
 pub fn cache_path() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    Some(home.join(".McpHub").join("schema-cache.json"))
+    Some(crate::instance::hub_dir().join("schema-cache.json"))
 }
 
 pub fn load_cache() -> Option<SchemaCache> {

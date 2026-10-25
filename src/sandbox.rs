@@ -266,6 +266,7 @@ pub fn profile(spec: &SandboxSpec, home: &str, referenced: &[String]) -> String 
             .iter()
             .map(|f| format!("(literal {})", q(&format!("{}/{}", home, f)))),
     );
+    denied.extend(crate::instance::sandbox_hub_rules(home));
     p.push_str(&format!("(deny file-read* file-write* {})\n", denied.join(" ")));
     let protected: Vec<String> = WRITE_PROTECTED
         .iter()

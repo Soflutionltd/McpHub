@@ -120,10 +120,7 @@ pub fn token_is_current(t: &str) -> bool {
 }
 
 fn login_path() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(".McpHub")
-        .join("dashboard-login")
+    crate::instance::hub_dir().join("dashboard-login")
 }
 
 /// Lien de connexion à usage unique (valable 2 minutes), écrit dans un fichier 600 que seul

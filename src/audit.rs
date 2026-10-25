@@ -76,13 +76,7 @@ pub struct AuditLogger {
 }
 
 pub fn default_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("MCPHUB_HOME") {
-        return PathBuf::from(dir).join("audit.jsonl");
-    }
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".McpHub")
-        .join("audit.jsonl")
+    crate::instance::hub_dir().join("audit.jsonl")
 }
 
 impl AuditLogger {

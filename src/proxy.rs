@@ -111,10 +111,7 @@ impl GlobalMetrics {
 }
 
 fn usage_stats_path() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    std::path::PathBuf::from(home)
-        .join(".McpHub")
-        .join("usage-stats.json")
+    crate::instance::hub_dir().join("usage-stats.json")
 }
 
 fn load_usage_stats() -> HashMap<String, u64> {
@@ -2451,7 +2448,7 @@ async fn config_and_cache_watcher(
         .and_then(|p| p.metadata().ok())
         .and_then(|m| m.modified().ok());
 
-    let config_path_opt = dirs::home_dir().map(|h| h.join(".McpHub/config.json"));
+    let config_path_opt = Some(crate::instance::hub_dir().join("config.json"));
     let mut last_config_modified: Option<SystemTime> = config_path_opt
         .as_ref()
         .and_then(|p| p.metadata().ok())

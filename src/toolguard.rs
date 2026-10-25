@@ -580,13 +580,7 @@ pub fn pins_path() -> PathBuf {
         return std::env::temp_dir().join(format!("mcphub-test-pins-{}.json", std::process::id()));
     }
     #[allow(unreachable_code)]
-    if let Ok(h) = std::env::var("MCPHUB_HOME") {
-        return PathBuf::from(h).join("tool-pins.json");
-    }
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(".McpHub")
-        .join("tool-pins.json")
+    crate::instance::hub_dir().join("tool-pins.json")
 }
 
 fn mtime(p: &PathBuf) -> Option<SystemTime> {

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn mcphub_dir() -> PathBuf {
-    dirs::home_dir().unwrap_or_default().join(".McpHub")
+    crate::instance::hub_dir()
 }
 
 pub fn run() {
@@ -49,9 +49,10 @@ pub fn run() {
     }
 
     // 4. Daemon & Port
-    match TcpStream::connect("127.0.0.1:24680") {
-        Ok(_) => println!("✓ Daemon: Running on port 24680"),
-        Err(_) => println!("! Daemon: Not running on port 24680 (or port is blocked)"),
+    let port = crate::instance::port();
+    match TcpStream::connect(("127.0.0.1", port)) {
+        Ok(_) => println!("✓ Daemon: Running on port {}", port),
+        Err(_) => println!("! Daemon: Not running on port {} (or port is blocked)", port),
     }
 
     // 5. Servers check
@@ -90,7 +91,8 @@ pub fn run() {
         }
     }
     println!(
-        "\nDisk Usage: ~/.McpHub/ uses {} MB",
+        "\nDisk Usage: {} uses {} MB",
+        mcphub_dir().display(),
         total_size / 1024 / 1024
     );
 }
