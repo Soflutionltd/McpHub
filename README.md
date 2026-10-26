@@ -12,7 +12,7 @@
   <a href="https://github.com/Soflutionltd/McpHub/releases/latest"><img src="https://img.shields.io/github/v/release/Soflutionltd/McpHub?color=F5B301&label=release" alt="Latest release"/></a>
   <img src="https://img.shields.io/badge/MCP-2026--07--28-2563EB" alt="MCP 2026-07-28"/>
   <img src="https://img.shields.io/badge/written%20in-Rust-B7410E?logo=rust&logoColor=white" alt="Rust"/>
-  <img src="https://img.shields.io/badge/platform-macOS-0F172A?logo=apple" alt="macOS"/>
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-0F172A?logo=apple" alt="macOS and Linux"/>
   <img src="https://img.shields.io/badge/license-MIT-16A34A" alt="MIT"/>
 </p>
 
@@ -29,6 +29,8 @@
   <a href="#-code-mode">Code mode</a> ·
   <a href="#%EF%B8%8F-security">Security</a> ·
   <a href="#-dashboard">Dashboard</a> ·
+  <a href="#-library">Library</a> ·
+  <a href="#-linux-servers-and-sync">Linux and sync</a> ·
   <a href="#%EF%B8%8F-configuration">Configuration</a> ·
   <a href="#-faq">FAQ</a>
 </p>
@@ -55,6 +57,9 @@
 | A malicious npm server reads `~/.ssh` | it can | **blocked by the macOS sandbox** |
 | Remote servers with OAuth | one `mcp-remote` process each, tokens in plain files | **native HTTP**, tokens in the Keychain, auto refresh |
 | Who called what | unknown | **audit log** with redacted arguments |
+| Finding a new server | search GitHub, copy a JSON snippet, paste a token | **Library** of the official MCP Registry: trust score, one-click add, secrets straight to the Keychain |
+| Your agent needs a tool you lack | you install it by hand | the agent **installs it itself** from the registry, sandboxed, if it is trusted enough |
+| A second machine, a Linux server | redo everything, copy tokens around | **same binary**, bubblewrap sandbox, **encrypted sync** of servers and secrets |
 
 ---
 
@@ -64,12 +69,12 @@
 curl -fsSL https://raw.githubusercontent.com/Soflutionltd/McpHub/main/get.sh | bash
 ```
 
-The script downloads the latest signed universal binary (Apple Silicon and Intel), verifies its SHA-256 checksum and installs it to `~/.local/bin/McpHub`. Then:
+The script downloads the latest binary for your machine (signed universal binary on macOS, x64 or arm64 on Linux), verifies its SHA-256 checksum and installs it to `~/.local/bin/McpHub`. Then:
 
 ```bash
-McpHub add        # add your MCP servers (or edit ~/.McpHub/config.json)
+McpHub dashboard  # Library tab: add servers from the official MCP Registry (or McpHub add)
 McpHub generate   # index every tool once
-McpHub install    # start the daemon at login (LaunchAgent)
+McpHub install    # start the daemon at login (LaunchAgent on macOS, systemd --user on Linux)
 ```
 
 <details>
@@ -80,7 +85,7 @@ McpHub install    # start the daemon at login (LaunchAgent)
 3. `tar -xzf McpHub-macos-universal.tar.gz && install -m 755 McpHub ~/.local/bin/McpHub`
 4. Downloaded through a browser? Clear the quarantine flag: `xattr -d com.apple.quarantine ~/.local/bin/McpHub`
 
-Linux (amd64, arm64) and Windows (amd64) archives are attached to [every release](https://github.com/Soflutionltd/McpHub/releases/latest) too. On those systems the macOS sandbox, Keychain and confirmation dialog are not available.
+Linux (amd64, arm64) and Windows (amd64) archives are attached to [every release](https://github.com/Soflutionltd/McpHub/releases/latest) too. On Linux the sandbox uses bubblewrap and secrets live in `~/.McpHub/secrets.env` (mode 600, hidden from sandboxed servers), see [Linux servers and sync](#-linux-servers-and-sync). Windows has no sandbox.
 
 </details>
 
@@ -400,6 +405,66 @@ Run `McpHub dashboard` (a one-time link opens your browser).
 
 ---
 
+## 📚 Library
+
+The **Library** tab of the dashboard is the official [MCP Registry](https://registry.modelcontextprotocol.io) inside McpHub: search thousands of servers, read a trust score, click **Add**.
+
+- **Search runs locally.** The first time you open the Library, McpHub downloads the catalog once in the background (the popular servers from the [GitHub MCP Registry](https://github.com/mcp) come first, in a few seconds; the full official catalog follows) into `~/.McpHub/registry-cache/`. After that, it only fetches what changed, at most once a day. Search is instant and works offline.
+- **Zero weight for your agent.** The catalog lives in the dashboard and on disk. It adds no tool definition to the agent's context and nothing stays in memory between searches.
+- **Trust score before you install** (0 to 100), with the detail of every point:
+  - verified publisher: the registry checks the namespace (a GitHub account or a DNS domain), McpHub checks that it publishes its own code;
+  - popularity and activity: GitHub stars, last update, archived repositories;
+  - permission scan: secrets requested, plain HTTP endpoints, privileged Docker options, bundle integrity hash, unpinned versions, and what the server can do (run commands, touch files, a browser, payments...).
+- **One-click add** for every kind of server: remote (Streamable HTTP), npm (`npx`), Python (`uvx`), Docker, .NET (`dnx`) and `.mcpb` bundles (downloaded, SHA-256 checked, extracted outside `~/.McpHub`).
+- **Secrets go to the Keychain**, never to `config.json`. A secret you already have (`GITHUB_TOKEN`...) is reused.
+- **Remote servers sign in with McpHub's native OAuth** (one click on *Sign in*), tokens in the Keychain.
+- **New servers inherit every guard**: shield sandbox for local code (Docker keeps its container), tool pinning and description scan on first contact, quarantine on change, audit log, permissions and profiles.
+
+From the terminal: `McpHub registry search postgres`, `McpHub registry info NAME`, `McpHub registry install NAME`, `McpHub registry sync`.
+
+### Your agent installs what it needs
+
+No new tool is added for this (about 30 tokens in total). When `mcphub_search` finds nothing, the agent can call:
+
+```text
+mcphub_call  server=mcphub  tool=registry_search   arguments={"query": "postgres"}
+mcphub_call  server=mcphub  tool=registry_install  arguments={"name": "io.github.acme/postgres-mcp"}
+```
+
+The server is installed with the same guards, its tools are indexed right away, and the call is audited. An agent never handles secrets: when a server needs one, the agent asks you to finish in the dashboard. Control it in `settings.registry`:
+
+```json
+"registry": { "agentInstall": "trusted", "minTrust": 60 }
+```
+
+`agentInstall`: `"trusted"` (default, only servers whose trust score reaches `minTrust`), `"any"` or `"off"`.
+
+---
+
+## 🐧 Linux servers and sync
+
+McpHub runs the same way on a Linux server, for example next to an agent running on a VPS:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Soflutionltd/McpHub/main/get.sh | bash
+sudo apt install bubblewrap   # sandbox
+McpHub install                # systemd --user service
+```
+
+- **Sandbox with bubblewrap**: same policy as on macOS. Every secret folder (`~/.ssh`, `~/.aws`, `~/.McpHub`...) is replaced by an empty folder in memory, every secret file by an empty file; `strict` mode makes the whole system read-only except temporary folders, caches and `allowWrite`.
+- **Secrets** in `~/.McpHub/secrets.env`, mode 600, hidden from sandboxed servers. `McpHub vault set NAME` works the same.
+
+**Move your setup from one machine to another without any plaintext secret:**
+
+```bash
+McpHub sync export mcphub.sync.json --secrets   # on the Mac
+McpHub sync import mcphub.sync.json --secrets   # on the server
+```
+
+The export is a portable `config.json`: every secret is a `${NAME}` reference (plain values that look like tokens are taken out of the copy), and home paths become `${HOME}/...`. With `--secrets`, the values travel too, encrypted with a passphrase (scrypt, then ChaCha20-Poly1305). Without the passphrase the file only reveals secret names. On import, servers whose program is missing on that machine are imported disabled, and decrypted secrets go to the Keychain (macOS) or `secrets.env` (Linux). For scripts, set `MCPHUB_SYNC_PASSPHRASE`.
+
+---
+
 ## ⚙️ Configuration
 
 Everything lives in `~/.McpHub/config.json` and is hot-reloaded while the daemon runs.
@@ -468,6 +533,8 @@ McpHub dashboard          # open the dashboard (one-time link)
 McpHub logs               # follow the daemon log
 McpHub add                # interactive server wizard
 McpHub vault ...          # Keychain secrets: status, list, set, get, rm, migrate
+McpHub registry ...       # Library: search, info, install, uninstall, sync
+McpHub sync ...           # export / import to another machine, secrets encrypted
 McpHub oauth ...          # remote servers: status, login, logout, migrate
 McpHub pins ...           # tool pinning: status, approve, reset, scan
 McpHub sandbox [show S]   # server isolation
