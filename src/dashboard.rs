@@ -1037,6 +1037,68 @@ async fn route(
                 )
             }
         }
+        ("GET", "/api/registry/search") => {
+            let q = query_param(&req.path, "q").unwrap_or_default();
+            let cursor = query_param(&req.path, "cursor");
+            let limit = query_param(&req.path, "limit").and_then(|l| l.parse().ok()).unwrap_or(30);
+            match crate::registry::search(&q, cursor.as_deref(), limit).await {
+                Ok(v) => json_ok(v),
+                Err(e) => json_err(502, &format!("Registre MCP : {}", e)),
+            }
+        }
+        ("GET", "/api/registry/server") => match query_param(&req.path, "name") {
+            None => json_err(400, "name requis"),
+            Some(name) => match crate::registry::details(&name).await {
+                Ok(v) => json_ok(v),
+                Err(e) => json_err(502, &format!("Registre MCP : {}", e)),
+            },
+        },
+        ("GET", "/api/registry/status") => json_ok(crate::registry::sync_status()),
+        ("POST", "/api/registry/sync") => {
+            crate::registry::ensure_sync();
+            json_ok(crate::registry::sync_status())
+        }
+        ("POST", "/api/registry/install") => {
+            let body: Value = serde_json::from_str(&req.body).unwrap_or(json!({}));
+            match body.get("name").and_then(|v| v.as_str()) {
+                None => json_err(400, "name requis"),
+                Some(name) => {
+                    let request = crate::registry::InstallRequest {
+                        name: name.to_string(),
+                        option: body.get("option").and_then(|v| v.as_str()).map(String::from),
+                        values: body.get("values").and_then(|v| v.as_object()).cloned().unwrap_or_default(),
+                        local_name: body.get("localName").and_then(|v| v.as_str()).map(String::from),
+                        by: "dashboard".into(),
+                    };
+                    match crate::registry::install(request).await {
+                        Ok(v) => {
+                            if v.get("ok").and_then(|o| o.as_bool()) == Some(true) {
+                                if let Some(p) = &proxy {
+                                    p.reload_config_now().await;
+                                }
+                            }
+                            json_ok(v)
+                        }
+                        Err(e) => json_err(400, &e),
+                    }
+                }
+            }
+        }
+        ("POST", "/api/registry/uninstall") => {
+            let body: Value = serde_json::from_str(&req.body).unwrap_or(json!({}));
+            match body.get("server").and_then(|v| v.as_str()) {
+                None => json_err(400, "server requis"),
+                Some(server) => match crate::registry::uninstall(server) {
+                    Ok(removed) => {
+                        if let Some(p) = &proxy {
+                            p.reload_config_now().await;
+                        }
+                        json_ok(json!({"ok": removed}))
+                    }
+                    Err(e) => json_err(500, &e),
+                },
+            }
+        }
         ("GET", "/api/servers") => handle_get_servers(),
         ("POST", "/api/servers") => handle_add_server(&req.body),
         ("GET", "/api/settings") => handle_get_settings(),
@@ -1072,21 +1134,23 @@ async fn route(
 }
 
 fn urldecode(s: &str) -> String {
-    let mut result = String::new();
+    // Octets décodés puis UTF-8 : "%C3%A9" donne "é", pas deux caractères.
+    let mut bytes: Vec<u8> = Vec::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
         if c == '%' {
             let hex: String = chars.by_ref().take(2).collect();
             if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                result.push(byte as char);
+                bytes.push(byte);
             }
         } else if c == '+' {
-            result.push(' ');
+            bytes.push(b' ');
         } else {
-            result.push(c);
+            let mut buf = [0u8; 4];
+            bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
         }
     }
-    result
+    String::from_utf8_lossy(&bytes).to_string()
 }
 
 // ─── Server Entry Point ─────────────────────────────────────

@@ -58,6 +58,9 @@ pub fn is_valid_name(name: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 pub fn list_names() -> Vec<String> {
+    if !is_available() {
+        return file_backend::read().into_iter().map(|(k, _)| k).collect();
+    }
     let path = match index_path() {
         Some(p) => p,
         None => return Vec::new(),
@@ -151,7 +154,7 @@ pub fn restrict_permissions(_path: &std::path::Path) {}
 
 pub fn get(name: &str) -> Result<Option<String>, String> {
     if !is_available() {
-        return Err("Trousseau macOS indisponible".into());
+        return Ok(file_backend::read().into_iter().find(|(k, _)| k == name).map(|(_, v)| v));
     }
     if !is_valid_name(name) {
         return Err(format!("nom invalide: {}", name));
@@ -225,9 +228,6 @@ fn quote_for_security(s: &str) -> String {
 }
 
 pub fn set(name: &str, value: &str) -> Result<(), String> {
-    if !is_available() {
-        return Err("Trousseau macOS indisponible".into());
-    }
     if !is_valid_name(name) {
         return Err(format!("nom invalide: {}", name));
     }
@@ -236,6 +236,9 @@ pub fn set(name: &str, value: &str) -> Result<(), String> {
     }
     if value.contains('\n') || value.contains('\r') {
         return Err("valeur sur plusieurs lignes non prise en charge".into());
+    }
+    if !is_available() {
+        return file_backend::upsert(name, Some(value)).map(|_| ());
     }
     // La commande passe par l'entrée standard de `security -i` : la valeur n'apparaît
     // jamais dans les arguments du processus (invisible pour `ps`).
@@ -279,7 +282,7 @@ pub fn set(name: &str, value: &str) -> Result<(), String> {
 
 pub fn delete(name: &str) -> Result<bool, String> {
     if !is_available() {
-        return Err("Trousseau macOS indisponible".into());
+        return file_backend::upsert(name, None);
     }
     if !is_valid_name(name) {
         return Err(format!("nom invalide: {}", name));
@@ -333,6 +336,67 @@ pub fn load_into_env() -> (usize, Vec<String>) {
 // secrets.env
 // ---------------------------------------------------------------------------
 
+/// Sans Trousseau (Linux, serveurs) : les secrets vivent dans ~/.McpHub/secrets.env, en mode 600,
+/// jamais lisible par les serveurs isolés (dossier caché par le bac à sable).
+mod file_backend {
+    use std::fs;
+    use std::io::Write;
+
+    pub fn read() -> Vec<(String, String)> {
+        super::secrets_env_path()
+            .and_then(|p| fs::read_to_string(p).ok())
+            .map(|c| super::parse_env_file(&c))
+            .unwrap_or_default()
+    }
+
+    /// Ajoute, remplace (Some) ou retire (None) une variable. Renvoie vrai si elle existait.
+    pub fn upsert(name: &str, value: Option<&str>) -> Result<bool, String> {
+        let path = super::secrets_env_path().ok_or("dossier ~/.McpHub introuvable")?;
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path.with_extension("env.lock"))
+            .map_err(|e| e.to_string())?;
+        lock.lock().map_err(|e| e.to_string())?;
+        let content = fs::read_to_string(&path).unwrap_or_default();
+        let mut existed = false;
+        let mut lines: Vec<String> = Vec::new();
+        for line in content.lines() {
+            let t = line.trim();
+            let key = t.strip_prefix("export ").unwrap_or(t).split('=').next().unwrap_or("").trim();
+            if !t.starts_with('#') && key == name {
+                existed = true;
+                continue;
+            }
+            lines.push(line.to_string());
+        }
+        if let Some(v) = value {
+            lines.push(format!("{}={}", name, v));
+        }
+        let tmp = path.with_extension(format!("env.tmp.{}", std::process::id()));
+        let res = (|| -> std::io::Result<()> {
+            let mut opts = fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp)?;
+            f.write_all((lines.join("\n") + "\n").as_bytes())?;
+            f.sync_all()?;
+            fs::rename(&tmp, &path)
+        })();
+        let _ = lock.unlock();
+        res.map_err(|e| e.to_string())?;
+        Ok(existed)
+    }
+}
+
 /// Lit un fichier KEY=VALUE (commentaires `#`, guillemets simples ou doubles retirés).
 pub fn parse_env_file(content: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
@@ -368,7 +432,7 @@ fn mask(value: &str) -> String {
     format!("****{} ({} caracteres)", tail, n)
 }
 
-fn read_secret_from_stdin(name: &str) -> Result<String, String> {
+pub(crate) fn read_secret_from_stdin(name: &str) -> Result<String, String> {
     let tty = atty_stdin();
     if tty {
         eprint!("Valeur de {} (saisie masquee) : ", name);

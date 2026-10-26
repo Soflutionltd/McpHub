@@ -326,8 +326,124 @@ pub fn profile(spec: &SandboxSpec, home: &str, referenced: &[String]) -> String 
     p
 }
 
-/// Commande enveloppée : `/usr/bin/sandbox-exec -p PROFIL commande args...`.
-/// Hors macOS (ou sans sandbox-exec), la commande est lancée telle quelle avec un avertissement.
+// ─── Linux : bubblewrap ──────────────────────────────────────
+//
+// Même politique qu'avec sandbox-exec, en espaces de noms : la machine reste visible, mais chaque
+// dossier secret est remplacé par un dossier vide en mémoire (tmpfs) et chaque fichier secret par
+// /dev/null. Les écritures dans ces dossiers vides disparaissent avec le serveur. En mode strict,
+// tout est en lecture seule sauf les dossiers temporaires, les caches et `allowWrite`.
+
+/// bwrap utilisable (installé et autorisé par le noyau à créer un espace de noms), testé une fois.
+fn bwrap_path() -> Option<String> {
+    static FOUND: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    FOUND
+        .get_or_init(|| {
+            let exe = ["/usr/bin/bwrap", "/usr/local/bin/bwrap", "/bin/bwrap"]
+                .into_iter()
+                .find(|p| Path::new(p).exists())?;
+            let ok = std::process::Command::new(exe)
+                .args(["--dev-bind", "/", "/", "--", "true"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            ok.then(|| exe.to_string())
+        })
+        .clone()
+}
+
+/// Dossiers de McpHub à cacher : ~/.McpHub, toutes les instances ~/.McpHub-*, l'instance courante.
+fn hub_dirs(home: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(home) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().to_string();
+            if n.eq_ignore_ascii_case(".mcphub") || n.to_ascii_lowercase().starts_with(".mcphub-") {
+                out.push(format!("{}/{}", home, n));
+            }
+        }
+    }
+    let own = crate::instance::hub_dir().to_string_lossy().to_string();
+    if !out.contains(&own) {
+        out.push(own);
+    }
+    out
+}
+
+pub fn bwrap_args(spec: &SandboxSpec, home: &str, referenced: &[String]) -> Vec<String> {
+    let mut a: Vec<String> = vec!["--die-with-parent".into(), "--new-session".into()];
+    let push = |a: &mut Vec<String>, parts: &[&str]| a.extend(parts.iter().map(|p| p.to_string()));
+    if spec.mode == SandboxMode::Strict {
+        push(&mut a, &["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"]);
+        let mut writable: Vec<String> = vec!["/tmp".into(), "/var/tmp".into(), "/dev/shm".into()];
+        for d in [".npm", ".cache", ".bun", ".pnpm-store", ".local/share/pnpm"] {
+            let p = format!("{}/{}", home, d);
+            let _ = std::fs::create_dir_all(&p);
+            writable.push(p);
+        }
+        for w in spec.allow_write.iter().map(|w| expand(w, home)) {
+            if w.starts_with('/') && !is_ancestor_of_secret(&w, home) {
+                writable.push(w);
+            }
+        }
+        for w in writable {
+            if Path::new(&w).exists() {
+                push(&mut a, &["--bind", &w, &w]);
+            }
+        }
+    } else {
+        push(&mut a, &["--dev-bind", "/", "/"]);
+    }
+    // Secrets : dossiers vides, fichiers remplacés par /dev/null.
+    let mut hidden: Vec<String> = SECRET_DIRS.iter().map(|d| format!("{}/{}", home, d)).collect();
+    hidden.extend(hub_dirs(home));
+    for d in hidden {
+        match std::fs::metadata(&d) {
+            Ok(m) if m.is_dir() => push(&mut a, &["--tmpfs", &d]),
+            Ok(_) => push(&mut a, &["--ro-bind", "/dev/null", &d]),
+            Err(_) => {}
+        }
+    }
+    for f in SECRET_FILES {
+        let p = format!("{}/{}", home, f);
+        if Path::new(&p).is_file() {
+            push(&mut a, &["--ro-bind", "/dev/null", &p]);
+        }
+    }
+    for f in WRITE_PROTECTED {
+        let p = format!("{}/{}", home, f);
+        if Path::new(&p).exists() {
+            push(&mut a, &["--ro-bind", &p, &p]);
+        }
+    }
+    // Exceptions en lecture seule : chemins précis à l'intérieur d'un secret, que le serveur
+    // référence lui-même (une clé .p8 passée en variable) ou autorisés par `allowRead`.
+    let reads: Vec<String> = referenced
+        .iter()
+        .cloned()
+        .chain(spec.allow_read.iter().map(|r| expand(r, home)))
+        .filter(|r| r.starts_with('/') && strictly_inside_secret(r, home) && Path::new(r).exists())
+        .collect();
+    for r in reads {
+        push(&mut a, &["--ro-bind", &r, &r]);
+    }
+    // Un dossier secret explicitement autorisé en écriture (ex. ~/.mcp-auth) reste réel.
+    for w in spec.allow_write.iter().map(|w| expand(w, home)) {
+        if SECRET_DIRS.iter().any(|d| w == format!("{}/{}", home, d)) && Path::new(&w).is_dir() {
+            push(&mut a, &["--bind", &w, &w]);
+        }
+    }
+    if !spec.network {
+        a.push("--unshare-net".into());
+    }
+    a
+}
+
+/// Commande enveloppée : `/usr/bin/sandbox-exec -p PROFIL commande args...` (macOS) ou
+/// `bwrap ... -- commande args...` (Linux). Sans l'un ni l'autre, la commande est lancée telle
+/// quelle avec un avertissement.
 pub fn wrap(
     server: &str,
     spec: Option<&SandboxSpec>,
@@ -338,14 +454,26 @@ pub fn wrap(
     let Some(spec) = spec else {
         return (command.to_string(), args.to_vec());
     };
+    let home = dirs::home_dir()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if cfg!(target_os = "linux") {
+        if let Some(bwrap) = bwrap_path() {
+            let referenced = referenced_paths(env, args, &home);
+            let mut new_args = bwrap_args(spec, &home, &referenced);
+            new_args.push("--".into());
+            new_args.push(command.to_string());
+            new_args.extend(args.iter().cloned());
+            return (bwrap, new_args);
+        }
+        eprintln!("[McpHub][SANDBOX] {} : bubblewrap (bwrap) indisponible ou refuse par le noyau, serveur lance sans isolation (apt install bubblewrap)", server);
+        return (command.to_string(), args.to_vec());
+    }
     let exe = "/usr/bin/sandbox-exec";
     if !cfg!(target_os = "macos") || !Path::new(exe).exists() {
         eprintln!("[McpHub][SANDBOX] {} : sandbox-exec indisponible, serveur lance sans isolation", server);
         return (command.to_string(), args.to_vec());
     }
-    let home = dirs::home_dir()
-        .map(|h| h.to_string_lossy().to_string())
-        .unwrap_or_default();
     let referenced = referenced_paths(env, args, &home);
     let mut new_args = vec!["-p".to_string(), profile(spec, &home, &referenced), command.to_string()];
     new_args.extend(args.iter().cloned());
@@ -405,6 +533,34 @@ mod tests {
         assert!(!p.contains("(subpath \"/Users/a\"))"), "~ ne doit pas etre rouvert");
         assert!(!p.contains("/usr/bin/open"));
         assert!(p.contains("(allow file-read* file-write* (subpath \"/Users/a/out\"))"));
+    }
+
+    #[test]
+    fn bubblewrap_bouclier_et_strict() {
+        let home = std::env::temp_dir().join(format!("mcphub-bw-{}", std::process::id()));
+        let h = home.to_string_lossy().to_string();
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::create_dir_all(home.join(".mcp-auth")).unwrap();
+        std::fs::write(home.join(".netrc"), "x").unwrap();
+        std::fs::write(home.join(".ssh/deploy.p8"), "k").unwrap();
+        let shield = SandboxSpec { mode: SandboxMode::Shield, network: false, allow_read: vec![], allow_write: vec!["~/.mcp-auth".into()], allow_exec: vec![] };
+        let key = format!("{}/.ssh/deploy.p8", h);
+        let a = bwrap_args(&shield, &h, &[key.clone()]).join(" ");
+        assert!(a.starts_with("--die-with-parent --new-session --dev-bind / /"), "{}", a);
+        assert!(a.contains(&format!("--tmpfs {}/.ssh", h)));
+        assert!(a.contains(&format!("--ro-bind /dev/null {}/.netrc", h)));
+        let tmpfs_at = a.find(&format!("--tmpfs {}/.ssh", h)).unwrap();
+        let key_at = a.find(&format!("--ro-bind {} {}", key, key)).unwrap();
+        assert!(key_at > tmpfs_at, "l'exception suit le masquage");
+        assert!(a.contains(&format!("--bind {0}/.mcp-auth {0}/.mcp-auth", h)));
+        assert!(a.ends_with("--unshare-net"));
+        let strict = SandboxSpec { mode: SandboxMode::Strict, network: true, allow_read: vec![], allow_write: vec!["~".into()], allow_exec: vec![] };
+        let b = bwrap_args(&strict, &h, &[]).join(" ");
+        assert!(b.contains("--ro-bind / / --dev /dev --proc /proc"));
+        assert!(b.contains("--bind /tmp /tmp"));
+        assert!(!b.contains(&format!("--bind {0} {0} ", h)), "~ ne doit jamais etre rouvert");
+        assert!(!b.contains("--unshare-net"));
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

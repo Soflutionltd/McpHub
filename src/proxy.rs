@@ -948,17 +948,19 @@ impl ProxyServer {
         server_names.sort();
         let profile = current_profile();
         server_names.retain(|s| crate::toolguard::server_visible(s, profile.as_deref()));
-        let server_enum: Vec<serde_json::Value> = server_names
+        let mut server_enum: Vec<serde_json::Value> = server_names
             .iter()
             .map(|s| serde_json::Value::String(s.clone()))
             .collect();
+        // Pseudo-serveur interne : bibliothèque du registre MCP officiel (aucun outil en plus).
+        server_enum.push(serde_json::Value::String("mcphub".into()));
 
         // Cursor V2 (MCP 2025-11-25) is strict: descriptions must be short, no `default` keyword,
         // use `integer` not `number` when applicable. The server list goes into `enum`, not the description.
         let mut tools = serde_json::json!([
             {
                 "name": "mcphub_search",
-                "description": "Search MCP tools across all connected servers using BM25. Call FIRST to find the right tool, then use `mcphub_call`. Compact by default (no schemas) — set expand=true to get inputSchemas.",
+                "description": "Search MCP tools across all connected servers using BM25. Call FIRST to find the right tool, then use `mcphub_call`. Compact by default (no schemas) — set expand=true to get inputSchemas. Nothing fits? mcphub_call server=mcphub tool=registry_search finds installable MCP servers.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1275,6 +1277,11 @@ impl ProxyServer {
                 },
                 "compact": !expand,
             });
+            if tools_json.is_empty() {
+                payload["hint"] = serde_json::json!(
+                    "No tool matches. To find an MCP server to install: mcphub_call server=mcphub tool=registry_search arguments={\"query\": \"...\"}"
+                );
+            }
             if !expand && !tools_json.is_empty() {
                 payload["hint"] = serde_json::json!(
                     "Compact mode (no schemas). Re-call with expand=true to see inputSchemas, or use mcphub_call directly which returns the schema on argument error."
@@ -1595,6 +1602,101 @@ impl ProxyServer {
         )
     }
 
+    /// Outils internes de McpHub (`mcphub_call` avec `server: "mcphub"`) : bibliothèque du
+    /// registre officiel. Une installation est appliquée tout de suite et ses outils indexés.
+    async fn handle_hub_tool(
+        &self,
+        id: Option<serde_json::Value>,
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let started = std::time::Instant::now();
+        let mut outcome = crate::registry::agent_call(tool, &arguments).await;
+        if let Ok(v) = &mut outcome {
+            if v.get("ok").and_then(|o| o.as_bool()) == Some(true) {
+                let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                self.reload_config_now().await;
+                let tools = self.wait_for_tools(&name, 45).await;
+                v["tools"] = serde_json::json!(tools);
+                v["next"] = serde_json::json!(if tools.is_empty() {
+                    format!("Installed. Its tools are still loading: mcphub_search with server={} in a few seconds.", name)
+                } else {
+                    format!("Ready: mcphub_call server={} tool=<one of tools>.", name)
+                });
+                if v.get("oauth").and_then(|o| o.as_bool()) == Some(true) && tools.is_empty() {
+                    v["next"] = serde_json::json!(format!(
+                        "Installed. This remote server signs in with OAuth: ask the user to run `McpHub oauth login {}` or click Sign in in the dashboard.",
+                        name
+                    ));
+                }
+            }
+        }
+        if tool.contains("install") {
+            self.record_audit(AuditEntry {
+                server: "mcphub".into(),
+                tool: format!("registry/{}", tool),
+                mode: "library",
+                decision: if outcome.is_ok() { "allow" } else { "deny" },
+                policy: "registry.agentInstall".into(),
+                status: if outcome.is_ok() { "ok" } else { "error" },
+                duration_ms: Some(started.elapsed().as_millis() as u64),
+                arguments: Some(crate::audit::safe_arguments(&arguments)),
+                error: outcome.as_ref().err().cloned(),
+            })
+            .await;
+        }
+        let (payload, is_error) = match outcome {
+            Ok(v) => (v, false),
+            Err(e) => (serde_json::json!({ "error": e }), true),
+        };
+        JsonRpcResponse::success(
+            id,
+            serde_json::json!({
+                "content": [{ "type": "text", "text": serde_json::to_string(&payload).unwrap_or_default() }],
+                "isError": is_error,
+            }),
+        )
+    }
+
+    /// Relit la config tout de suite (au lieu d'attendre le surveillant, absent en mode stdio).
+    pub async fn reload_config_now(&self) {
+        apply_config_change(
+            self.search_engine.clone(),
+            self.config.clone(),
+            self.child_manager.clone(),
+            self.catalog_refresh_in_progress.clone(),
+        )
+        .await;
+    }
+
+    /// Outils d'un serveur dès qu'ils sont indexés (attente bornée).
+    async fn wait_for_tools(&self, server: &str, max_secs: u64) -> Vec<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_secs);
+        loop {
+            {
+                let engine = self.search_engine.lock().await;
+                let names: Vec<String> = engine
+                    .get_catalog()
+                    .iter()
+                    .filter(|e| e.server == server)
+                    .map(|e| e.name.clone())
+                    .collect();
+                if !names.is_empty() {
+                    return names;
+                }
+            }
+            if let Some(cached) = crate::cache::load_cache() {
+                if cached.errors.contains_key(server) {
+                    return Vec::new();
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Vec::new();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
     async fn handle_crawl(
         &self,
         id: Option<serde_json::Value>,
@@ -1642,6 +1744,9 @@ impl ProxyServer {
             .get("arguments")
             .cloned()
             .unwrap_or(serde_json::json!({}));
+        if server.eq_ignore_ascii_case("mcphub") {
+            return self.handle_hub_tool(id, &tool, arguments).await;
+        }
         let bypass_cache = args
             .get("bypass_cache")
             .and_then(|v| v.as_bool())
@@ -2433,6 +2538,70 @@ async fn rebuild_catalog(
     );
 }
 
+/// Applique une config modifiée : serveurs, filtres, index, et rafraîchit le catalogue des
+/// serveurs nouveaux ou changés.
+async fn apply_config_change(
+    engine: Arc<Mutex<SearchEngine>>,
+    config_store: Arc<Mutex<ProxyConfig>>,
+    child_manager: Arc<ChildManager>,
+    catalog_refresh_in_progress: Arc<AtomicBool>,
+) {
+    let new_config = crate::config::auto_detect();
+    let new_servers = new_config.servers.clone();
+    let new_server_hashes = crate::cache::server_config_hashes(&new_servers);
+    let existing_cache = crate::cache::load_cache();
+    let mut refresh_server_names: Vec<String> =
+        new_servers.keys().cloned().collect();
+    refresh_server_names.sort();
+    let mut removed_server_names = Vec::new();
+
+    if let Some(cached) = existing_cache {
+        refresh_server_names.retain(|server_name| {
+            cached.server_hashes.get(server_name)
+                != new_server_hashes.get(server_name)
+                || cached.errors.contains_key(server_name)
+                || !cached.servers.contains_key(server_name)
+        });
+
+        removed_server_names = cached
+            .server_hashes
+            .keys()
+            .filter(|server_name| !new_servers.contains_key(*server_name))
+            .cloned()
+            .collect();
+    }
+
+    crate::toolguard::configure(new_config.guard.clone());
+    {
+        let mut cfg = config_store.lock().await;
+        *cfg = new_config;
+    }
+    // Filtres et descriptions peuvent avoir changé sans redémarrage de serveur.
+    if let Some(cached) = crate::cache::load_cache() {
+        let all_tools = indexed_tools_from_servers(&cached.servers);
+        engine.lock().await.build_index(all_tools);
+    }
+
+    child_manager.update_configs(new_servers).await;
+    eprintln!("[McpHub][INFO] Config hot-reloaded");
+
+    let delay_ms = {
+        let cfg = config_store.lock().await;
+        cfg.preload_delay_ms
+    };
+
+    spawn_catalog_refresh(
+        "config changed".to_string(),
+        child_manager.clone(),
+        engine.clone(),
+        refresh_server_names,
+        removed_server_names,
+        new_server_hashes,
+        delay_ms,
+        catalog_refresh_in_progress.clone(),
+    );
+}
+
 /// Watches schema-cache.json and config.json for changes and hot-reloads them.
 async fn config_and_cache_watcher(
     engine: Arc<Mutex<SearchEngine>>,
@@ -2503,60 +2672,13 @@ async fn config_and_cache_watcher(
                     if Some(current_modified) != last_config_modified {
                         last_config_modified = Some(current_modified);
 
-                        let new_config = crate::config::auto_detect();
-                        let new_servers = new_config.servers.clone();
-                        let new_server_hashes = crate::cache::server_config_hashes(&new_servers);
-                        let existing_cache = crate::cache::load_cache();
-                        let mut refresh_server_names: Vec<String> =
-                            new_servers.keys().cloned().collect();
-                        refresh_server_names.sort();
-                        let mut removed_server_names = Vec::new();
-
-                        if let Some(cached) = existing_cache {
-                            refresh_server_names.retain(|server_name| {
-                                cached.server_hashes.get(server_name)
-                                    != new_server_hashes.get(server_name)
-                                    || cached.errors.contains_key(server_name)
-                                    || !cached.servers.contains_key(server_name)
-                            });
-
-                            removed_server_names = cached
-                                .server_hashes
-                                .keys()
-                                .filter(|server_name| !new_servers.contains_key(*server_name))
-                                .cloned()
-                                .collect();
-                        }
-
-                        crate::toolguard::configure(new_config.guard.clone());
-                        {
-                            let mut cfg = config_store.lock().await;
-                            *cfg = new_config;
-                        }
-                        // Filtres et descriptions peuvent avoir changé sans redémarrage de serveur.
-                        if let Some(cached) = crate::cache::load_cache() {
-                            let all_tools = indexed_tools_from_servers(&cached.servers);
-                            engine.lock().await.build_index(all_tools);
-                        }
-
-                        child_manager.update_configs(new_servers).await;
-                        eprintln!("[McpHub][INFO] Config hot-reloaded");
-
-                        let delay_ms = {
-                            let cfg = config_store.lock().await;
-                            cfg.preload_delay_ms
-                        };
-
-                        spawn_catalog_refresh(
-                            "config changed".to_string(),
-                            child_manager.clone(),
+                        apply_config_change(
                             engine.clone(),
-                            refresh_server_names,
-                            removed_server_names,
-                            new_server_hashes,
-                            delay_ms,
+                            config_store.clone(),
+                            child_manager.clone(),
                             catalog_refresh_in_progress.clone(),
-                        );
+                        )
+                        .await;
                     }
                 }
             }

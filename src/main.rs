@@ -21,11 +21,13 @@ mod oauth;
 mod protocol;
 mod proxy;
 mod redaction;
+mod registry;
 mod remote;
 mod response_cache;
 mod sandbox;
 mod search;
 mod sse;
+mod sync;
 mod toolguard;
 mod untrusted;
 mod update;
@@ -66,6 +68,8 @@ USAGE:
   McpHub sandbox      Server isolation (macOS sandbox): list, or 'sandbox show SERVER'
   McpHub oauth        Remote servers: status, login SERVER, logout SERVER, migrate [--apply] (from mcp-remote)
   McpHub pins         Tool pinning (anti rug-pull): list, status, approve SERVER [TOOL], reset SERVER, scan
+  McpHub registry     Library of the official MCP Registry: search, info, install, uninstall
+  McpHub sync         Move the config to another machine with no plaintext secret (export, import)
   McpHub update       Self-update to the latest version on GitHub
   McpHub version      Show version
   McpHub help         Show this help
@@ -391,6 +395,8 @@ async fn main() {
         }
         Some("pins") => std::process::exit(toolguard::cmd_pins(&args[2..])),
         Some("oauth") => std::process::exit(oauth::run_cli(&args[2..]).await),
+        Some("sync") => std::process::exit(sync::run_cli(&args[2..])),
+        Some("registry") | Some("library") => std::process::exit(registry::run_cli(&args[2..]).await),
         _ => {
             // Default: stdio proxy + HTTP server with SSE
             eprintln!("McpHub v{} — starting...", VERSION);

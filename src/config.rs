@@ -79,41 +79,47 @@ impl Default for ProxyConfig {
     }
 }
 
+/// Chemin qui désigne McpHub lui-même (binaire, client Node...). Les serveurs installés par la
+/// bibliothèque vivent dans .../McpHub/servers/ : leur chemin contient « McpHub » sans l'être.
+fn names_mcphub(s: &str) -> bool {
+    let lower = s.to_lowercase();
+    let bundles = crate::registry::servers_dir().to_string_lossy().to_lowercase();
+    let lower = match lower.strip_prefix(&bundles) {
+        Some(rest) => rest.to_string(),
+        None => lower,
+    };
+    lower.contains("mcphub") || lower.contains("mcp-on-demand")
+}
+
 fn is_self(name: &str, config: &Value) -> bool {
     let lower = name.to_lowercase();
     if lower == "mcphub" || lower == "mcp-hub" || lower == "mcp-on-demand" {
         return true;
     }
     if let Some(cmd) = config.get("command").and_then(|v| v.as_str()) {
-        let cmd_lower = cmd.to_lowercase();
-        if cmd_lower.contains("mcphub") || cmd_lower.contains("mcp-on-demand") {
+        if names_mcphub(cmd) {
             return true;
         }
     }
     if let Some(args) = config.get("args").and_then(|v| v.as_array()) {
-        if args.iter().any(|a| {
-            a.as_str()
-                .map(|s| {
-                    let s_lower = s.to_lowercase();
-                    s_lower.contains("mcphub") || s_lower.contains("mcp-on-demand")
-                })
-                .unwrap_or(false)
-        }) {
+        if args.iter().any(|a| a.as_str().map(names_mcphub).unwrap_or(false)) {
             return true;
         }
     }
     false
 }
 
-static SECRETS_INIT: std::sync::Once = std::sync::Once::new();
+static SECRETS_FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-/// Charge les secrets dans l'environnement du process, une seule fois.
-/// Ordre de priorité : environnement réel > Trousseau macOS (vault) > ~/.mcphub/secrets.env.
-/// Les variables déjà présentes dans l'environnement ne sont pas écrasées.
+/// Charge dans l'environnement du process les secrets qui n'y sont pas encore : au démarrage, puis
+/// à chaque rechargement de la config (un secret ajouté depuis la bibliothèque ou `McpHub vault
+/// set` sert sans redémarrer). Ordre de priorité : environnement réel > Trousseau macOS (vault) >
+/// ~/.McpHub/secrets.env. Les variables déjà présentes ne sont jamais écrasées.
 fn load_secrets_env() {
-    SECRETS_INIT.call_once(|| {
+    let first = SECRETS_FIRST.swap(false, std::sync::atomic::Ordering::SeqCst);
+    {
         let (from_vault, missing) = crate::vault::load_into_env();
-        if from_vault > 0 || !missing.is_empty() {
+        if from_vault > 0 || (first && !missing.is_empty()) {
             eprintln!(
                 "[McpHub][INFO] Trousseau: {} secrets charges{}",
                 from_vault,
@@ -124,11 +130,11 @@ fn load_secrets_env() {
                 }
             );
         }
-        let home = match dirs::home_dir() {
-            Some(h) => h,
+        // Même fichier que le coffre hors macOS (~/.McpHub/secrets.env, ou le dossier de l'instance).
+        let path = match crate::vault::secrets_env_path() {
+            Some(p) => p,
             None => return,
         };
-        let path = home.join(".mcphub").join("secrets.env");
         let content = match fs::read_to_string(&path) {
             Ok(c) => c,
             Err(_) => return,
@@ -154,8 +160,10 @@ fn load_secrets_env() {
                 }
             }
         }
-        eprintln!("[McpHub][INFO] secrets.env charge ({} variables)", n);
-    });
+        if first || n > 0 {
+            eprintln!("[McpHub][INFO] secrets.env charge ({} variables)", n);
+        }
+    }
 }
 
 /// Remplace les motifs ${VAR} par la valeur de la variable d'environnement.
@@ -529,6 +537,11 @@ mod tests {
         assert!(is_self(
             "test",
             &json!({"command": "node", "args": ["mcphub"]})
+        ));
+        let bundle = crate::registry::servers_dir().join("depsonar/current/dist/index.js");
+        assert!(!is_self(
+            "depsonar",
+            &json!({"command": "node", "args": [bundle.to_string_lossy()]})
         ));
     }
 

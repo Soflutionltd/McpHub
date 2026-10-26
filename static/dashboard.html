@@ -112,12 +112,50 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
 .pill{font-size:10px;padding:1px 7px;border-radius:6px;font-weight:600;margin-left:6px}
 .pill-red{background:rgba(239,68,68,.1);color:var(--danger)}
 </style>
+<style>
+/* Library */
+.lib-head{display:flex;align-items:center;gap:10px;margin-bottom:6px}
+.lib-sync{font-size:11px;color:var(--text-dim);margin:0 0 14px 2px;min-height:14px}
+.lib-card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px;display:flex;flex-direction:column;gap:8px;cursor:pointer;transition:all .15s}
+.lib-card:hover{border-color:rgba(251,191,36,.25);transform:translateY(-1px)}
+.lib-top{display:flex;gap:10px;align-items:flex-start}
+.lib-icon{width:36px;height:36px;border-radius:9px;background:var(--accent-dim);display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0;overflow:hidden}
+.lib-icon img{width:100%;height:100%;object-fit:cover}
+.lib-title{font-weight:600;font-size:13px;line-height:1.3;word-break:break-word}
+.lib-name{font-size:10px;color:var(--text-dim);font-family:'SF Mono',Monaco,monospace;word-break:break-all}
+.lib-desc{font-size:12px;color:var(--text-dim);line-height:1.45;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;min-height:34px}
+.lib-foot{display:flex;align-items:center;gap:6px;margin-top:auto;flex-wrap:wrap}
+.trust{font-size:10px;font-weight:700;padding:2px 8px;border-radius:6px}
+.trust-high{background:rgba(34,197,94,.12);color:var(--ok)}
+.trust-medium{background:rgba(251,191,36,.12);color:var(--accent)}
+.trust-low{background:rgba(239,68,68,.12);color:var(--danger)}
+.kind{font-size:10px;padding:2px 7px;border-radius:6px;background:var(--surface);border:1px solid var(--border);color:var(--text-dim)}
+.lib-installed{font-size:10px;font-weight:700;color:var(--ok);margin-left:auto}
+.lib-more{display:flex;justify-content:center;margin:18px 0}
+.sig{display:flex;gap:10px;font-size:12px;padding:4px 0;border-bottom:1px solid var(--border)}
+.sig-pts{width:34px;text-align:right;font-weight:700;font-family:monospace}
+.sig-pos{color:var(--ok)}.sig-neg{color:var(--danger)}.sig-zero{color:var(--text-dim)}
+.lib-section{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-dim);margin:16px 0 8px}
+.lib-warn{font-size:12px;color:var(--danger);padding:3px 0}
+.lib-cap{font-size:12px;color:var(--text-dim);padding:3px 0}
+.lib-opt{display:flex;gap:8px;align-items:flex-start;padding:8px 10px;border:1px solid var(--border);border-radius:10px;margin-bottom:6px;font-size:12px;cursor:pointer}
+.lib-opt.disabled{opacity:.45;cursor:default}
+.lib-opt input{margin-top:2px}
+.lib-field{margin-bottom:10px}
+.lib-field label{display:block;font-size:12px;font-weight:600;margin-bottom:4px}
+.lib-field .hint{font-size:11px;color:var(--text-dim);margin-bottom:4px}
+.lib-field input{width:100%;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:8px 10px;color:var(--text);font-size:13px;outline:none}
+.lib-field input:focus{border-color:var(--accent)}
+.lib-field.missing input{border-color:var(--danger)}
+.lib-links a{color:var(--blue);font-size:12px;margin-right:12px;text-decoration:none}
+</style>
 </head><body>
 <div class="container" id="main-content">
   <header>
     <div class="logo"><svg width="28" height="28" viewBox="0 0 28 28" fill="none" style="vertical-align:middle;margin-right:8px"><circle cx="14" cy="14" r="4.5" fill="#fbbf24"/><circle cx="5" cy="5" r="2" fill="#fbbf24" opacity=".5"/><circle cx="23" cy="5" r="2" fill="#fbbf24" opacity=".5"/><circle cx="5" cy="23" r="2" fill="#fbbf24" opacity=".5"/><circle cx="23" cy="23" r="2" fill="#fbbf24" opacity=".5"/><circle cx="14" cy="2.5" r="1.5" fill="#fbbf24" opacity=".4"/><circle cx="25.5" cy="14" r="1.5" fill="#fbbf24" opacity=".4"/><circle cx="2.5" cy="14" r="1.5" fill="#fbbf24" opacity=".4"/><line x1="5" y1="5" x2="11" y2="11.5" stroke="#fbbf24" stroke-width=".8" opacity=".3"/><line x1="23" y1="5" x2="17" y2="11.5" stroke="#fbbf24" stroke-width=".8" opacity=".3"/><line x1="5" y1="23" x2="11" y2="16.5" stroke="#fbbf24" stroke-width=".8" opacity=".3"/><line x1="23" y1="23" x2="17" y2="16.5" stroke="#fbbf24" stroke-width=".8" opacity=".3"/><line x1="14" y1="2.5" x2="14" y2="9.5" stroke="#fbbf24" stroke-width=".8" opacity=".3"/><line x1="25.5" y1="14" x2="18.5" y2="14" stroke="#fbbf24" stroke-width=".8" opacity=".3"/><line x1="2.5" y1="14" x2="9.5" y2="14" stroke="#fbbf24" stroke-width=".8" opacity=".3"/></svg>Mcp<span>Hub</span></div>
     <div class="tabs">
       <div class="tab active" data-view="servers" onclick="switchView('servers')">Servers</div>
+      <div class="tab" data-view="library" onclick="switchView('library')">Library</div>
       <div class="tab" data-view="tools" onclick="switchView('tools')">Tools</div>
       <div class="tab" data-view="metrics" onclick="switchView('metrics')">Metrics</div>
       <div class="tab" data-view="logs" onclick="switchView('logs')">Logs</div>
@@ -141,6 +179,17 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
     </div>
     <div class="grid" id="server-grid"></div>
     <div class="gen-log hidden" id="gen-log"></div>
+  </div>
+
+  <!-- Library View -->
+  <div id="view-library" class="hidden">
+    <div class="lib-head">
+      <div class="search" style="flex:1"><input id="lib-search" placeholder="Search the official MCP Registry (GitHub, Postgres, Notion, Stripe...)" oninput="libSearchSoon()"></div>
+      <button class="btn btn-ghost" onclick="libSync()" title="Refresh the local copy of the catalog">↻ Update catalog</button>
+    </div>
+    <div class="lib-sync" id="lib-sync"></div>
+    <div class="grid" id="lib-grid"></div>
+    <div class="lib-more hidden" id="lib-more"><button class="btn btn-ghost" onclick="libLoadMore()">Load more</button></div>
   </div>
 
   <!-- Tools View -->
@@ -235,6 +284,17 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
     </div>
   </div>
 
+  <!-- Library detail modal -->
+  <div class="overlay hidden" id="lib-modal" onclick="libClose()">
+    <div class="modal" onclick="event.stopPropagation()" style="width:600px">
+      <div class="modal-head"><h2 class="modal-title" id="lib-m-title">Server</h2><button class="modal-close" onclick="libClose()">✕</button></div>
+      <div id="lib-m-body"></div>
+      <div class="json-error hidden" id="lib-m-error"></div>
+      <div id="lib-m-result"></div>
+      <div class="modal-actions"><button class="btn btn-ghost" onclick="libClose()">Close</button><button class="btn btn-primary" id="lib-m-add" onclick="libInstall()">Add to McpHub</button></div>
+    </div>
+  </div>
+
   <div class="toast hidden" id="toast"></div>
 
   <!-- Welcome popup (first visit) -->
@@ -316,11 +376,13 @@ function switchView(view){
   document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.view===view));
   document.getElementById('view-servers').classList.toggle('hidden',view!=='servers');
   document.getElementById('view-tools').classList.toggle('hidden',view!=='tools');
+  document.getElementById('view-library').classList.toggle('hidden',view!=='library');
   document.getElementById('view-metrics').classList.toggle('hidden',view!=='metrics');
   document.getElementById('view-logs').classList.toggle('hidden',view!=='logs');
   document.getElementById('view-settings').classList.toggle('hidden',view!=='settings');
   if(view==='tools')renderTools();
   if(view==='metrics')fetchMetrics();
+  if(view==='library'&&!libLoaded)libSearch();
 }
 async function fetchServers(){
   try{
@@ -650,6 +712,127 @@ function toggleLogs(){
   }
 }
 function clearLogs(){document.getElementById('live-logs').innerHTML=''}
+
+// ─── Library (official MCP Registry) ───
+// Everything shown here comes from third parties: always escaped.
+function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+let libReq=0,libLoaded=false,libItems=[],libCursor=null,libTimer=null,libSyncTimer=null,libCurrent=null,libMissing=[];
+const KIND_LABEL={remote:'Remote',npm:'npm',pypi:'Python',oci:'Docker',mcpb:'Bundle',nuget:'.NET'};
+function libSearchSoon(){clearTimeout(libTimer);libTimer=setTimeout(()=>libSearch(),250)}
+function trustBadge(t){if(!t)return'';const lvl=t.level||'low';return `<span class="trust trust-${esc(lvl)}" title="Trust score${t.complete?'':' (partial: repository not checked yet)'}">${esc(t.score)}${t.complete?'':'*'}</span>`}
+function libIcon(x){return x.icon&&/^https:\/\//.test(x.icon)?`<img src="${esc(x.icon)}" alt="" referrerpolicy="no-referrer" onerror="this.remove()">`:'🔌'}
+function libSyncText(sync,source){
+  const el=document.getElementById('lib-sync');if(!el)return;
+  if(!sync){el.textContent='';return}
+  if(sync.running)el.textContent=`Downloading the registry catalog once for instant search: ${sync.downloaded||0} servers so far${source==='live'?' (meanwhile, searches go to the registry directly and can be slow)':''}...`;
+  else if(sync.complete)el.textContent=`${sync.count} servers in the local catalog${sync.syncedAt?', updated '+new Date(sync.syncedAt).toLocaleString():''}. Search runs locally; McpHub adds no tool to your agent's context.`;
+  else if(sync.error)el.textContent='Catalog download paused: '+sync.error+'. It resumes automatically.';
+  clearTimeout(libSyncTimer);
+  if(sync.running)libSyncTimer=setTimeout(async()=>{try{const r=await fetch('/api/registry/status');const s=await r.json();libSyncText(s,source);if(!s.running&&s.complete)libSearch()}catch(e){}},4000);
+}
+async function libSearch(more){
+  const q=document.getElementById('lib-search').value.trim();
+  const grid=document.getElementById('lib-grid');
+  if(!more){libItems=[];libCursor=null;grid.innerHTML='<div style="color:var(--text-dim);font-size:12px"><span class="spinner" style="border-color:rgba(255,255,255,.15);border-top-color:var(--accent)"></span>Searching...</div>'}
+  const my=++libReq;
+  try{
+    const url='/api/registry/search?limit=30&q='+encodeURIComponent(q)+(more&&libCursor?'&cursor='+encodeURIComponent(libCursor):'');
+    const res=await fetch(url);const data=await res.json();
+    if(my!==libReq)return; // a newer search is on its way
+    if(!res.ok)throw new Error(data.error||'Registry unavailable');
+    libLoaded=true;libItems=libItems.concat(data.servers||[]);libCursor=data.nextCursor||null;
+    libRender();libSyncText(data.sync,data.source);
+  }catch(e){if(my!==libReq)return;grid.innerHTML=`<div class="info-box info-fail"><div class="info-title">Registry unavailable</div><div class="info-desc">${esc(e.message)}</div></div>`}
+}
+function libLoadMore(){libSearch(true)}
+function libRender(){
+  const grid=document.getElementById('lib-grid');
+  if(!libItems.length){grid.innerHTML='<div style="color:var(--text-dim);font-size:12px">No server found.</div>'}
+  else grid.innerHTML=libItems.map((x,i)=>`
+    <div class="lib-card" onclick="libOpen(${i})">
+      <div class="lib-top"><div class="lib-icon">${libIcon(x)}</div><div style="min-width:0"><div class="lib-title">${esc(x.title)}</div><div class="lib-name">${esc(x.name)}</div></div></div>
+      <div class="lib-desc">${esc(x.description)}</div>
+      <div class="lib-foot">${trustBadge(x.trust)}${(x.kinds||[]).map(k=>`<span class="kind">${esc(KIND_LABEL[k]||k)}</span>`).join('')}${x.installed?`<span class="lib-installed">✓ ${esc(x.installed)}</span>`:''}</div>
+    </div>`).join('');
+  document.getElementById('lib-more').classList.toggle('hidden',!libCursor);
+}
+async function libSync(){try{const r=await fetch('/api/registry/sync',{method:'POST'});libSyncText(await r.json(),'local');notify('Catalog update started')}catch(e){notify(e.message,'danger')}}
+function libClose(){document.getElementById('lib-modal').classList.add('hidden');libCurrent=null}
+async function libOpen(i){
+  const x=libItems[i];if(!x)return;
+  document.getElementById('lib-m-title').innerHTML=esc(x.title);
+  document.getElementById('lib-m-body').innerHTML='<div style="color:var(--text-dim);font-size:12px">Checking publisher, repository and permissions...</div>';
+  document.getElementById('lib-m-result').innerHTML='';
+  document.getElementById('lib-m-error').classList.add('hidden');
+  document.getElementById('lib-m-add').classList.remove('hidden');
+  document.getElementById('lib-m-add').disabled=true;libCurrent=null;
+  document.getElementById('lib-modal').classList.remove('hidden');
+  libMissing=[];
+  try{
+    const r=await fetch('/api/registry/server?name='+encodeURIComponent(x.name));const d=await r.json();
+    if(!r.ok)throw new Error(d.error||'Registry unavailable');
+    libCurrent=d;libRenderDetail();
+  }catch(e){document.getElementById('lib-m-body').innerHTML=`<div class="info-box info-fail"><div class="info-desc">${esc(e.message)}</div></div>`;document.getElementById('lib-m-add').classList.add('hidden')}
+}
+function libRenderDetail(){
+  const d=libCurrent;const t=d.trust||{};
+  const links=[d.repository?`<a href="${esc(d.repository)}" target="_blank" rel="noopener noreferrer">Source code</a>`:'',d.website&&d.website!==d.repository?`<a href="${esc(d.website)}" target="_blank" rel="noopener noreferrer">Website</a>`:''].join('');
+  const repo=d.repo?`<div class="lib-cap">${esc(d.repo.stars)} stars${d.repo.license?' · '+esc(d.repo.license):''}${d.repo.archived?' · archived':''}</div>`:'';
+  const sigs=(t.signals||[]).map(s=>`<div class="sig"><span class="sig-pts ${s.points>0?'sig-pos':s.points<0?'sig-neg':'sig-zero'}">${s.points>0?'+':''}${esc(s.points)}</span><span>${esc(s.label)}</span></div>`).join('');
+  const warns=(t.warnings||[]).map(w=>`<div class="lib-warn">⚠ ${esc(w)}</div>`).join('');
+  const caps=(t.capabilities||[]).map(c=>`<div class="lib-cap">• ${esc(c)}</div>`).join('');
+  const opts=(d.options||[]);
+  const firstOk=opts.find(o=>o.available);
+  const optHtml=opts.map(o=>`<label class="lib-opt${o.available?'':' disabled'}"><input type="radio" name="lib-opt" value="${esc(o.id)}" ${o.available?'':'disabled'} ${firstOk&&o.id===firstOk.id?'checked':''} onchange="libRenderInputs()"><span><b>${esc(o.label)}</b>${o.reason?`<br><span style="color:var(--text-dim)">${esc(o.reason)}</span>`:''}</span></label>`).join('');
+  document.getElementById('lib-m-body').innerHTML=`
+    <div class="lib-name" style="margin-bottom:6px">${esc(d.name)} · v${esc(d.version)}</div>
+    <div style="font-size:13px;line-height:1.5;margin-bottom:8px">${esc(d.description)}</div>
+    <div class="lib-links">${links}</div>${repo}
+    <div class="lib-section">Trust ${trustBadge(t)} <span style="text-transform:none;letter-spacing:0">${t.level==='high'?'High':t.level==='medium'?'Medium':'Low'}</span></div>
+    ${sigs}${warns}
+    ${caps?`<div class="lib-section">Permission scan</div>${caps}<div class="lib-cap" style="margin-top:4px">After install, every tool description is scanned and pinned (changes are quarantined).</div>`:''}
+    <div class="lib-section">Install</div>
+    ${optHtml||'<div class="lib-cap">Nothing installable on this machine.</div>'}
+    <div id="lib-inputs"></div>
+    <div class="lib-field" style="margin-top:14px"><label>Name in McpHub</label><input id="lib-local" placeholder="${esc(d.installed||'')}" value="${esc(d.installed||'')}"></div>`;
+  document.getElementById('lib-m-add').textContent=d.installed?'Update in McpHub':'Add to McpHub';
+  document.getElementById('lib-m-add').disabled=!firstOk;
+  libRenderInputs();
+}
+function libSelectedOption(){const el=document.querySelector('input[name="lib-opt"]:checked');return el?el.value:null}
+function libRenderInputs(){
+  const d=libCurrent;if(!d)return;
+  const o=(d.options||[]).find(x=>x.id===libSelectedOption());
+  const box=document.getElementById('lib-inputs');if(!box)return;
+  const inputs=(o&&o.inputs)||[];
+  if(o&&o.kind==='mcpb'&&!inputs.length){box.innerHTML='<div class="lib-cap">The bundle is downloaded and its SHA-256 checked; settings it needs are asked next.</div>';return}
+  box.innerHTML=inputs.map(i=>`<div class="lib-field${libMissing.includes(i.key)?' missing':''}"><label>${esc(i.label)}${i.required?' *':''}${i.secret?' 🔒':''}</label>${i.description?`<div class="hint">${esc(i.description)}</div>`:''}${i.secret?`<div class="hint">${i.existing?'Already in the vault: leave empty to reuse it.':'Stored in the Keychain (secrets.env, mode 600, on Linux), never in config.json.'}</div>`:''}<input data-key="${esc(i.key)}" type="${i.secret?'password':'text'}" autocomplete="off" placeholder="${esc(i.default||'')}"></div>`).join('');
+}
+async function libInstall(){
+  const d=libCurrent;if(!d)return;
+  const btn=document.getElementById('lib-m-add');const err=document.getElementById('lib-m-error');err.classList.add('hidden');
+  const values={};document.querySelectorAll('#lib-inputs input[data-key]').forEach(el=>{if(el.value)values[el.dataset.key]=el.value});
+  const body={name:d.name,option:libSelectedOption(),values,localName:document.getElementById('lib-local').value.trim()||null};
+  btn.disabled=true;btn.innerHTML='<span class="spinner"></span>Installing...';
+  try{
+    const r=await fetch('/api/registry/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const res=await r.json();
+    if(!r.ok)throw new Error(res.error||'Install failed');
+    if(!res.ok){
+      // Values asked once the option is known (bundle settings, required secrets).
+      const o=(d.options||[]).find(x=>x.id===res.option);if(o&&res.inputs)o.inputs=res.inputs;
+      libMissing=(res.needs||[]).map(n=>n.key);libRenderInputs();
+      document.querySelectorAll('#lib-inputs input[data-key]').forEach(el=>{if(values[el.dataset.key])el.value=values[el.dataset.key]});
+      err.textContent=res.message||'Some values are required';err.classList.remove('hidden');return;
+    }
+    const oauth=res.oauth?`<button class="btn btn-primary" style="margin-top:10px;font-size:11px" onclick="libOauth('${esc(res.name)}')">Sign in (OAuth)</button>`:'';
+    document.getElementById('lib-m-result').innerHTML=`<div class="info-box info-ok"><div class="info-title">✓ Added as ${esc(res.name)}</div><div class="info-desc">${res.kind==='remote'?'Remote server, no local code.':res.sandbox==='shield'?'Runs in the McpHub sandbox (shield): no access to your keys, browsers or editor configs.':res.kind==='oci'?'Runs in its Docker container.':'Runs with your global sandbox settings.'} Tools are pinned on first contact, every call is audited.${(res.secretsStored||[]).length?' Secrets stored: '+res.secretsStored.map(esc).join(', ')+'.':''}</div>${oauth}</div>`;
+    btn.classList.add('hidden');notify(res.name+' added');libMissing=[];
+    d.installed=res.name;const it=libItems.find(x=>x.name===d.name);if(it)it.installed=res.name;libRender();
+    setTimeout(fetchServers,1500);
+  }catch(e){err.textContent=e.message;err.classList.remove('hidden')}
+  finally{btn.disabled=false;if(!btn.classList.contains('hidden'))btn.textContent=d.installed?'Update in McpHub':'Add to McpHub'}
+}
+async function libOauth(server){try{await fetch('/api/oauth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({server})});notify('Sign-in page opened in your browser')}catch(e){notify(e.message,'danger')}}
 
 fetchServers();
 checkWelcome();
