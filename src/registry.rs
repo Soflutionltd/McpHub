@@ -567,9 +567,9 @@ fn local_search(text: &str, query: &str, offset: usize, limit: usize) -> (Vec<Va
         }
         let score = if words.is_empty() { Some(0) } else { relevance(&x.server, &words) };
         if let Some(sc) = score {
-            // Popularité : jusqu'à +10 (10 étoiles +2, 1000 étoiles +6, 100 000 +10).
-            let boost = ((x.server.meta.publisher.github.stars as f64 + 1.0).log10() * 2.0) as u32;
-            hits.push((sc * 4 + boost, x.meta.official.updated_at, i));
+            // Popularité : 100 étoiles +24, 1000 +36, 100 000 +60 (un serveur reconnu passe devant les homonymes).
+            let boost = ((x.server.meta.publisher.github.stars as f64 + 1.0).log10() * 12.0) as u32;
+            hits.push((sc * 2 + boost, x.meta.official.updated_at, i));
         }
     }
     // Les plus pertinents, puis les plus récents.
