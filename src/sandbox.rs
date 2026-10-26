@@ -119,7 +119,7 @@ const BLOCKED_EXEC: &[(&str, &str)] = &[
 
 /// Serveurs conçus pour tout faire sur la machine (shell, fichiers) : pas de bac à sable par
 /// défaut, sauf réglage explicite sur le serveur.
-const UNSANDBOXED_BY_DEFAULT: &[&str] = &["desktop-commander"];
+const UNSANDBOXED_BY_DEFAULT: &[&str] = &["desktop-commander", "kilnshell"];
 
 fn str_list(v: Option<&Value>) -> Vec<String> {
     v.and_then(|x| x.as_array())
