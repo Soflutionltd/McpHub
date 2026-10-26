@@ -62,6 +62,13 @@ pub fn run() {
     for (name, srv) in &config.servers {
         print!("  {} ... ", name);
 
+        if let Some(url) = &srv.url {
+            // Only the host: the rest of a URL can carry a token.
+            let host = url.split("://").nth(1).unwrap_or(url).split(['/', '?']).next().unwrap_or("");
+            println!("✓ Remote server ({})", host);
+            continue;
+        }
+
         // Check command exists
         let output = Command::new("which").arg(&srv.command).output();
         let cmd_exists = output.map(|o| o.status.success()).unwrap_or(false);
