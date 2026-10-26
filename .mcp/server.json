@@ -1,6 +1,6 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.Soflutionltd/mcphub",
+  "name": "com.soflution/mcphub",
   "title": "McpHub",
   "description": "One MCP endpoint for all your servers: a few meta-tools, Keychain secrets, sandbox, audit, OAuth.",
   "version": "0.0.0",
