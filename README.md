@@ -319,6 +319,8 @@ Descriptions and schemas are scanned for invisible Unicode and classic injection
 "settings": { "toolSecurity": { "pinning": "block", "scan": "block", "newTools": "block" } }
 ```
 
+With `"pinning": "off"` (or `"warn"`), changed definitions are accepted automatically but scanned again: a new description that trips the scan is still blocked when `scan` is `block`.
+
 </details>
 
 <details>
