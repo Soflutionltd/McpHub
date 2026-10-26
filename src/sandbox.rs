@@ -354,6 +354,22 @@ fn bwrap_path() -> Option<String> {
         .clone()
 }
 
+fn empty_file() -> String {
+    let p = std::env::temp_dir().join(format!("mcphub-empty-{}", std::process::id()));
+    let ok = std::fs::metadata(&p).map(|m| m.is_file() && m.len() == 0).unwrap_or(false)
+        || std::fs::write(&p, b"").is_ok();
+    #[cfg(unix)]
+    if ok {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o444));
+    }
+    if ok {
+        p.to_string_lossy().to_string()
+    } else {
+        "/dev/null".into()
+    }
+}
+
 /// Dossiers de McpHub à cacher : ~/.McpHub, toutes les instances ~/.McpHub-*, l'instance courante.
 fn hub_dirs(home: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -399,17 +415,20 @@ pub fn bwrap_args(spec: &SandboxSpec, home: &str, referenced: &[String]) -> Vec<
     // Secrets : dossiers vides, fichiers remplacés par /dev/null.
     let mut hidden: Vec<String> = SECRET_DIRS.iter().map(|d| format!("{}/{}", home, d)).collect();
     hidden.extend(hub_dirs(home));
+    // Fichier vide en lecture seule plutôt que /dev/null (inutilisable sur un montage nodev) :
+    // un shell lit un ~/.bashrc vide au lieu d'afficher « Permission denied ».
+    let empty = empty_file();
     for d in hidden {
         match std::fs::metadata(&d) {
             Ok(m) if m.is_dir() => push(&mut a, &["--tmpfs", &d]),
-            Ok(_) => push(&mut a, &["--ro-bind", "/dev/null", &d]),
+            Ok(_) => push(&mut a, &["--ro-bind", &empty, &d]),
             Err(_) => {}
         }
     }
     for f in SECRET_FILES {
         let p = format!("{}/{}", home, f);
         if Path::new(&p).is_file() {
-            push(&mut a, &["--ro-bind", "/dev/null", &p]);
+            push(&mut a, &["--ro-bind", &empty, &p]);
         }
     }
     for f in WRITE_PROTECTED {
@@ -548,7 +567,7 @@ mod tests {
         let a = bwrap_args(&shield, &h, &[key.clone()]).join(" ");
         assert!(a.starts_with("--die-with-parent --new-session --dev-bind / /"), "{}", a);
         assert!(a.contains(&format!("--tmpfs {}/.ssh", h)));
-        assert!(a.contains(&format!("--ro-bind /dev/null {}/.netrc", h)));
+        assert!(a.contains(&format!("{}/.netrc", h)) && a.contains("mcphub-empty-"));
         let tmpfs_at = a.find(&format!("--tmpfs {}/.ssh", h)).unwrap();
         let key_at = a.find(&format!("--ro-bind {} {}", key, key)).unwrap();
         assert!(key_at > tmpfs_at, "l'exception suit le masquage");

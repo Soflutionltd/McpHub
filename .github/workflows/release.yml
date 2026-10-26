@@ -57,6 +57,7 @@ jobs:
           cd target/${{ matrix.target }}/release
           tar czf ../../../${{ matrix.asset }} McpHub
           cd ../../..
+          shasum -a 256 ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -69,7 +70,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
-          path: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}*
 
   release:
     needs: build
@@ -88,6 +89,7 @@ jobs:
         with:
           generate_release_notes: true
           files: |
+            artifacts/*/*.sha256
             artifacts/McpHub-macos-arm.tar.gz/McpHub-macos-arm.tar.gz
             artifacts/McpHub-macos-intel.tar.gz/McpHub-macos-intel.tar.gz
             artifacts/McpHub-linux-amd64.tar.gz/McpHub-linux-amd64.tar.gz

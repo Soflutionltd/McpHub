@@ -475,12 +475,11 @@ fn atty_stdin() -> bool {
 
 pub fn run_cli(args: &[String]) {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("status");
-    if !is_available() && sub != "help" {
-        eprintln!("Le coffre utilise le Trousseau macOS : indisponible sur ce systeme.");
-        eprintln!(
-            "McpHub continue d'utiliser {}.",
-            crate::instance::hub_dir().join("secrets.env").display()
-        );
+    if !is_available() && matches!(sub, "status" | "migrate") {
+        // Hors macOS : le coffre est secrets.env (mode 600, caché aux serveurs isolés).
+        let p = crate::instance::hub_dir().join("secrets.env");
+        println!("Trousseau macOS indisponible : coffre = {} (mode 600)", p.display());
+        println!("Secrets dans le coffre : {}", list_names().len());
         return;
     }
     match sub {
