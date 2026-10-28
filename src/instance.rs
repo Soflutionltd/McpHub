@@ -11,6 +11,7 @@ use std::sync::OnceLock;
 
 pub const DEFAULT_PORT: u16 = 24680;
 const DEFAULT_SERVICE: &str = "McpHub";
+#[cfg(any(target_os = "macos", test))]
 const DEFAULT_LABEL: &str = "com.soflution.mcphub";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +23,7 @@ pub struct Instance {
 }
 
 impl Instance {
+    #[cfg(any(target_os = "macos", test))]
     pub fn launchd_label(&self) -> String {
         match &self.name {
             Some(name) => format!("{}.{}", DEFAULT_LABEL, name),

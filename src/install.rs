@@ -4,6 +4,7 @@
 use std::fs;
 use std::path::PathBuf;
 
+#[cfg(target_os = "macos")]
 fn xml_escape(value: &str) -> String {
     value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
