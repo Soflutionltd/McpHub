@@ -215,6 +215,17 @@ impl PermissionsConfig {
         Ok(cfg)
     }
 
+    /// Première règle explicite qui correspond, sans repli sur `autoClassify` ni `default`.
+    pub fn rule_for(&self, server: &str, tool: &str) -> Option<Decision> {
+        self.rules.iter().enumerate().find_map(|(i, rule)| {
+            (glob_match(&rule.server, server) && glob_match(&rule.tool, tool)).then(|| Decision {
+                action: rule.action,
+                source: format!("rule#{}", i + 1),
+                reason: rule.reason.clone(),
+            })
+        })
+    }
+
     pub fn decide(&self, server: &str, tool: &str) -> Decision {
         self.decide_with(server, tool, false)
     }
@@ -223,14 +234,8 @@ impl PermissionsConfig {
     /// le serveur. Une annotation ne peut que durcir la décision (jamais l'assouplir) :
     /// `readOnlyHint` est déclaratif et ne doit pas permettre de contourner une règle.
     pub fn decide_with(&self, server: &str, tool: &str, declared_destructive: bool) -> Decision {
-        for (i, rule) in self.rules.iter().enumerate() {
-            if glob_match(&rule.server, server) && glob_match(&rule.tool, tool) {
-                return Decision {
-                    action: rule.action,
-                    source: format!("rule#{}", i + 1),
-                    reason: rule.reason.clone(),
-                };
-            }
+        if let Some(decision) = self.rule_for(server, tool) {
+            return decision;
         }
         if self.auto_classify && is_destructive(tool) && self.default != Action::Deny {
             return Decision {

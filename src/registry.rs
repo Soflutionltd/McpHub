@@ -1854,8 +1854,11 @@ pub fn uninstall(local: &str) -> Result<bool, String> {
 // ─── Réglages ────────────────────────────────────────────────
 
 /// settings.registry.agentInstall : "trusted" (défaut, score >= minTrust), "any" ou "off".
+/// Config illisible : "off" (on ne sait pas ce que l'utilisateur a choisi).
 fn agent_policy() -> (String, i64) {
-    let config = read_hub_config().unwrap_or_else(|_| json!({}));
+    let Ok(config) = read_hub_config() else {
+        return ("off".into(), 100);
+    };
     let r = config.pointer("/settings/registry");
     let mode = r
         .and_then(|r| r.get("agentInstall"))
@@ -1867,6 +1870,11 @@ fn agent_policy() -> (String, i64) {
 }
 
 // ─── Appels de l'agent (mcphub_call, server = "mcphub") ──────
+
+/// Outils internes qui installent et lancent un programme : soumis aux permissions.
+pub fn is_install_tool(tool: &str) -> bool {
+    matches!(tool, "registry_install" | "install")
+}
 
 /// Outils internes accessibles par `mcphub_call` avec `server: "mcphub"`, sans aucune
 /// définition d'outil supplémentaire dans le contexte de l'agent.

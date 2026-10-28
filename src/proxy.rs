@@ -295,6 +295,47 @@ impl ProxyServer {
                 }),
             ));
         }
+        let declared_destructive = tool_def
+            .as_ref()
+            .map(|t| t.declared_destructive())
+            .unwrap_or(false);
+        let decision = permissions.decide_with(server, tool, declared_destructive);
+        self.permission_gate(id, mode, server, tool, arguments, confirmation_token, &permissions, decision)
+            .await
+    }
+
+    /// Outils internes qui installent et lancent un programme (`server: "mcphub"`) : une règle
+    /// explicite l'emporte, sinon confirmation humaine, quel que soit `default`.
+    async fn hub_tool_gate(
+        &self,
+        id: &Option<serde_json::Value>,
+        tool: &str,
+        arguments: &serde_json::Value,
+        confirmation_token: Option<&str>,
+    ) -> PolicyGate {
+        let permissions = self.config.lock().await.permissions.clone();
+        let decision = permissions
+            .rule_for("mcphub", tool)
+            .unwrap_or_else(|| crate::permissions::Decision {
+                action: Action::Confirm,
+                source: "mcphub:install".into(),
+                reason: Some("installe et lance un nouveau serveur MCP sur cette machine".into()),
+            });
+        self.permission_gate(id, "library", "mcphub", tool, arguments, confirmation_token, &permissions, decision)
+            .await
+    }
+
+    async fn permission_gate(
+        &self,
+        id: &Option<serde_json::Value>,
+        mode: &'static str,
+        server: &str,
+        tool: &str,
+        arguments: &serde_json::Value,
+        confirmation_token: Option<&str>,
+        permissions: &crate::permissions::PermissionsConfig,
+        decision: crate::permissions::Decision,
+    ) -> PolicyGate {
         if DIALOG_OPEN.load(std::sync::atomic::Ordering::SeqCst) && controls_computer(server) {
             return PolicyGate::Respond(JsonRpcResponse::error(
                 id.clone(),
@@ -305,11 +346,6 @@ impl ProxyServer {
                 ),
             ));
         }
-        let declared_destructive = tool_def
-            .as_ref()
-            .map(|t| t.declared_destructive())
-            .unwrap_or(false);
-        let decision = permissions.decide_with(server, tool, declared_destructive);
         let base_entry = || AuditEntry {
             server: server.to_string(),
             tool: tool.to_string(),
@@ -1613,7 +1649,15 @@ impl ProxyServer {
         id: Option<serde_json::Value>,
         tool: &str,
         arguments: serde_json::Value,
+        confirmation_token: Option<&str>,
     ) -> JsonRpcResponse {
+        if crate::registry::is_install_tool(tool) {
+            if let PolicyGate::Respond(response) =
+                self.hub_tool_gate(&id, tool, &arguments, confirmation_token).await
+            {
+                return response;
+            }
+        }
         let started = std::time::Instant::now();
         let mut outcome = crate::registry::agent_call(tool, &arguments).await;
         if let Ok(v) = &mut outcome {
@@ -1635,7 +1679,7 @@ impl ProxyServer {
                 }
             }
         }
-        if tool.contains("install") {
+        if crate::registry::is_install_tool(tool) {
             self.record_audit(AuditEntry {
                 server: "mcphub".into(),
                 tool: format!("registry/{}", tool),
@@ -1749,7 +1793,8 @@ impl ProxyServer {
             .cloned()
             .unwrap_or(serde_json::json!({}));
         if server.eq_ignore_ascii_case("mcphub") {
-            return self.handle_hub_tool(id, &tool, arguments).await;
+            let token = args.get("confirmation_token").and_then(|v| v.as_str());
+            return self.handle_hub_tool(id, &tool, arguments, token).await;
         }
         let bypass_cache = args
             .get("bypass_cache")
@@ -2739,6 +2784,50 @@ async fn config_and_cache_watcher(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn hub_with_permissions(permissions: crate::permissions::PermissionsConfig) -> ProxyServer {
+        ProxyServer::new(ProxyConfig {
+            permissions,
+            audit: crate::audit::AuditConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn installation_par_l_agent_demande_confirmation_par_defaut() {
+        let hub = hub_with_permissions(crate::permissions::PermissionsConfig {
+            confirm_via_dialog: false,
+            ..Default::default()
+        });
+        let response = hub
+            .handle_hub_tool(Some(json!(1)), "registry_install", json!({"name": "io.example/x"}), None)
+            .await;
+        let result = response.result.expect("demande de confirmation");
+        assert_eq!(result["_meta"]["mcphub"]["status"], "confirmation_required");
+
+        let response = hub
+            .handle_hub_tool(Some(json!(2)), "registry_install", json!({"name": "io.example/x"}), Some("faux"))
+            .await;
+        assert!(response.error.is_some(), "un jeton inconnu est refuse");
+    }
+
+    #[tokio::test]
+    async fn regle_explicite_sur_l_installation_respectee() {
+        let hub = hub_with_permissions(
+            crate::permissions::PermissionsConfig::from_json(&json!({
+                "confirmVia": "token",
+                "rules": [{ "server": "mcphub", "tool": "registry_install", "action": "deny" }]
+            }))
+            .unwrap(),
+        );
+        let response = hub
+            .handle_hub_tool(Some(json!(1)), "registry_install", json!({"name": "io.example/x"}), None)
+            .await;
+        assert!(response.error.expect("refus").message.contains("interdit"));
+    }
 
     #[test]
     fn test_live_discover_results_prioritizes_exact_tool_name() {
