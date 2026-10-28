@@ -30,11 +30,6 @@ pub fn crawl_tool_def() -> Value {
     })
 }
 
-/// Check if a tool name is the built-in crawl tool.
-pub fn is_crawl_tool(name: &str) -> bool {
-    name == CRAWL_TOOL_NAME
-}
-
 /// Execute the crawl tool. Calls Cloudflare Browser Rendering API.
 pub async fn execute_crawl(args: Value) -> Result<String, String> {
     let url = args
