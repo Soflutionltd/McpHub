@@ -520,19 +520,23 @@ impl ProxyServer {
                             token,
                             permissions.confirm_ttl_secs
                         );
+                        // `_meta` est conservé par tous les clients MCP ; `_mcphub` reste pour
+                        // les intégrations existantes (code mode).
+                        let pending = serde_json::json!({
+                            "status": "confirmation_required",
+                            "confirmation_token": token,
+                            "expires_in_secs": permissions.confirm_ttl_secs,
+                            "server": server,
+                            "tool": tool,
+                            "policy": decision.source,
+                        });
                         PolicyGate::Respond(JsonRpcResponse::success(
                             id.clone(),
                             serde_json::json!({
                                 "content": [{ "type": "text", "text": text }],
                                 "isError": false,
-                                "_mcphub": {
-                                    "status": "confirmation_required",
-                                    "confirmation_token": token,
-                                    "expires_in_secs": permissions.confirm_ttl_secs,
-                                    "server": server,
-                                    "tool": tool,
-                                    "policy": decision.source,
-                                }
+                                "_meta": { "mcphub": pending.clone() },
+                                "_mcphub": pending,
                             }),
                         ))
                     }
@@ -1963,13 +1967,15 @@ impl ProxyServer {
                     "tool": tool,
                     "args_received": arguments,
                 });
-                if let Some(schema) = tool_schema {
-                    data["inputSchema"] = schema;
-                    data["hint"] = serde_json::json!(
-                        "The tool returned an error. Check `inputSchema` to see required arguments."
-                    );
+                if failure_status(&e) == "error" {
+                    if let Some(schema) = tool_schema {
+                        data["inputSchema"] = schema;
+                        data["hint"] = serde_json::json!(
+                            "The tool returned an error. Check `inputSchema` to see required arguments."
+                        );
+                    }
                 }
-                JsonRpcResponse::error_with_data(id, -32000, e, data)
+                tool_failure_response(id, e, data)
             }
         }
     }
@@ -2056,7 +2062,11 @@ impl ProxyServer {
                 let normalized = self.normalize_result_for_profile(result).await;
                 JsonRpcResponse::success(id, normalized)
             }
-            Err(e) => JsonRpcResponse::error(id, -32000, e),
+            Err(e) => tool_failure_response(
+                id,
+                e,
+                serde_json::json!({ "server": server, "tool": tool }),
+            ),
         }
     }
 
@@ -2149,17 +2159,14 @@ impl ProxyServer {
         }
     }
 
+    /// L'identifiant reçu est celui du client, pas celui que McpHub a donné au serveur enfant :
+    /// le transmettre tel quel pouvait annuler l'appel d'un autre client. Sans table de
+    /// correspondance, l'annulation n'est pas relayée (l'appel se termine ou expire).
     async fn handle_cancel(&self, args: serde_json::Value) {
-        // Just broadcast the cancellation to all running servers.
-        // ChildManager does not keep track of request IDs globally.
-        // The server will simply ignore the cancellation if it doesn't know the request ID.
-        let running_servers = self.child_manager.server_names().await;
-        for server in running_servers {
-            let _ = self
-                .child_manager
-                .forward_notification(&server, "notifications/cancelled", args.clone())
-                .await;
-        }
+        eprintln!(
+            "[McpHub][INFO] notifications/cancelled recu (requestId {}) : non relaye aux serveurs",
+            args.get("requestId").cloned().unwrap_or_default()
+        );
     }
 }
 
@@ -2167,10 +2174,43 @@ impl ProxyServer {
 /// avec `isError: true`, sinon "ok".
 fn audit_status(res: &Result<serde_json::Value, String>) -> &'static str {
     match res {
-        Err(_) => "error",
+        Err(e) => failure_status(e),
         Ok(v) if v.get("isError").and_then(|b| b.as_bool()).unwrap_or(false) => "tool_error",
         Ok(_) => "ok",
     }
+}
+
+/// État réel d'un appel en échec : rien n'a été exécuté, effet inconnu, ou erreur rendue.
+fn failure_status(e: &str) -> &'static str {
+    if crate::child::is_unknown_outcome(e) {
+        "unknown_outcome"
+    } else if crate::child::is_not_sent(e) {
+        "not_executed"
+    } else {
+        "error"
+    }
+}
+
+/// Erreur JSON-RPC d'un appel d'outil, avec l'état réel dans `data.status`.
+fn tool_failure_response(
+    id: Option<serde_json::Value>,
+    e: String,
+    mut data: serde_json::Value,
+) -> JsonRpcResponse {
+    let status = failure_status(&e);
+    data["status"] = serde_json::json!(status);
+    match status {
+        "unknown_outcome" => {
+            data["hint"] = serde_json::json!(
+                "Ne pas relancer automatiquement : verifier d'abord si l'action a eu lieu."
+            );
+        }
+        "not_executed" => {
+            data["hint"] = serde_json::json!("Rien n'a ete execute : relancer est sans risque.");
+        }
+        _ => {}
+    }
+    JsonRpcResponse::error_with_data(id, -32000, e, data)
 }
 
 fn server_matches_filter(server_name: &str, filter: &str) -> bool {
