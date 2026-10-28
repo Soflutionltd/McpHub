@@ -474,6 +474,9 @@ fn handle_update_server(name: &str, body: &str) -> Vec<u8> {
     let new_name = data.get("newName").and_then(|v| v.as_str()).unwrap_or(name);
 
     if new_name != name {
+        if servers.contains_key(new_name) {
+            return json_err(409, "A server with this name already exists");
+        }
         let existing = servers.remove(name).unwrap();
         servers.insert(new_name.to_string(), existing);
     }
