@@ -217,6 +217,42 @@ WantedBy=default.target"#,
     }
 }
 
+/// Démarrage automatique déjà enregistré pour l'instance courante.
+pub fn is_installed() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        dirs::home_dir()
+            .map(|home| {
+                home.join("Library/LaunchAgents")
+                    .join(format!("{}.plist", crate::instance::current().launchd_label()))
+                    .exists()
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        dirs::home_dir()
+            .map(|home| {
+                home.join(".config/systemd/user")
+                    .join(crate::instance::current().systemd_unit())
+                    .exists()
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("reg")
+            .args(["query", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run", "/v", "McpHub"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        false
+    }
+}
+
 pub fn uninstall() {
     #[cfg(target_os = "macos")]
     {
