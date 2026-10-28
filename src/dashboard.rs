@@ -712,17 +712,32 @@ async fn handle_repair_server(name: &str) -> Vec<u8> {
         return json_err(404, "Server not found");
     }
 
-    let srv = &servers[name];
-    let command = srv.get("command").and_then(|v| v.as_str()).unwrap_or("");
-    let args: Vec<String> = srv
-        .get("args")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    // Même config que le démon (${VAR} résolus, sandbox), pas le JSON brut.
+    let server_config = match crate::config::try_auto_detect() {
+        Ok(cfg) => match cfg.servers.get(name) {
+            Some(s) if s.url.is_some() => {
+                return json_ok(json!({
+                    "ok": false,
+                    "step": "remote_server",
+                    "error": "Remote server: there is no local command to test",
+                    "suggestion": "Check its URL and headers, or sign in with OAuth",
+                    "auto_fixable": false
+                }))
+            }
+            Some(s) => s.clone(),
+            None => {
+                return json_ok(json!({
+                    "ok": false,
+                    "step": "not_loaded",
+                    "error": "Server is disabled or skipped by McpHub",
+                    "suggestion": "Enable it, then run the diagnosis again",
+                    "auto_fixable": false
+                }))
+            }
+        },
+        Err(e) => return json_err(409, &e),
+    };
+    let command = server_config.command.as_str();
 
     // Step 1: Check if command exists
     let cmd_check = tokio::process::Command::new("which")
@@ -775,21 +790,9 @@ async fn handle_repair_server(name: &str) -> Vec<u8> {
         }));
     }
 
-    // Step 2: Try to start the server and get tools
-    let mut cmd = tokio::process::Command::new(command);
-    for arg in &args {
-        cmd.arg(arg);
-    }
-
-    // Add env vars
-    if let Some(env_obj) = srv.get("env").and_then(|v| v.as_object()) {
-        for (k, v) in env_obj {
-            if let Some(val) = v.as_str() {
-                cmd.env(k, val);
-            }
-        }
-    }
-
+    // Step 2: start it exactly as the daemon does (sandbox, minimal environment without the
+    // daemon's secrets, own process group).
+    let mut cmd = crate::child::local_command(name, &server_config);
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -808,8 +811,14 @@ async fn handle_repair_server(name: &str) -> Vec<u8> {
     };
 
     // Give it 10 seconds to start
+    let pid = child.id();
     let output =
         tokio::time::timeout(std::time::Duration::from_secs(10), child.wait_with_output()).await;
+    if output.is_err() {
+        if let Some(pid) = pid {
+            crate::child::kill_group(pid);
+        }
+    }
 
     match output {
         Ok(Ok(out)) => {

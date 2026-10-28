@@ -102,7 +102,7 @@ enum KillHandle {
 }
 
 /// Tue le groupe de processus entier : `npx` et le `node` qu'il a lancé, par exemple.
-fn kill_group(pid: u32) {
+pub fn kill_group(pid: u32) {
     #[cfg(unix)]
     {
         // SAFETY: killpg n'accède à aucune mémoire ; un groupe déjà disparu renvoie ESRCH.
