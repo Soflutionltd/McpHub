@@ -264,8 +264,18 @@ fn check_sha256(bytes: &[u8], expected: &str) -> Result<(), String> {
     }
 }
 
+/// Windows : le `tar.exe` du système (bsdtar) lit les zip, un `tar` GNU trouvé dans le PATH non.
+fn tar_program() -> PathBuf {
+    if cfg!(windows) {
+        let root = env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        PathBuf::from(root).join("System32").join("tar.exe")
+    } else {
+        PathBuf::from("tar")
+    }
+}
+
 async fn extract(dir: &Path, archive: &Path) -> Result<PathBuf, String> {
-    let status = tokio::process::Command::new("tar")
+    let status = tokio::process::Command::new(tar_program())
         .arg("-xf")
         .arg(archive)
         .arg("-C")
@@ -414,7 +424,10 @@ fn on_boot(state: &mut UpdateState, running: &str) -> BootAction {
         return BootAction::Continue;
     };
     if pending.to != running {
-        state.pending = None;
+        // Un processus encore sur l'ancienne version ne dit rien de la nouvelle.
+        if !is_newer(&pending.to, running) {
+            state.pending = None;
+        }
         return BootAction::Continue;
     }
     pending.boots += 1;
@@ -430,8 +443,12 @@ fn on_boot(state: &mut UpdateState, running: &str) -> BootAction {
 }
 
 /// À appeler au tout début de `McpHub serve`, avant de lire la config : une version qui plante
-/// au démarrage y repasse à chaque relance du service.
+/// au démarrage y repasse à chaque relance du service. Seule l'instance principale compte : les
+/// instances nommées partagent le binaire et fausseraient le décompte.
 pub fn startup_guard() {
+    if crate::instance::current().name.is_some() {
+        return;
+    }
     let Ok(exe) = env::current_exe() else { return };
     let mut state = read_state(&exe);
     let action = on_boot(&mut state, VERSION);
@@ -473,11 +490,13 @@ pub fn spawn_daemon_tasks(proxy: Arc<crate::proxy::ProxyServer>) {
     let Ok(exe) = env::current_exe() else { return };
     let fingerprint = binary_fingerprint(&exe);
 
-    let healthy_exe = exe.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(PROBATION).await;
-        confirm_healthy(&healthy_exe);
-    });
+    if crate::instance::current().name.is_none() {
+        let healthy_exe = exe.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(PROBATION).await;
+            confirm_healthy(&healthy_exe);
+        });
+    }
 
     let watched_exe = exe.clone();
     tokio::spawn(async move {
@@ -772,7 +791,11 @@ mod tests {
             pending: Some(Pending { from: "5.9.1".into(), to: "5.10.0".into(), boots: 2 }),
             rejected: vec![],
         };
+        // Un processus plus ancien n'efface pas la période d'essai de la nouvelle version.
         assert_eq!(on_boot(&mut other, "5.9.1"), BootAction::Continue);
+        assert_eq!(other.pending.as_ref().map(|p| p.boots), Some(2));
+        // Une version plus récente que celle en essai la remplace.
+        assert_eq!(on_boot(&mut other, "5.11.0"), BootAction::Continue);
         assert_eq!(other.pending, None);
     }
 
