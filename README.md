@@ -102,6 +102,17 @@ make install      # cargo build --release, install, sign
 
 </details>
 
+### 🔄 Updates
+
+Once the daemon runs (`McpHub install`), McpHub keeps itself up to date. Editors connected by URL (Cursor, Claude Code, VS Code, Windsurf) need nothing: they talk to the updated daemon.
+
+- **Signed.** Every release publishes `latest.json` (version and SHA-256 of each file) signed with minisign; the public key is compiled into McpHub. On macOS the new binary must also carry Soflution's Developer ID signature. Anything else is refused.
+- **Gradual.** A new version reaches 10% of installations on day one, everyone after 24 hours. The daemon checks at start-up, then every 6 hours. The only request is the download from GitHub: no telemetry, the rollout bucket is drawn from a random local id that never leaves your machine.
+- **Never in the middle of a call.** The new binary is installed next to the old one; each daemon switches over as soon as no request is in flight (editors reconnect by themselves). If the new version fails to start three times, the previous one is restored and that version is skipped.
+- **Your choice.** `"settings": { "autoUpdate": false }` turns it off; `McpHub update` installs the latest release right away, `McpHub update --check` only reports it. Development builds and named instances never update themselves (the main instance updates the shared binary).
+- **Claude Desktop extension.** `mcphub.mcpb` uses the installed McpHub when there is one, so it follows the same updates; otherwise it runs the binary it ships with.
+- **Windows.** The binary is replaced in place and used from the next session start.
+
 ---
 
 ## 🔌 Connect your editor
@@ -184,17 +195,17 @@ Use `http://127.0.0.1:24680/sse` with the same `Authorization` header.
 
 Per-project policy lives in `~/.McpHub/projects.json` (or the path in `MCPHUB_PROJECTS`), see [`client/projects.example.json`](client/projects.example.json). For a workspace listed there, only its `allowedServers` are reachable, and a call aimed at another Supabase project, App Store app or Cloudflare project is refused. Without the file there is no policy; an unreadable file is an error, never silently ignored.
 
-```bash
-cd client && npm ci
-```
+Each release ships the client as a single file, `mcphub-client.mjs`, which the daemon keeps up to date in `~/.McpHub/client/` (Node 20 or later, no `npm install`). Editors pick up a new version the next time they start the server:
 
 ```json
 {
   "mcpServers": {
-    "McpHub": { "command": "node", "args": ["/path/to/McpHub/client/index.js"] }
+    "McpHub": { "command": "node", "args": ["/Users/you/.McpHub/client/mcphub-client.mjs"] }
   }
 }
 ```
+
+From a clone instead: `cd client && npm ci`, then point `args` at `/path/to/McpHub/client/index.js`.
 
 `npm test` runs smoke tests against the local daemon (MemoryPilot and supabase configured), with a throwaway project file.
 
@@ -542,8 +553,26 @@ McpHub pins ...           # tool pinning: status, approve, reset, scan
 McpHub sandbox [show S]   # server isolation
 McpHub policy test S T    # which permission applies
 McpHub audit --tail 50    # recent calls
-McpHub update | version | help
+McpHub update [--check]   # install the latest signed release now (automatic otherwise)
+McpHub version | help
 ```
+
+<details>
+<summary><b>Publishing a release (maintainers)</b></summary>
+
+Bump `version` in `Cargo.toml`, merge, then push the tag `vX.Y.Z` (only admins can create `v*` tags). The `Release` workflow builds every binary, signs and notarizes the macOS ones, bundles the client and the Claude Desktop extension, signs `latest.json` and publishes. Its secrets live in the `release` environment, reachable only from `v*` tags; the signing key and the certificate are also kept in 1Password (`scripts/ci-signing-secrets.sh` refreshes the certificate when it is renewed).
+
+Something wrong with a version already out?
+
+```bash
+gh workflow run release.yml --ref vX.Y.Z -f action=pause    # nobody else receives it
+gh workflow run release.yml --ref vX.Y.Z -f action=resume   # back to the gradual rollout
+gh workflow run release.yml --ref vX.Y.Z -f action=full     # everyone now (urgent fix)
+```
+
+Installations never go back to an older version: to undo a release, publish a fixed one with a higher number.
+
+</details>
 
 Files: `~/.McpHub/` (config, cache, pins, audit log, token; `~/.McpHub-<name>/` for a [named instance](#working-on-client-accounts)) and `~/Library/Logs/McpHub/<server>.stderr.log` (each server's error output).
 

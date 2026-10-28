@@ -62,6 +62,11 @@ Invariants now enforced by tests. Do not regress them:
 - Only implemented MCP revisions are announced (`src/protocol.rs`).
 - `McpHub update` never downgrades, requires the published SHA-256, checks `--version` of the new binary
   and rolls back on failure.
+- Automatic updates: only from a `latest.json` signed with the minisign key whose public half is
+  `UPDATE_PUBLIC_KEY` in `src/update.rs` (private half in 1Password and the GitHub `release`
+  environment). macOS binaries must carry the Developer ID of team TB8CC687M3. Gradual rollout (10%, then
+  everyone after 24 h), restart only when `in_flight() == 0`, rollback after 3 failed starts. Never in
+  debug builds, named instances or a cargo `target/` directory.
 
 Next, not done yet:
 
