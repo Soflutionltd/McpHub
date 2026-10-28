@@ -269,6 +269,9 @@ pub struct ChildManager {
     starting: Mutex<HashMap<String, Arc<Mutex<Option<(Instant, String)>>>>>,
     idle_timeout_ms: u64,
     request_timeout_secs: u64,
+    /// Augmente à chaque serveur perdu, relancé ou arrêté : les réponses mises en cache avant
+    /// ne sont plus servies (l'état du serveur a pu changer).
+    epoch: AtomicU64,
 }
 
 impl ChildManager {
@@ -283,7 +286,16 @@ impl ChildManager {
             starting: Mutex::new(HashMap::new()),
             idle_timeout_ms,
             request_timeout_secs: request_timeout_secs.max(1),
+            epoch: AtomicU64::new(0),
         }
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
+    fn bump_epoch(&self) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
     }
 
     pub async fn update_configs(&self, new_configs: HashMap<String, ServerConfig>) {
@@ -343,6 +355,7 @@ impl ChildManager {
 
     async fn discard(&self, name: &str, pool: &Arc<ServerPool>) {
         if self.remove_if_same(name, pool).await {
+            self.bump_epoch();
             pool.kill_now().await;
         }
     }
@@ -616,6 +629,7 @@ impl ChildManager {
     pub async fn stop_server(&self, name: &str) {
         let removed = self.pools.lock().await.remove(name);
         if let Some(pool) = removed {
+            self.bump_epoch();
             pool.kill_now().await;
             eprintln!("[McpHub][INFO] Stopped server: {}", name);
         }
@@ -623,6 +637,7 @@ impl ChildManager {
 
     pub async fn stop_all(&self) {
         let drained: Vec<(String, Arc<ServerPool>)> = self.pools.lock().await.drain().collect();
+        self.bump_epoch();
         for (name, pool) in drained {
             pool.kill_now().await;
             eprintln!("[McpHub][INFO] Stopped server: {}", name);

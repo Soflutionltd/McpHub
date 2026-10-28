@@ -1917,8 +1917,10 @@ impl ProxyServer {
 
         // Cache hit short-circuit: only for idempotent tools, only when caller didn't bypass.
         let cacheable = !bypass_cache && ResponseCache::is_cacheable(&tool);
+        let mutating = !ResponseCache::is_cacheable(&tool);
+        let epoch = self.child_manager.epoch();
         if cacheable {
-            if let Some(hit) = self.response_cache.get(&server, &tool, &arguments) {
+            if let Some(hit) = self.response_cache.get(&server, &tool, &arguments, epoch) {
                 let mut value = hit.value;
                 if let Some(obj) = value.as_object_mut() {
                     obj.insert(
@@ -1949,11 +1951,18 @@ impl ProxyServer {
             }
         }
 
+        // Avant et après : une lecture lancée pendant l'écriture ne doit pas survivre à celle-ci.
+        if mutating {
+            self.response_cache.invalidate_server(&server);
+        }
         let start_time = Instant::now();
         let res = self
             .child_manager
             .call_tool(&server, &tool, arguments.clone())
             .await;
+        if mutating {
+            self.response_cache.invalidate_server(&server);
+        }
         let elapsed = start_time.elapsed().as_millis() as u64;
 
         let usage_key = format!("{}__{}", server, tool);
@@ -1991,7 +2000,7 @@ impl ProxyServer {
                 let mut normalized = self.normalize_result_for_profile(result).await;
                 if cacheable {
                     self.response_cache
-                        .put(&server, &tool, &arguments, normalized.clone());
+                        .put(&server, &tool, &arguments, normalized.clone(), epoch);
                 }
                 if tool_untrusted {
                     if let Some(obj) = normalized.as_object_mut() {
@@ -2074,6 +2083,9 @@ impl ProxyServer {
 
         let start_time = Instant::now();
         let res = self.child_manager.call_tool(server, tool, arguments).await;
+        if !ResponseCache::is_cacheable(tool) {
+            self.response_cache.invalidate_server(server);
+        }
         let elapsed = start_time.elapsed().as_millis() as u64;
 
         self.record_audit(AuditEntry {
