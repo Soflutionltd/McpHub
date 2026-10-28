@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo test --locked
+
+  client:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Test
+        working-directory: client
+        run: |
+          npm ci
+          npm audit --omit=dev --audit-level=high
+          npm run -s test:offline
+          npm run -s bundle
+          MCPHUB_CLIENT_ENTRY=dist/mcphub-client.mjs npm run -s test:offline
