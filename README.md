@@ -560,7 +560,7 @@ McpHub version | help
 <details>
 <summary><b>Publishing a release (maintainers)</b></summary>
 
-Bump `version` in `Cargo.toml`, merge, then push the tag `vX.Y.Z` (only admins can create `v*` tags). The `Release` workflow builds every binary, signs and notarizes the macOS ones, bundles the client and the Claude Desktop extension, signs `latest.json` and publishes. Its secrets live in the `release` environment, reachable only from `v*` tags; the signing key and the certificate are also kept in 1Password (`scripts/ci-signing-secrets.sh` refreshes the certificate when it is renewed).
+Bump `version` in `Cargo.toml`, merge, then push the tag `vX.Y.Z` (only admins can create `v*` tags). The `Release` workflow builds every binary, signs and notarizes the macOS ones, bundles the client, signs `latest.json` and publishes; the `MCP Registry` workflow then builds the Claude Desktop extension from `.mcp/`, attaches it and publishes to the MCP Registry. Its secrets live in the `release` environment, reachable only from `v*` tags; the signing key and the certificate are also kept in 1Password (`scripts/ci-signing-secrets.sh` refreshes the certificate when it is renewed).
 
 Something wrong with a version already out?
 
