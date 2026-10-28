@@ -927,43 +927,18 @@ impl ProxyServer {
         JsonRpcResponse::success(id, serde_json::to_value(result).unwrap())
     }
 
-    /// Negotiate protocol version per MCP spec:
-    /// - If client requests a YYYY-MM-DD version we recognize as compatible, echo it back.
-    /// - Otherwise propose our latest stable.
-    /// We treat all `20xx-MM-DD` versions as compatible because the JSON-RPC surface
-    /// for tools/list is stable across MCP revisions; new features (elicitation, roots,
-    /// extensions, MCP-UI) are opt-in via capabilities, which we simply don't advertise.
+    /// Négociation MCP : la version demandée si McpHub l'implémente, sinon sa plus récente
+    /// (le client décide alors s'il continue). Une date inconnue n'est jamais renvoyée telle
+    /// quelle : ce serait annoncer un protocole que McpHub ne parle pas.
     fn negotiate_protocol_version(params: &serde_json::Value) -> String {
         let requested = params
             .get("protocolVersion")
             .and_then(|value| value.as_str());
 
         match requested {
-            Some(v) if Self::is_known_protocol_version(v) => v.to_string(),
-            _ => "2025-11-25".to_string(),
+            Some(v) if crate::protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&v) => v.to_string(),
+            _ => crate::protocol::LATEST_PROTOCOL_VERSION.to_string(),
         }
-    }
-
-    fn is_known_protocol_version(v: &str) -> bool {
-        // Accept any YYYY-MM-DD shaped version starting with "20"
-        // (covers 2024-11-05, 2025-03-26, 2025-11-25, and future revisions).
-        let bytes = v.as_bytes();
-        if bytes.len() != 10 {
-            return false;
-        }
-        if bytes[4] != b'-' || bytes[7] != b'-' {
-            return false;
-        }
-        if !v.starts_with("20") {
-            return false;
-        }
-        v.chars().enumerate().all(|(i, c)| {
-            if i == 4 || i == 7 {
-                c == '-'
-            } else {
-                c.is_ascii_digit()
-            }
-        })
     }
 
     async fn handle_tools_list(&self, id: Option<serde_json::Value>) -> JsonRpcResponse {
@@ -2824,6 +2799,19 @@ mod tests {
             },
             ..Default::default()
         })
+    }
+
+    #[test]
+    fn version_inconnue_jamais_renvoyee_telle_quelle() {
+        let negotiate = |v: &str| ProxyServer::negotiate_protocol_version(&json!({"protocolVersion": v}));
+        assert_eq!(negotiate("2025-06-18"), "2025-06-18");
+        assert_eq!(negotiate("2024-11-05"), "2024-11-05");
+        assert_eq!(negotiate("2026-07-28"), crate::protocol::LATEST_PROTOCOL_VERSION);
+        assert_eq!(negotiate("2099-01-01"), crate::protocol::LATEST_PROTOCOL_VERSION);
+        assert_eq!(
+            ProxyServer::negotiate_protocol_version(&json!({})),
+            crate::protocol::LATEST_PROTOCOL_VERSION
+        );
     }
 
     #[tokio::test]

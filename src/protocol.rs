@@ -247,6 +247,14 @@ impl ToolContent {
 
 // ─── MCP Initialize Types ────────────────────────────────────
 
+/// Révisions MCP à poignée de main (`initialize`) que McpHub implémente, la plus récente en
+/// premier. La révision 2026-07-28 (sans `initialize`, avec `server/discover`) n'en fait pas
+/// partie : l'annoncer serait promettre un protocole que McpHub ne parle pas.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
+    &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07"];
+
+pub const LATEST_PROTOCOL_VERSION: &str = SUPPORTED_PROTOCOL_VERSIONS[0];
+
 #[derive(Debug, Serialize)]
 pub struct ServerInfo {
     pub name: String,

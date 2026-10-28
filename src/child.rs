@@ -216,9 +216,6 @@ pub fn local_command(name: &str, config: &ServerConfig) -> Command {
     cmd
 }
 
-/// Version de protocole proposée aux serveurs enfants (ils répondent avec la leur).
-const CHILD_PROTOCOL_VERSION: &str = "2025-11-25";
-
 /// Sortie d'erreur d'un serveur enfant : ~/Library/Logs/McpHub/<serveur>.stderr.log (remise à zéro
 /// au-delà de 1 Mo). Auparavant jetée, ce qui rendait les pannes de démarrage illisibles.
 fn child_stderr(name: &str) -> Stdio {
@@ -846,7 +843,7 @@ async fn initialize(
         proc,
         "initialize",
         serde_json::json!({
-            "protocolVersion": CHILD_PROTOCOL_VERSION,
+            "protocolVersion": crate::protocol::LATEST_PROTOCOL_VERSION,
             "capabilities": {},
             "clientInfo": { "name": "McpHub", "version": env!("CARGO_PKG_VERSION") }
         }),
@@ -856,7 +853,14 @@ async fn initialize(
 
     if let Some(pv) = init_result.get("protocolVersion").and_then(|v| v.as_str()) {
         if index == 0 {
-            eprintln!("[McpHub][INFO] Server '{}' negotiated protocol: {}", name, pv);
+            if crate::protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&pv) {
+                eprintln!("[McpHub][INFO] Server '{}' negotiated protocol: {}", name, pv);
+            } else {
+                eprintln!(
+                    "[McpHub][WARN] Server '{}' answered with protocol {} that McpHub does not implement; tools/list and tools/call are attempted anyway",
+                    name, pv
+                );
+            }
         }
     }
 
