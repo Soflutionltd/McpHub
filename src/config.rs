@@ -365,7 +365,7 @@ pub fn write_raw_atomic(path: &Path, config: &Value) -> Result<(), String> {
     let text = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
     let seq = WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = path.with_extension(format!("json.tmp.{}.{}", std::process::id(), seq));
-    if let Err(e) = fs::write(&tmp, text) {
+    if let Err(e) = write_private_synced(&tmp, text.as_bytes()) {
         let _ = fs::remove_file(&tmp);
         return Err(format!("{} : {}", tmp.display(), e));
     }
@@ -373,7 +373,30 @@ pub fn write_raw_atomic(path: &Path, config: &Value) -> Result<(), String> {
     fs::rename(&tmp, path).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         format!("{} : {}", path.display(), e)
-    })
+    })?;
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        if let Ok(handle) = fs::File::open(dir) {
+            let _ = handle.sync_all();
+        }
+    }
+    Ok(())
+}
+
+/// Fichier neuf, créé directement en 600 (la config peut contenir des secrets en clair) et
+/// écrit sur disque avant le renommage, pour qu'une coupure ne laisse pas un config.json vide.
+fn write_private_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 pub fn dedicated_config_path() -> PathBuf {
