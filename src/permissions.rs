@@ -105,61 +105,114 @@ pub struct Decision {
 }
 
 impl PermissionsConfig {
-    pub fn from_json(value: &Value) -> PermissionsConfig {
+    /// Toute valeur ou clé inconnue est une erreur : une règle `deny` ignorée pour une faute de
+    /// frappe laisserait passer l'outil qu'elle devait bloquer.
+    pub fn from_json(value: &Value) -> Result<PermissionsConfig, String> {
+        const KEYS: &[&str] = &[
+            "default",
+            "autoClassify",
+            "confirmTtlSecs",
+            "confirmVia",
+            "dialogTimeoutSecs",
+            "rules",
+        ];
+        const RULE_KEYS: &[&str] = &["server", "tool", "action", "reason"];
+        let obj = value
+            .as_object()
+            .ok_or("permissions doit etre un objet")?;
+        if let Some(unknown) = obj.keys().find(|k| !KEYS.contains(&k.as_str())) {
+            return Err(format!(
+                "permissions : cle inconnue \"{}\" ({})",
+                unknown,
+                KEYS.join(", ")
+            ));
+        }
+        let text = |key: &str| -> Result<Option<&str>, String> {
+            match obj.get(key) {
+                None => Ok(None),
+                Some(Value::String(s)) => Ok(Some(s.as_str())),
+                Some(_) => Err(format!("permissions.{} doit etre une chaine", key)),
+            }
+        };
+        let number = |key: &str| -> Result<Option<u64>, String> {
+            match obj.get(key) {
+                None => Ok(None),
+                Some(v) => v
+                    .as_u64()
+                    .map(Some)
+                    .ok_or_else(|| format!("permissions.{} doit etre un entier positif", key)),
+            }
+        };
         let mut cfg = PermissionsConfig::default();
-        if let Some(d) = value
-            .get("default")
-            .and_then(|v| v.as_str())
-            .and_then(Action::parse)
-        {
-            cfg.default = d;
+        if let Some(d) = text("default")? {
+            cfg.default = Action::parse(d)
+                .ok_or_else(|| format!("permissions.default invalide \"{}\" (allow, confirm, deny)", d))?;
         }
-        if let Some(a) = value.get("autoClassify").and_then(|v| v.as_bool()) {
-            cfg.auto_classify = a;
+        match obj.get("autoClassify") {
+            None => {}
+            Some(Value::Bool(a)) => cfg.auto_classify = *a,
+            Some(_) => return Err("permissions.autoClassify doit etre true ou false".into()),
         }
-        if let Some(t) = value.get("confirmTtlSecs").and_then(|v| v.as_u64()) {
+        if let Some(t) = number("confirmTtlSecs")? {
             cfg.confirm_ttl_secs = t.clamp(30, 3600);
         }
-        if let Some(v) = value.get("confirmVia").and_then(|v| v.as_str()) {
-            cfg.confirm_via_dialog = !v.eq_ignore_ascii_case("token");
-            cfg.dialog_fallback_token = v.eq_ignore_ascii_case("auto");
-        }
-        if let Some(t) = value.get("dialogTimeoutSecs").and_then(|v| v.as_u64()) {
-            cfg.dialog_timeout_secs = t.clamp(10, 600);
-        }
-        if let Some(rules) = value.get("rules").and_then(|v| v.as_array()) {
-            for (i, r) in rules.iter().enumerate() {
-                let action = match r
-                    .get("action")
-                    .and_then(|v| v.as_str())
-                    .and_then(Action::parse)
-                {
-                    Some(a) => a,
-                    None => {
-                        eprintln!(
-                            "[McpHub][WARN] permissions: regle #{} ignoree (action invalide)",
-                            i + 1
-                        );
-                        continue;
-                    }
-                };
-                cfg.rules.push(Rule {
-                    server: r
-                        .get("server")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("*")
-                        .to_string(),
-                    tool: r
-                        .get("tool")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("*")
-                        .to_string(),
-                    action,
-                    reason: r.get("reason").and_then(|v| v.as_str()).map(String::from),
-                });
+        if let Some(v) = text("confirmVia")? {
+            match v.to_ascii_lowercase().as_str() {
+                "dialog" => {}
+                "token" => cfg.confirm_via_dialog = false,
+                "auto" => cfg.dialog_fallback_token = true,
+                _ => {
+                    return Err(format!(
+                        "permissions.confirmVia invalide \"{}\" (dialog, auto, token)",
+                        v
+                    ))
+                }
             }
         }
-        cfg
+        if let Some(t) = number("dialogTimeoutSecs")? {
+            cfg.dialog_timeout_secs = t.clamp(10, 600);
+        }
+        let rules = match obj.get("rules") {
+            None => &[][..],
+            Some(Value::Array(rules)) => rules.as_slice(),
+            Some(_) => return Err("permissions.rules doit etre une liste".into()),
+        };
+        for (i, r) in rules.iter().enumerate() {
+            let n = i + 1;
+            let rule = r
+                .as_object()
+                .ok_or_else(|| format!("permissions : regle #{} doit etre un objet", n))?;
+            if let Some(unknown) = rule.keys().find(|k| !RULE_KEYS.contains(&k.as_str())) {
+                return Err(format!(
+                    "permissions : regle #{}, cle inconnue \"{}\" ({})",
+                    n,
+                    unknown,
+                    RULE_KEYS.join(", ")
+                ));
+            }
+            let field = |key: &str| -> Result<Option<String>, String> {
+                match rule.get(key) {
+                    None => Ok(None),
+                    Some(Value::String(s)) => Ok(Some(s.clone())),
+                    Some(_) => Err(format!("permissions : regle #{}, {} doit etre une chaine", n, key)),
+                }
+            };
+            let action_text = field("action")?
+                .ok_or_else(|| format!("permissions : regle #{} sans action", n))?;
+            let action = Action::parse(&action_text).ok_or_else(|| {
+                format!(
+                    "permissions : regle #{}, action invalide \"{}\" (allow, confirm, deny)",
+                    n, action_text
+                )
+            })?;
+            cfg.rules.push(Rule {
+                server: field("server")?.unwrap_or_else(|| "*".into()),
+                tool: field("tool")?.unwrap_or_else(|| "*".into()),
+                action,
+                reason: field("reason")?,
+            });
+        }
+        Ok(cfg)
     }
 
     pub fn decide(&self, server: &str, tool: &str) -> Decision {
@@ -444,7 +497,8 @@ mod tests {
                 { "server": "cloudflare", "tool": "*", "action": "confirm", "reason": "prod" },
                 { "server": "*", "tool": "list_*", "action": "allow" }
             ]
-        }));
+        }))
+        .expect("permissions valides");
         assert_eq!(
             cfg.decide("github", "delete_repository").action,
             Action::Deny
@@ -462,14 +516,22 @@ mod tests {
     }
 
     #[test]
-    fn invalid_rules_are_skipped_and_defaults_kept() {
-        let cfg = PermissionsConfig::from_json(&json!({
-            "rules": [{ "server": "x", "action": "maybe" }]
-        }));
-        assert!(cfg.rules.is_empty());
+    fn invalid_settings_are_rejected_instead_of_silently_allowing() {
+        for invalid in [
+            json!({ "rules": [{ "server": "x", "action": "maybe" }] }),
+            json!({ "rules": [{ "server": "x", "tool": "*", "acton": "deny" }] }),
+            json!({ "rules": [{ "server": "x" }] }),
+            json!({ "default": "dney" }),
+            json!({ "rule": [{ "server": "x", "action": "deny" }] }),
+            json!({ "confirmVia": "dialgo" }),
+            json!({ "autoClassify": "yes" }),
+            json!({ "rules": { "server": "x", "action": "deny" } }),
+        ] {
+            assert!(PermissionsConfig::from_json(&invalid).is_err(), "accepte : {}", invalid);
+        }
+        let cfg = PermissionsConfig::from_json(&json!({})).expect("objet vide valide");
         assert_eq!(cfg.default, Action::Allow);
         assert!(!cfg.auto_classify);
-        assert_eq!(cfg.decide("x", "delete_all").action, Action::Allow);
     }
 
     #[test]

@@ -121,39 +121,53 @@ const BLOCKED_EXEC: &[(&str, &str)] = &[
 /// défaut, sauf réglage explicite sur le serveur.
 const UNSANDBOXED_BY_DEFAULT: &[&str] = &["desktop-commander", "kilnshell"];
 
-fn str_list(v: Option<&Value>) -> Vec<String> {
-    v.and_then(|x| x.as_array())
-        .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
-        .unwrap_or_default()
+fn str_list(server_name: &str, key: &str, v: Option<&Value>) -> Result<Vec<String>, String> {
+    let Some(v) = v else { return Ok(Vec::new()) };
+    v.as_array()
+        .and_then(|a| a.iter().map(|s| s.as_str().map(String::from)).collect::<Option<Vec<_>>>())
+        .ok_or_else(|| format!("{} : sandbox.{} doit etre une liste de chaines", server_name, key))
 }
 
-fn mode_of(s: &str) -> Option<SandboxMode> {
+enum ModeSetting {
+    Off,
+    On(SandboxMode),
+}
+
+/// Une valeur inconnue est une erreur : la traiter comme « pas d'isolation » retirerait la
+/// protection en silence pour une simple faute de frappe.
+fn mode_of(server_name: &str, s: &str) -> Result<ModeSetting, String> {
     match s.to_ascii_lowercase().as_str() {
-        "shield" | "bouclier" | "on" | "true" => Some(SandboxMode::Shield),
-        "strict" => Some(SandboxMode::Strict),
-        _ => None,
+        "shield" | "bouclier" | "on" | "true" => Ok(ModeSetting::On(SandboxMode::Shield)),
+        "strict" => Ok(ModeSetting::On(SandboxMode::Strict)),
+        "off" | "false" | "none" => Ok(ModeSetting::Off),
+        _ => Err(format!(
+            "{} : mode sandbox inconnu \"{}\" (shield, strict ou false)",
+            server_name, s
+        )),
     }
 }
+
+const SPEC_KEYS: &[&str] = &["mode", "network", "allowRead", "allowWrite", "allowExec"];
 
 /// Réglage effectif d'un serveur : `mcpServers.X.sandbox` (false / true / "shield" / "strict" /
 /// objet), sinon `settings.sandbox` global, sinon pas d'isolation.
-pub fn resolve(server_name: &str, server: &Value, global: Option<&Value>, command: &str, args: &[String]) -> Option<SandboxSpec> {
+pub fn resolve(
+    server_name: &str,
+    server: &Value,
+    global: Option<&Value>,
+    command: &str,
+    args: &[String],
+) -> Result<Option<SandboxSpec>, String> {
     let local = server.get("sandbox");
     let explicit = local.is_some();
-    let spec_value = match local {
-        Some(Value::Bool(false)) => return None,
-        Some(v) => v.clone(),
+    let (spec_value, label) = match local {
+        Some(Value::Bool(false)) => return Ok(None),
+        Some(v) => (v.clone(), server_name.to_string()),
         None => match global {
-            Some(Value::Bool(false)) | None => return None,
-            Some(g) => g.clone(),
+            Some(Value::Bool(false)) | None => return Ok(None),
+            Some(g) => (g.clone(), "settings.sandbox".to_string()),
         },
     };
-    if !explicit {
-        let haystack = format!("{} {} {}", server_name, command, args.join(" ")).to_lowercase();
-        if UNSANDBOXED_BY_DEFAULT.iter().any(|n| haystack.contains(n)) {
-            return None;
-        }
-    }
     let mut spec = SandboxSpec {
         mode: SandboxMode::Shield,
         network: true,
@@ -163,19 +177,48 @@ pub fn resolve(server_name: &str, server: &Value, global: Option<&Value>, comman
     };
     match &spec_value {
         Value::Bool(true) => {}
-        Value::String(s) => spec.mode = mode_of(s)?,
+        Value::String(s) => match mode_of(&label, s)? {
+            ModeSetting::Off => return Ok(None),
+            ModeSetting::On(mode) => spec.mode = mode,
+        },
         Value::Object(o) => {
-            if let Some(m) = o.get("mode").and_then(|v| v.as_str()) {
-                spec.mode = mode_of(m)?;
+            if let Some(unknown) = o.keys().find(|k| !SPEC_KEYS.contains(&k.as_str())) {
+                return Err(format!(
+                    "{} : cle sandbox inconnue \"{}\" ({})",
+                    label,
+                    unknown,
+                    SPEC_KEYS.join(", ")
+                ));
             }
-            if let Some(n) = o.get("network").and_then(|v| v.as_bool()) {
-                spec.network = n;
+            match o.get("mode") {
+                None => {}
+                Some(Value::String(m)) => match mode_of(&label, m)? {
+                    ModeSetting::Off => return Ok(None),
+                    ModeSetting::On(mode) => spec.mode = mode,
+                },
+                Some(_) => return Err(format!("{} : sandbox.mode doit etre une chaine", label)),
             }
-            spec.allow_read = str_list(o.get("allowRead"));
-            spec.allow_write = str_list(o.get("allowWrite"));
-            spec.allow_exec = str_list(o.get("allowExec"));
+            match o.get("network") {
+                None => {}
+                Some(Value::Bool(n)) => spec.network = *n,
+                Some(_) => return Err(format!("{} : sandbox.network doit etre true ou false", label)),
+            }
+            spec.allow_read = str_list(&label, "allowRead", o.get("allowRead"))?;
+            spec.allow_write = str_list(&label, "allowWrite", o.get("allowWrite"))?;
+            spec.allow_exec = str_list(&label, "allowExec", o.get("allowExec"))?;
         }
-        _ => return None,
+        _ => {
+            return Err(format!(
+                "{} : sandbox doit etre true, false, \"shield\", \"strict\" ou un objet",
+                label
+            ))
+        }
+    }
+    if !explicit {
+        let haystack = format!("{} {} {}", server_name, command, args.join(" ")).to_lowercase();
+        if UNSANDBOXED_BY_DEFAULT.iter().any(|n| haystack.contains(n)) {
+            return Ok(None);
+        }
     }
     // Besoins connus des enveloppes courantes.
     let cmd_base = Path::new(command)
@@ -188,7 +231,7 @@ pub fn resolve(server_name: &str, server: &Value, global: Option<&Value>, comman
     if cmd_base == "xurl" || args.iter().any(|a| a.contains("@xdevplatform/xurl")) {
         spec.allow_write.push("~/.xurl".into());
     }
-    Some(spec)
+    Ok(Some(spec))
 }
 
 fn expand(p: &str, home: &str) -> String {
@@ -507,18 +550,33 @@ mod tests {
     #[test]
     fn resolution_des_reglages() {
         let g = json!("shield");
-        assert!(resolve("supabase", &json!({}), Some(&g), "npx", &[]).is_some());
-        assert!(resolve("supabase", &json!({"sandbox": false}), Some(&g), "npx", &[]).is_none());
-        assert!(resolve("supabase", &json!({}), None, "npx", &[]).is_none());
-        assert!(resolve("dc", &json!({}), Some(&g), "npx", &["@wonderwhy-er/desktop-commander".into()]).is_none());
-        assert!(resolve("dc", &json!({"sandbox": "shield"}), Some(&g), "npx", &["desktop-commander".into()]).is_some());
-        let s = resolve("x", &json!({"sandbox": {"mode": "strict", "network": false, "allowWrite": ["~/data"]}}), None, "xurl", &[]).unwrap();
+        let ok = |name: &str, server: Value, global: Option<&Value>, args: &[String]| {
+            resolve(name, &server, global, "npx", args).expect("reglage valide")
+        };
+        assert!(ok("supabase", json!({}), Some(&g), &[]).is_some());
+        assert!(ok("supabase", json!({"sandbox": false}), Some(&g), &[]).is_none());
+        assert!(ok("supabase", json!({"sandbox": "off"}), Some(&g), &[]).is_none());
+        assert!(ok("supabase", json!({}), None, &[]).is_none());
+        assert!(ok("dc", json!({}), Some(&g), &["@wonderwhy-er/desktop-commander".into()]).is_none());
+        assert!(ok("dc", json!({"sandbox": "shield"}), Some(&g), &["desktop-commander".into()]).is_some());
+        let s = resolve("x", &json!({"sandbox": {"mode": "strict", "network": false, "allowWrite": ["~/data"]}}), None, "xurl", &[])
+            .unwrap()
+            .unwrap();
         assert_eq!(s.mode, SandboxMode::Strict);
         assert!(!s.network);
         assert!(s.allow_write.contains(&"~/data".to_string()));
         assert!(s.allow_write.contains(&"~/.xurl".to_string()));
-        let r = resolve("cf", &json!({}), Some(&g), "npx", &["-y".into(), "mcp-remote@0.15.1".into()]).unwrap();
+        let r = ok("cf", json!({}), Some(&g), &["-y".into(), "mcp-remote@0.15.1".into()]).unwrap();
         assert!(r.allow_write.contains(&"~/.mcp-auth".to_string()));
+    }
+
+    #[test]
+    fn faute_de_frappe_refusee_au_lieu_de_retirer_l_isolation() {
+        assert!(resolve("a", &json!({"sandbox": "sheild"}), None, "npx", &[]).is_err());
+        assert!(resolve("a", &json!({}), Some(&json!("stirct")), "npx", &[]).is_err());
+        assert!(resolve("a", &json!({"sandbox": {"mode": "shield", "allowWrites": ["~/x"]}}), None, "npx", &[]).is_err());
+        assert!(resolve("a", &json!({"sandbox": {"network": "no"}}), None, "npx", &[]).is_err());
+        assert!(resolve("a", &json!({"sandbox": 1}), None, "npx", &[]).is_err());
     }
 
     #[test]

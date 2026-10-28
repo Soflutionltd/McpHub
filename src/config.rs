@@ -201,7 +201,7 @@ fn expand_vars(input: &str) -> String {
     out
 }
 
-fn parse_servers(json: &Value) -> HashMap<String, ServerConfig> {
+fn parse_servers(json: &Value) -> Result<HashMap<String, ServerConfig>, String> {
     load_secrets_env();
     let mut result = HashMap::new();
     let servers_obj = json
@@ -210,7 +210,7 @@ fn parse_servers(json: &Value) -> HashMap<String, ServerConfig> {
         .unwrap_or(json);
     let servers = match servers_obj.as_object() {
         Some(m) => m,
-        None => return result,
+        None => return Ok(result),
     };
 
     for (name, config) in servers {
@@ -260,7 +260,7 @@ fn parse_servers(json: &Value) -> HashMap<String, ServerConfig> {
                 json.get("settings").and_then(|s| s.get("sandbox")),
                 &command,
                 &args,
-            );
+            )?;
             result.insert(
                 name.clone(),
                 ServerConfig {
@@ -314,37 +314,97 @@ fn parse_servers(json: &Value) -> HashMap<String, ServerConfig> {
                     oauth,
                 },
             );
+        } else {
+            return Err(format!("{} : ni \"command\" ni \"url\"", name));
         }
     }
-    result
+    Ok(result)
 }
 
 /// Réglages de garde des outils de la config dédiée (pour la commande `McpHub pins`).
 pub fn load_guard_config() -> crate::toolguard::GuardConfig {
-    load_dedicated_config()
-        .map(|c| c.guard)
-        .unwrap_or_default()
-}
-
-fn load_dedicated_config() -> Option<ProxyConfig> {
-    let path = crate::instance::hub_dir().join("config.json");
-    load_dedicated_config_from_path(&path)
-}
-
-fn load_dedicated_config_from_path(path: &Path) -> Option<ProxyConfig> {
-    if !path.exists() {
-        return None;
+    match load_dedicated() {
+        Dedicated::Valid(c) => c.guard,
+        _ => crate::toolguard::GuardConfig::default(),
     }
-    let content = fs::read_to_string(path).ok()?;
-    let json: Value = serde_json::from_str(&content).ok()?;
-    config_from_json(&json, Some(path))
 }
 
-fn config_from_json(json: &Value, source_path: Option<&Path>) -> Option<ProxyConfig> {
-    let servers = parse_servers(&json);
-    if servers.is_empty() {
-        return None;
+/// État de `config.json` de l'instance. Une config invalide n'est jamais confondue avec une
+/// config absente : ce serait remplacer les serveurs choisis par ceux des éditeurs.
+pub enum Dedicated {
+    Missing,
+    Invalid(String),
+    Valid(ProxyConfig),
+}
+
+/// `config.json` brut, pour le modifier. `None` si absent. Illisible ou invalide = erreur :
+/// repartir d'une config vide puis l'enregistrer effacerait tous les serveurs.
+pub fn read_raw(path: &Path) -> Result<Option<Value>, String> {
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{} illisible : {}", path.display(), e)),
+    };
+    let json: Value = serde_json::from_str(&content).map_err(|e| {
+        format!("{} : JSON invalide ({}), corrige-le avant toute modification", path.display(), e)
+    })?;
+    if !json.is_object() {
+        return Err(format!("{} : la racine doit etre un objet JSON", path.display()));
     }
+    Ok(Some(json))
+}
+
+static WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Écriture atomique (fichier temporaire unique puis rename) : le surveillant de config ne lit
+/// jamais un fichier à moitié écrit, et deux écritures simultanées ne se mélangent pas.
+pub fn write_raw_atomic(path: &Path, config: &Value) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("{} : {}", dir.display(), e))?;
+    }
+    let text = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
+    let seq = WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.tmp.{}.{}", std::process::id(), seq));
+    if let Err(e) = fs::write(&tmp, text) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("{} : {}", tmp.display(), e));
+    }
+    crate::vault::restrict_permissions(&tmp);
+    fs::rename(&tmp, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("{} : {}", path.display(), e)
+    })
+}
+
+pub fn dedicated_config_path() -> PathBuf {
+    crate::instance::hub_dir().join("config.json")
+}
+
+pub fn load_dedicated() -> Dedicated {
+    load_dedicated_from_path(&dedicated_config_path())
+}
+
+fn load_dedicated_from_path(path: &Path) -> Dedicated {
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Dedicated::Missing,
+        Err(e) => return Dedicated::Invalid(format!("{} illisible : {}", path.display(), e)),
+    };
+    let json: Value = match serde_json::from_str(&content) {
+        Ok(j) => j,
+        Err(e) => return Dedicated::Invalid(format!("{} : JSON invalide : {}", path.display(), e)),
+    };
+    match config_from_json(&json, Some(path)) {
+        Ok(c) => Dedicated::Valid(c),
+        Err(e) => Dedicated::Invalid(format!("{} : {}", path.display(), e)),
+    }
+}
+
+fn config_from_json(json: &Value, source_path: Option<&Path>) -> Result<ProxyConfig, String> {
+    if !json.is_object() {
+        return Err("la racine doit etre un objet JSON".into());
+    }
+    let servers = parse_servers(json)?;
     if let Some(path) = source_path {
         eprintln!(
             "[McpHub][INFO] Loaded {} servers from {}",
@@ -417,13 +477,13 @@ fn config_from_json(json: &Value, source_path: Option<&Path>) -> Option<ProxyCon
             }
         }
         if let Some(permissions) = settings.get("permissions") {
-            config.permissions = crate::permissions::PermissionsConfig::from_json(permissions);
+            config.permissions = crate::permissions::PermissionsConfig::from_json(permissions)?;
         }
         if let Some(audit) = settings.get("audit") {
             config.audit = crate::audit::AuditConfig::from_json(audit);
         }
     }
-    Some(config)
+    Ok(config)
 }
 
 fn get_config_paths() -> Vec<PathBuf> {
@@ -451,20 +511,37 @@ fn get_config_paths() -> Vec<PathBuf> {
     paths
 }
 
+/// Config au démarrage ou pour une commande : une config invalide donne zéro serveur (et une
+/// erreur visible), jamais l'import des serveurs des éditeurs.
 pub fn auto_detect() -> ProxyConfig {
-    if let Some(config) = load_dedicated_config() {
-        let mode_str = match config.mode {
-            Mode::Discover => "discover",
-            Mode::Passthrough => "passthrough",
-        };
-        eprintln!(
-            "[McpHub][INFO] Using dedicated config: {} servers, mode={}",
-            config.servers.len(),
-            mode_str
-        );
-        return apply_env_overrides(config);
-    }
+    try_auto_detect().unwrap_or_else(|e| {
+        eprintln!("[McpHub][ERROR] config invalide, aucun serveur charge : {}", e);
+        apply_env_overrides(ProxyConfig::default())
+    })
+}
 
+/// Comme `auto_detect`, mais rend l'erreur d'une config invalide : le rechargement à chaud
+/// garde alors la dernière config valide.
+pub fn try_auto_detect() -> Result<ProxyConfig, String> {
+    match load_dedicated() {
+        Dedicated::Valid(config) => {
+            let mode_str = match config.mode {
+                Mode::Discover => "discover",
+                Mode::Passthrough => "passthrough",
+            };
+            eprintln!(
+                "[McpHub][INFO] Using dedicated config: {} servers, mode={}",
+                config.servers.len(),
+                mode_str
+            );
+            Ok(apply_env_overrides(config))
+        }
+        Dedicated::Invalid(e) => Err(e),
+        Dedicated::Missing => Ok(editors_config()),
+    }
+}
+
+fn editors_config() -> ProxyConfig {
     let mut config = ProxyConfig::default();
     if crate::instance::current().name.is_some() {
         eprintln!(
@@ -474,20 +551,22 @@ pub fn auto_detect() -> ProxyConfig {
         return config;
     }
     for path in &get_config_paths() {
-        if path.exists() {
-            if let Ok(content) = fs::read_to_string(path) {
-                if let Ok(json) = serde_json::from_str::<Value>(&content) {
-                    let servers = parse_servers(&json);
-                    if !servers.is_empty() {
-                        eprintln!(
-                            "[McpHub][INFO] Found {} servers in {}",
-                            servers.len(),
-                            path.display()
-                        );
-                        config.servers.extend(servers);
-                    }
-                }
+        let Ok(content) = fs::read_to_string(path) else { continue };
+        let Ok(json) = serde_json::from_str::<Value>(&content) else {
+            eprintln!("[McpHub][WARN] {} : JSON invalide, ignore", path.display());
+            continue;
+        };
+        match parse_servers(&json) {
+            Ok(servers) if !servers.is_empty() => {
+                eprintln!(
+                    "[McpHub][INFO] Found {} servers in {}",
+                    servers.len(),
+                    path.display()
+                );
+                config.servers.extend(servers);
             }
+            Ok(_) => {}
+            Err(e) => eprintln!("[McpHub][WARN] {} ignore : {}", path.display(), e),
         }
     }
 
@@ -567,7 +646,7 @@ mod tests {
             }
         });
 
-        let servers = parse_servers(&json);
+        let servers = parse_servers(&json).unwrap();
 
         assert_eq!(servers.len(), 1);
         assert!(servers.contains_key("github"));
@@ -583,9 +662,40 @@ mod tests {
 
     #[test]
     fn test_parse_servers_no_servers() {
-        let json = json!({"otherKey": "value"});
-        let servers = parse_servers(&json);
+        let json = json!({"servers": {}});
+        let servers = parse_servers(&json).unwrap();
         assert!(servers.is_empty());
+        // Sans clé servers/mcpServers, la racine est lue comme la liste des serveurs : une
+        // entrée qui n'en est pas une est signalée au lieu d'être ignorée.
+        assert!(parse_servers(&json!({"otherKey": "value"})).is_err());
+    }
+
+    #[test]
+    fn config_absente_invalide_ou_vide_bien_distinguees() {
+        let dir = std::env::temp_dir().join(format!("mcphub-config-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let _ = fs::remove_file(&path);
+        assert!(matches!(load_dedicated_from_path(&path), Dedicated::Missing));
+
+        fs::write(&path, "{\"servers\": {").unwrap();
+        assert!(matches!(load_dedicated_from_path(&path), Dedicated::Invalid(_)));
+
+        fs::write(&path, r#"{"servers": {"a": {"command": "x", "sandbox": "sheild"}}}"#).unwrap();
+        assert!(matches!(load_dedicated_from_path(&path), Dedicated::Invalid(_)));
+
+        fs::write(&path, r#"{"servers": {"a": {"args": ["x"]}}}"#).unwrap();
+        assert!(matches!(load_dedicated_from_path(&path), Dedicated::Invalid(_)));
+
+        fs::write(&path, r#"{"servers": {}, "settings": {"permissions": {"rules": [{"action": "dney"}]}}}"#).unwrap();
+        assert!(matches!(load_dedicated_from_path(&path), Dedicated::Invalid(_)));
+
+        fs::write(&path, r#"{"servers": {}}"#).unwrap();
+        match load_dedicated_from_path(&path) {
+            Dedicated::Valid(c) => assert!(c.servers.is_empty()),
+            _ => panic!("une config sans serveur est valide"),
+        }
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

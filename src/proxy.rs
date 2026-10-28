@@ -2586,7 +2586,16 @@ async fn apply_config_change(
     child_manager: Arc<ChildManager>,
     catalog_refresh_in_progress: Arc<AtomicBool>,
 ) {
-    let new_config = crate::config::auto_detect();
+    let new_config = match crate::config::try_auto_detect() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "[McpHub][ERROR] config invalide, la derniere config valide reste active : {}",
+                e
+            );
+            return;
+        }
+    };
     let new_servers = new_config.servers.clone();
     let new_server_hashes = crate::cache::server_config_hashes(&new_servers);
     let existing_cache = crate::cache::load_cache();
