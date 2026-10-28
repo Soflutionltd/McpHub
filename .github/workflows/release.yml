@@ -1,24 +1,117 @@
 name: Release
 
+# Un tag vX.Y.Z publie la release : binaires macOS signés (Developer ID) et notarisés, Linux,
+# Windows, client Node en un fichier, extension Claude Desktop (.mcpb), puis latest.json signé
+# avec minisign, que les démons installés lisent pour se mettre à jour.
+#
+# Déploiement d'une release déjà publiée (sur le tag, pas sur une branche) :
+#   gh workflow run release.yml --ref vX.Y.Z -f action=pause|resume|full
+
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Rollout of this release
+        type: choice
+        required: true
+        options: [pause, resume, full]
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  build-macos:
+    if: github.event_name == 'push'
+    runs-on: macos-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag matches Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME, Cargo.toml $version"; exit 1; }
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Build
+        run: |
+          cargo test --locked
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          mkdir -p out/arm out/intel out/universal
+          cp target/aarch64-apple-darwin/release/McpHub out/arm/McpHub
+          cp target/x86_64-apple-darwin/release/McpHub out/intel/McpHub
+          lipo -create -output out/universal/McpHub out/arm/McpHub out/intel/McpHub
+
+      - name: Import the Developer ID certificate
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/release.keychain-db"
+          keychain_password=$(openssl rand -hex 24)
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          printf '%s' "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" "$HOME/Library/Keychains/login.keychain-db"
+          identity=$(security find-identity -v -p codesigning "$keychain" | grep -m1 'Developer ID Application: .*(TB8CC687M3)' | awk '{print $2}')
+          test -n "$identity" || { echo "Developer ID Application (TB8CC687M3) not found in the certificate"; exit 1; }
+          echo "SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+
+      - name: Sign
+        run: |
+          requirement='=identifier "com.soflution.mcphub" and anchor apple generic and certificate leaf[subject.OU] = "TB8CC687M3"'
+          for bin in out/arm/McpHub out/intel/McpHub out/universal/McpHub; do
+            codesign --force --sign "$SIGN_IDENTITY" --identifier com.soflution.mcphub --options runtime --timestamp "$bin"
+            codesign --verify --strict -R "$requirement" "$bin"
+          done
+
+      - name: Notarize
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          key="$RUNNER_TEMP/AuthKey.p8"
+          printf '%s' "$APPLE_API_KEY_P8" | base64 --decode > "$key"
+          ditto -c -k --keepParent out notarize.zip
+          xcrun notarytool submit notarize.zip --key "$key" --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER" --wait --timeout 30m --output-format json > notary.json
+          rm -f "$key"
+          status=$(python3 -c "import json; print(json.load(open('notary.json'))['status'])")
+          test "$status" = "Accepted" || { cat notary.json; exit 1; }
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar czf dist/McpHub-macos-arm.tar.gz -C out/arm McpHub
+          tar czf dist/McpHub-macos-intel.tar.gz -C out/intel McpHub
+          tar czf dist/McpHub-macos-universal.tar.gz -C out/universal McpHub
+
+      - name: Remove the keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/release.keychain-db" 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*
+
+  build-other:
+    if: github.event_name == 'push'
     strategy:
       matrix:
         include:
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            asset: McpHub-macos-arm.tar.gz
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            asset: McpHub-macos-intel.tar.gz
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             asset: McpHub-linux-amd64.tar.gz
@@ -28,14 +121,11 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             asset: McpHub-windows-amd64.zip
-
     runs-on: ${{ matrix.os }}
-
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
@@ -45,55 +135,114 @@ jobs:
 
       - name: Build
         if: matrix.target != 'aarch64-unknown-linux-gnu'
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Build with cross
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: cross build --release --target ${{ matrix.target }}
+        run: cross build --release --locked --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.asset }} McpHub
-          cd ../../..
-          shasum -a 256 ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
+          mkdir -p dist
+          tar czf dist/${{ matrix.asset }} -C target/${{ matrix.target }}/release McpHub
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         run: |
-          cd target/${{ matrix.target }}/release
-          Compress-Archive -Path McpHub.exe -DestinationPath ../../../${{ matrix.asset }}
-          cd ../../..
-          $hash = (Get-FileHash -Algorithm SHA256 ${{ matrix.asset }}).Hash.ToLower()
-          "$hash  ${{ matrix.asset }}" | Out-File -Encoding ascii -NoNewline ${{ matrix.asset }}.sha256
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path target/${{ matrix.target }}/release/McpHub.exe -DestinationPath dist/${{ matrix.asset }}
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
-          path: ${{ matrix.asset }}*
+          path: dist/*
 
-  release:
-    needs: build
+  client:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Bundle and test
+        working-directory: client
+        run: |
+          npm ci
+          npm audit --omit=dev --audit-level=high
+          npm run -s test:offline
+          npm run -s bundle
+          MCPHUB_CLIENT_ENTRY=dist/mcphub-client.mjs npm run -s test:offline
+      - uses: actions/upload-artifact@v4
+        with:
+          name: client
+          path: client/dist/mcphub-client.mjs
 
+  publish:
+    needs: [build-macos, build-other, client]
+    runs-on: ubuntu-latest
+    environment: release
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: |
-            artifacts/*/*.sha256
-            artifacts/McpHub-macos-arm.tar.gz/McpHub-macos-arm.tar.gz
-            artifacts/McpHub-macos-intel.tar.gz/McpHub-macos-intel.tar.gz
-            artifacts/McpHub-linux-amd64.tar.gz/McpHub-linux-amd64.tar.gz
-            artifacts/McpHub-linux-arm64.tar.gz/McpHub-linux-arm64.tar.gz
-            artifacts/McpHub-windows-amd64.zip/McpHub-windows-amd64.zip
+      - name: Claude Desktop extension (.mcpb)
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p mcpb/server/darwin mcpb/server/linux-x64 mcpb/server/linux-arm64 mcpb/server/win32
+          tar xzf artifacts/macos/McpHub-macos-universal.tar.gz -C mcpb/server/darwin
+          tar xzf artifacts/McpHub-linux-amd64.tar.gz/McpHub-linux-amd64.tar.gz -C mcpb/server/linux-x64
+          tar xzf artifacts/McpHub-linux-arm64.tar.gz/McpHub-linux-arm64.tar.gz -C mcpb/server/linux-arm64
+          unzip -q artifacts/McpHub-windows-amd64.zip/McpHub-windows-amd64.zip -d mcpb/server/win32
+          cp packaging/mcpb/run.sh mcpb/server/run.sh
+          chmod +x mcpb/server/run.sh mcpb/server/*/McpHub
+          jq --arg v "$version" '.version = $v' packaging/mcpb/manifest.json > mcpb/manifest.json
+          (cd mcpb && zip -qr ../mcphub.mcpb manifest.json server)
+
+      - name: Collect assets
+        run: |
+          mkdir -p dist
+          find artifacts -type f \( -name 'McpHub-*' -o -name 'mcphub-client.mjs' \) -exec cp {} dist/ \;
+          mv mcphub.mcpb dist/
+          (cd dist && for f in McpHub-*; do sha256sum "$f" > "$f.sha256"; done)
+          ls -la dist
+
+      - name: Signed manifest
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          sudo apt-get install -y -qq minisign > /dev/null
+          python3 scripts/make-manifest.py new --version "${GITHUB_REF_NAME#v}" --dir dist \
+            --percent 10 --full-after-hours 24 > dist/latest.json
+          scripts/sign-manifest.sh dist/latest.json
+
+      - name: Publish
+        run: |
+          gh release create "$GITHUB_REF_NAME" --draft --generate-notes --title "McpHub $GITHUB_REF_NAME" dist/*
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+
+  rollout:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: release
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Re-sign the manifest
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          ROLLOUT_ACTION: ${{ inputs.action }}
+        run: |
+          case "$GITHUB_REF" in refs/tags/v*) ;; *) echo "run this on a release tag (--ref vX.Y.Z)"; exit 1 ;; esac
+          sudo apt-get install -y -qq minisign > /dev/null
+          gh release download "$GITHUB_REF_NAME" --pattern latest.json --dir current
+          python3 scripts/make-manifest.py edit --from current/latest.json --action "$ROLLOUT_ACTION" > latest.json
+          scripts/sign-manifest.sh latest.json
+          gh release upload "$GITHUB_REF_NAME" latest.json latest.json.minisig --clobber

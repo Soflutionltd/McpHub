@@ -63,4 +63,5 @@ echo "  1. McpHub dashboard    # Library tab: add servers from the official MCP 
 echo "     or McpHub registry search postgres && McpHub registry install NAME"
 echo "  2. McpHub install      # start the daemon at login (launchd on macOS, systemd --user on Linux)"
 echo "  3. Point your agent at http://127.0.0.1:24680/mcp (token in ~/.McpHub/auth-token)"
+echo "  Updates install themselves once the daemon runs (signed releases; opt out with \"autoUpdate\": false in settings)."
 echo "  Moving from another machine?  McpHub sync export file --secrets   then   McpHub sync import file --secrets"
