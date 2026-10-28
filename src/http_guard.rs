@@ -83,10 +83,11 @@ pub fn token_matches(provided: &str, expected: &str) -> bool {
 pub fn bearer_token(headers: &HashMap<String, String>) -> Option<&str> {
     let v = headers.get("authorization")?;
     let v = v.trim();
-    if v.len() > 7 && v[..7].eq_ignore_ascii_case("bearer ") {
-        Some(v[7..].trim())
-    } else {
-        None
+    match (v.get(..7), v.get(7..)) {
+        (Some(scheme), Some(rest)) if scheme.eq_ignore_ascii_case("bearer ") && !rest.is_empty() => {
+            Some(rest.trim())
+        }
+        _ => None,
     }
 }
 
@@ -234,6 +235,15 @@ mod tests {
         assert!(!token_matches("", ""));
         assert!(token_is_current(&random_token().unwrap()));
         assert!(!token_is_current("mcphub_18d2f3a0b"));
+    }
+
+    #[test]
+    fn bearer_non_ascii_ne_panique_pas() {
+        assert_eq!(bearer_token(&h(&[("authorization", "Beareré x")])), None);
+        assert_eq!(bearer_token(&h(&[("authorization", "ééééé")])), None);
+        assert_eq!(bearer_token(&h(&[("authorization", "Bearer ")])), None);
+        assert_eq!(bearer_token(&h(&[("authorization", "Bearer é")])), Some("é"));
+        assert!(!api_authorized(&h(&[("authorization", "\u{FFFD}\u{FFFD}\u{FFFD}")]), None, "mcphub_abc"));
     }
 
     #[test]
