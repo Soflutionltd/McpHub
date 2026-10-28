@@ -1,5 +1,4 @@
-use serde_json::{json, Value};
-use std::fs;
+use serde_json::json;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
@@ -51,15 +50,13 @@ pub async fn run() {
         }
     }
 
-    println!("\nTesting connection... (simulated)");
-
-    // Read existing config
     let path = mcphub_dir().join("config.json");
-    let mut config: Value = if path.exists() {
-        let content = fs::read_to_string(&path).unwrap();
-        serde_json::from_str(&content).unwrap_or(json!({"mcpServers": {}}))
-    } else {
-        json!({"mcpServers": {}})
+    let mut config = match crate::config::read_raw(&path) {
+        Ok(c) => c.unwrap_or_else(|| json!({"mcpServers": {}})),
+        Err(e) => {
+            eprintln!("✗ {}", e);
+            std::process::exit(1);
+        }
     };
 
     let key = if config.get("servers").is_some() {
@@ -71,7 +68,10 @@ pub async fn run() {
         config[key] = json!({});
     }
 
-    let servers = config.get_mut(key).unwrap().as_object_mut().unwrap();
+    let Some(servers) = config.get_mut(key).and_then(|v| v.as_object_mut()) else {
+        eprintln!("✗ {} : \"{}\" n'est pas un objet", path.display(), key);
+        std::process::exit(1);
+    };
     servers.insert(
         name.clone(),
         json!({
@@ -81,10 +81,10 @@ pub async fn run() {
         }),
     );
 
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+    if let Err(e) = crate::config::write_raw_atomic(&path, &config) {
+        eprintln!("✗ {}", e);
+        std::process::exit(1);
     }
-    fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
 
     println!("✓ Added '{}' to {}", name, path.display());
     println!("Run 'McpHub generate' to rebuild cache if needed.");

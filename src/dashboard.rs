@@ -79,26 +79,18 @@ fn binary_path() -> PathBuf {
     })
 }
 
-fn read_config() -> Value {
-    let path = config_path();
-    if !path.exists() {
-        return json!({"mcpServers": {}, "settings": {"mode": "discover", "idleTimeout": 300}});
+/// L'erreur est déjà la réponse HTTP : une config illisible bloque toute modification.
+fn read_config() -> Result<Value, Vec<u8>> {
+    match crate::config::read_raw(&config_path()) {
+        Ok(Some(c)) => Ok(c),
+        Ok(None) => Ok(json!({"mcpServers": {}, "settings": {"mode": "discover", "idleTimeout": 300}})),
+        Err(e) => Err(json_err(409, &e)),
     }
-    fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| json!({"mcpServers": {}, "settings": {}}))
 }
 
-fn save_config(config: &Value) -> bool {
-    let path = config_path();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    serde_json::to_string_pretty(config)
-        .ok()
-        .and_then(|json| fs::write(&path, json).ok())
-        .is_some()
+fn save_config(config: &Value) -> Result<(), Vec<u8>> {
+    crate::config::write_raw_atomic(&config_path(), config)
+        .map_err(|e| json_err(500, &format!("Failed to save config: {}", e)))
 }
 
 fn read_cache() -> Option<Value> {
@@ -331,7 +323,10 @@ fn requested_profile(full_path: &str) -> Result<Option<String>, Vec<u8>> {
 // ─── API Handlers ────────────────────────────────────────────
 
 fn handle_get_servers() -> Vec<u8> {
-    let config = read_config();
+    let config = match read_config() {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
     let cache = read_cache();
     let servers_obj = config
         .get("mcpServers")
@@ -428,7 +423,10 @@ fn handle_add_server(body: &str) -> Vec<u8> {
 
     let env = data.get("env").cloned().unwrap_or(json!({}));
 
-    let mut config = read_config();
+    let mut config = match read_config() {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
     let key = if config.get("servers").is_some() {
         "servers"
     } else {
@@ -443,10 +441,9 @@ fn handle_add_server(body: &str) -> Vec<u8> {
         "env": env
     });
 
-    if save_config(&config) {
-        json_ok(json!({"ok": true, "message": "Server added"}))
-    } else {
-        json_err(500, "Failed to save config")
+    match save_config(&config) {
+        Ok(()) => json_ok(json!({"ok": true, "message": "Server added"})),
+        Err(resp) => resp,
     }
 }
 
@@ -456,7 +453,10 @@ fn handle_update_server(name: &str, body: &str) -> Vec<u8> {
         Err(_) => return json_err(400, "Invalid JSON"),
     };
 
-    let mut config = read_config();
+    let mut config = match read_config() {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
     let key = if config.get("servers").and_then(|v| v.as_object()).is_some() {
         "servers"
     } else {
@@ -497,15 +497,17 @@ fn handle_update_server(name: &str, body: &str) -> Vec<u8> {
         srv["env"] = env.clone();
     }
 
-    if save_config(&config) {
-        json_ok(json!({"ok": true}))
-    } else {
-        json_err(500, "Failed to save config")
+    match save_config(&config) {
+        Ok(()) => json_ok(json!({"ok": true})),
+        Err(resp) => resp,
     }
 }
 
 fn handle_delete_server(name: &str) -> Vec<u8> {
-    let mut config = read_config();
+    let mut config = match read_config() {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
     let key = if config.get("servers").and_then(|v| v.as_object()).is_some() {
         "servers"
     } else {
@@ -518,10 +520,9 @@ fn handle_delete_server(name: &str) -> Vec<u8> {
     if servers.remove(name).is_none() {
         return json_err(404, "Server not found");
     }
-    if save_config(&config) {
-        json_ok(json!({"ok": true}))
-    } else {
-        json_err(500, "Failed to save config")
+    match save_config(&config) {
+        Ok(()) => json_ok(json!({"ok": true})),
+        Err(resp) => resp,
     }
 }
 
@@ -535,7 +536,10 @@ fn handle_toggle_server(name: &str, body: &str) -> Vec<u8> {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let mut config = read_config();
+    let mut config = match read_config() {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
     let key = if config.get("servers").and_then(|v| v.as_object()).is_some() {
         "servers"
     } else {
@@ -556,15 +560,17 @@ fn handle_toggle_server(name: &str, body: &str) -> Vec<u8> {
             obj.remove("disabled");
         }
     }
-    if save_config(&config) {
-        json_ok(json!({"ok": true, "disabled": disabled}))
-    } else {
-        json_err(500, "Failed to save config")
+    match save_config(&config) {
+        Ok(()) => json_ok(json!({"ok": true, "disabled": disabled})),
+        Err(resp) => resp,
     }
 }
 
 fn handle_get_settings() -> Vec<u8> {
-    let config = read_config();
+    let config = match read_config() {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
     let settings = config
         .get("settings")
         .cloned()
@@ -592,7 +598,10 @@ fn handle_update_settings(body: &str) -> Vec<u8> {
         Ok(v) => v,
         Err(_) => return json_err(400, "Invalid JSON"),
     };
-    let mut config = read_config();
+    let mut config = match read_config() {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
     if let Some(existing) = config.get_mut("settings").and_then(|v| v.as_object_mut()) {
         if let Some(obj) = data.as_object() {
             for (k, v) in obj {
@@ -602,10 +611,9 @@ fn handle_update_settings(body: &str) -> Vec<u8> {
     } else {
         config["settings"] = data;
     }
-    if save_config(&config) {
-        json_ok(json!({"ok": true, "settings": config["settings"]}))
-    } else {
-        json_err(500, "Failed to save config")
+    match save_config(&config) {
+        Ok(()) => json_ok(json!({"ok": true, "settings": config["settings"]})),
+        Err(resp) => resp,
     }
 }
 
@@ -684,7 +692,10 @@ async fn handle_generate() -> Vec<u8> {
 // ─── Repair Handler ─────────────────────────────────────────
 
 async fn handle_repair_server(name: &str) -> Vec<u8> {
-    let config = read_config();
+    let config = match read_config() {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
     let key = if config.get("servers").and_then(|v| v.as_object()).is_some() {
         "servers"
     } else {

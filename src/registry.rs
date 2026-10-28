@@ -1664,12 +1664,7 @@ fn hub_config_path() -> PathBuf {
 }
 
 fn read_hub_config() -> Result<Value, String> {
-    let path = hub_config_path();
-    if !path.exists() {
-        return Ok(json!({"mcpServers": {}}));
-    }
-    let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    serde_json::from_str(&raw).map_err(|e| format!("{} is not valid JSON: {}", path.display(), e))
+    Ok(crate::config::read_raw(&hub_config_path())?.unwrap_or_else(|| json!({"mcpServers": {}})))
 }
 
 fn servers_key(config: &Value) -> &'static str {
@@ -1685,14 +1680,7 @@ fn servers_obj(config: &Value) -> Option<&Map<String, Value>> {
 }
 
 fn write_hub_config(config: &Value) -> Result<(), String> {
-    let path = hub_config_path();
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
-    let tmp = path.with_extension(format!("json.tmp{}", std::process::id()));
-    std::fs::write(&tmp, serde_json::to_string_pretty(config).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    crate::vault::restrict_permissions(&tmp);
-    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
+    crate::config::write_raw_atomic(&hub_config_path(), config)
 }
 
 /// Nom local libre dérivé du nom du registre ("io.github.acme/weather-mcp" -> "weather-mcp").

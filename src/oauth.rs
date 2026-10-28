@@ -921,7 +921,7 @@ pub async fn run_cli(args: &[String]) -> i32 {
                 return 1;
             }
             crate::vault::restrict_permissions(&backup_path);
-            match std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap_or_default()) {
+            match crate::config::write_raw_atomic(&path, &json) {
                 Ok(_) => {
                     println!(
                         "\n{} serveur(s) migre(s). Sauvegarde : {}\nRetour arriere d'un serveur : remettre son bloc _mcpRemote.",
