@@ -435,13 +435,13 @@ function renderGrid(){
     const errText=s.error||'';
     const shortErr=errText.length>60?errText.slice(0,57)+'...':errText;
     return `
-    <div class="card${s.disabled?' disabled':''}" onclick="openEdit('${s.name}')">
+    <div class="card${s.disabled?' disabled':''}" data-name="${esc(s.name)}" onclick="openEdit(this.dataset.name)">
       <div class="card-head">
         <div class="card-icon">${icon(s.name)}</div>
-        <div class="card-name">${s.name}</div>
+        <div class="card-name">${esc(s.name)}</div>
         <div class="card-dot ${s.status==='cached'?'dot-ok':'dot-fail'}"></div>
         <label class="toggle" onclick="event.stopPropagation()" title="${s.disabled?'Disabled':'Enabled'}">
-          <input type="checkbox" ${s.disabled?'':'checked'} onchange="toggleServer('${s.name}',this.checked)">
+          <input type="checkbox" ${s.disabled?'':'checked'} onchange="toggleServer(this.closest('.card').dataset.name,this.checked)">
           <div class="toggle-track"></div>
           <div class="toggle-knob"></div>
         </label>
@@ -449,8 +449,8 @@ function renderGrid(){
       <div class="card-meta">${s.disabled
         ?`<span style="color:var(--text-dim);font-size:11px">Disabled</span>`
         :s.status==='cached'
-        ?`<span>${s.tools} tools</span>`
-        :`<span style="color:var(--danger);font-size:11px">${shortErr||'Not cached'}</span>`
+        ?`<span>${esc(s.tools)} tools</span>`
+        :`<span style="color:var(--danger);font-size:11px">${esc(shortErr||'Not cached')}</span>`
       }</div>
       ${s.status!=='cached'&&!s.disabled?'<div style="font-size:10px;color:var(--accent);margin-top:4px;cursor:pointer">🔧 Click to diagnose</div>':''}
       <div class="card-cat">${cat(s.name)}</div>
@@ -462,7 +462,7 @@ function renderTools(){
   servers.forEach(s=>(s.toolNames||[]).forEach(t=>tools.push({name:t,server:s.name,desc:''})));
   if(q)tools=tools.filter(t=>t.name.toLowerCase().includes(q)||t.server.toLowerCase().includes(q));
   document.getElementById('tool-list').innerHTML=tools.slice(0,200).map(t=>`
-    <div class="tool-row"><span class="tool-name">${t.name}</span><span class="tool-server">${icon(t.server)} ${t.server}</span></div>`).join('');
+    <div class="tool-row"><span class="tool-name">${esc(t.name)}</span><span class="tool-server">${icon(t.server)} ${esc(t.server)}</span></div>`).join('');
 }
 
 function parseJsonInput(raw){
@@ -519,7 +519,7 @@ function openEdit(name){
   const rs=document.getElementById('repair-section');
   rs.innerHTML='';
   if(s.status==='cached'){
-    ib.innerHTML=`<div class="info-box info-ok"><div class="info-title">✓ ${s.tools} Tools Cached</div><div class="info-desc">${(s.toolNames||[]).slice(0,8).join(', ')}${s.toolNames&&s.toolNames.length>8?' + '+(s.toolNames.length-8)+' more':''}</div></div>`;
+    ib.innerHTML=cachedToolsBox(s);
     rb.style.display='none';
   }else{
     ib.innerHTML=`<div class="info-box info-fail"><div class="info-title">✗ Not Cached</div><div class="info-desc">Running diagnostics...</div></div>`;
@@ -530,6 +530,11 @@ function openEdit(name){
   document.getElementById('edit-modal').classList.remove('hidden');
 }
 function hideEditModal(){document.getElementById('edit-modal').classList.add('hidden');editingServerName=null}
+function cachedToolsBox(s){
+  const names=s.toolNames||[];
+  return `<div class="info-box info-ok"><div class="info-title">✓ ${esc(s.tools)} Tools Cached</div><div class="info-desc">${names.slice(0,8).map(esc).join(', ')}${names.length>8?' + '+(names.length-8)+' more':''}</div></div>`;
+}
+let pendingFix=null;
 
 async function repairServer(){
   if(!editingServerName)return;
@@ -543,28 +548,31 @@ async function repairServer(){
     const data=await res.json();
     
     if(data.ok){
-      rs.innerHTML=`<div class="info-box info-ok"><div class="info-title">✓ ${data.message||'Repaired!'}</div><div class="info-desc">Cache rebuilt successfully. Refresh to see changes.</div></div>`;
+      rs.innerHTML=`<div class="info-box info-ok"><div class="info-title">✓ ${esc(data.message||'Repaired!')}</div><div class="info-desc">Cache rebuilt successfully. Refresh to see changes.</div></div>`;
       notify('Server repaired!');
       await fetchServers();
       // Update the edit modal info
       const s=servers.find(x=>x.name===editingServerName);
       if(s&&s.status==='cached'){
-        document.getElementById('edit-info-box').innerHTML=`<div class="info-box info-ok"><div class="info-title">✓ ${s.tools} Tools Cached</div><div class="info-desc">${(s.toolNames||[]).slice(0,8).join(', ')}${s.toolNames&&s.toolNames.length>8?' + '+(s.toolNames.length-8)+' more':''}</div></div>`;
+        document.getElementById('edit-info-box').innerHTML=cachedToolsBox(s);
         rb.style.display='none';
       }
     }else{
-      let html=`<div class="info-box info-fail"><div class="info-title">✗ ${data.step.replace(/_/g,' ').toUpperCase()}</div><div class="info-desc">${data.error||'Unknown error'}</div>`;
-      if(data.detail)html+=`<pre style="margin-top:8px;font-size:10px;color:var(--text-dim);white-space:pre-wrap;font-family:monospace;background:var(--bg);padding:8px;border-radius:6px;max-height:120px;overflow-y:auto">${data.detail}</pre>`;
-      if(data.suggestion)html+=`<div style="margin-top:6px;font-size:11px;color:var(--accent)">💡 ${data.suggestion}</div>`;
+      const step=String(data.step||'error');
+      let html=`<div class="info-box info-fail"><div class="info-title">✗ ${esc(step.replace(/_/g,' ').toUpperCase())}</div><div class="info-desc">${esc(data.error||'Unknown error')}</div>`;
+      if(data.detail)html+=`<pre style="margin-top:8px;font-size:10px;color:var(--text-dim);white-space:pre-wrap;font-family:monospace;background:var(--bg);padding:8px;border-radius:6px;max-height:120px;overflow-y:auto">${esc(data.detail)}</pre>`;
+      if(data.suggestion)html+=`<div style="margin-top:6px;font-size:11px;color:var(--accent)">💡 ${esc(data.suggestion)}</div>`;
+      pendingFix=null;
       if(data.auto_fixable&&data.fix_command){
-        html+=`<button class="btn btn-primary" style="margin-top:10px;font-size:11px" onclick="autoFixCommand('${editingServerName}','${data.fix_command.replace(/'/g,"\\'")}')">⚡ Auto-fix: Update command path</button>`;
+        pendingFix={name:editingServerName,command:data.fix_command};
+        html+=`<button class="btn btn-primary" style="margin-top:10px;font-size:11px" onclick="pendingFix&&autoFixCommand(pendingFix.name,pendingFix.command)">⚡ Auto-fix: Update command path</button>`;
       }
       html+='</div>';
       rs.innerHTML=html;
-      notify('Repair failed: '+data.step,'danger');
+      notify('Repair failed: '+step,'danger');
     }
   }catch(e){
-    rs.innerHTML=`<div class="info-box info-fail"><div class="info-title">✗ Error</div><div class="info-desc">${e.message}</div></div>`;
+    rs.innerHTML=`<div class="info-box info-fail"><div class="info-title">✗ Error</div><div class="info-desc">${esc(e.message)}</div></div>`;
   }finally{
     rb.disabled=false;rb.innerHTML='🔧 Repair';
   }
@@ -616,10 +624,10 @@ async function regenerateCache(){
   try{
     const res=await fetch('/api/generate',{method:'POST'});const data=await res.json();
     let html='';
-    if(data.servers)for(const s of data.servers)html+=`<div class="gl ${s.ok?'gl-ok':'gl-err'}">${s.ok?'✓':'✗'} ${s.name} — ${s.ok?s.tools+' tools':'FAILED'}</div>`;
-    if(data.summary)html+=`<div class="gl gl-info">Done: ${data.summary.ok} OK, ${data.summary.failed} failed, ${data.summary.totalTools} tools</div>`;
+    if(data.servers)for(const s of data.servers)html+=`<div class="gl ${s.ok?'gl-ok':'gl-err'}">${s.ok?'✓':'✗'} ${esc(s.name)} — ${s.ok?esc(s.tools)+' tools':'FAILED'}</div>`;
+    if(data.summary)html+=`<div class="gl gl-info">Done: ${esc(data.summary.ok)} OK, ${esc(data.summary.failed)} failed, ${esc(data.summary.totalTools)} tools</div>`;
     log.innerHTML=html;notify('Cache regenerated');await fetchServers();
-  }catch(e){log.innerHTML=`<div class="gl gl-err">Error: ${e.message}</div>`}
+  }catch(e){log.innerHTML=`<div class="gl gl-err">Error: ${esc(e.message)}</div>`}
   finally{btn.disabled=false;btn.innerHTML='↻ Rebuild Cache';if(btn2)btn2.disabled=false}
 }
 
@@ -669,7 +677,7 @@ async function fetchMetrics(){
       const errRate=s.call_count>0?Math.round((s.error_count/s.call_count)*100):0;
       const avgLat=s.call_count>0?Math.round(s.total_latency_ms/s.call_count):0;
       return `<div class="card" style="cursor:default">
-        <div style="font-weight:600;font-size:14px;color:var(--accent);margin-bottom:8px">${icon(name)} ${name}</div>
+        <div style="font-weight:600;font-size:14px;color:var(--accent);margin-bottom:8px">${icon(name)} ${esc(name)}</div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:11px">
           <div><div style="color:var(--text-dim)">Calls</div><div style="font-size:14px;font-weight:600">${s.call_count}</div></div>
           <div><div style="color:var(--text-dim)">Errors</div><div style="font-size:14px;font-weight:600;color:${s.error_count>0?'var(--danger)':'var(--ok)'}">${s.error_count} <span style="font-size:10px;font-weight:400;opacity:0.8">(${errRate}%)</span></div></div>
@@ -703,7 +711,7 @@ function toggleLogs(){
           box.innerHTML+=`<div>${l}</div>`;
           box.scrollTop=box.scrollHeight;
         }else if(d.error){
-          box.innerHTML+=`<div style="color:var(--danger)">${d.error}</div>`;
+          box.innerHTML+=`<div style="color:var(--danger)">${esc(d.error)}</div>`;
         }
       }catch(err){}
     };
@@ -824,7 +832,7 @@ async function libInstall(){
       document.querySelectorAll('#lib-inputs input[data-key]').forEach(el=>{if(values[el.dataset.key])el.value=values[el.dataset.key]});
       err.textContent=res.message||'Some values are required';err.classList.remove('hidden');return;
     }
-    const oauth=res.oauth?`<button class="btn btn-primary" style="margin-top:10px;font-size:11px" onclick="libOauth('${esc(res.name)}')">Sign in (OAuth)</button>`:'';
+    const oauth=res.oauth?`<button class="btn btn-primary" style="margin-top:10px;font-size:11px" data-server="${esc(res.name)}" onclick="libOauth(this.dataset.server)">Sign in (OAuth)</button>`:'';
     document.getElementById('lib-m-result').innerHTML=`<div class="info-box info-ok"><div class="info-title">✓ Added as ${esc(res.name)}</div><div class="info-desc">${res.kind==='remote'?'Remote server, no local code.':res.sandbox==='shield'?'Runs in the McpHub sandbox (shield): no access to your keys, browsers or editor configs.':res.kind==='oci'?'Runs in its Docker container.':'Runs with your global sandbox settings.'} Tools are pinned on first contact, every call is audited.${(res.secretsStored||[]).length?' Secrets stored: '+res.secretsStored.map(esc).join(', ')+'.':''}</div>${oauth}</div>`;
     btn.classList.add('hidden');notify(res.name+' added');libMissing=[];
     d.installed=res.name;const it=libItems.find(x=>x.name===d.name);if(it)it.installed=res.name;libRender();
