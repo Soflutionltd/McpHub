@@ -1,6 +1,11 @@
 #!/bin/sh
-# Starts the McpHub binary that matches this machine (macOS universal, Linux x64 or arm64).
-dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# Prefers the McpHub installed on this machine, which its daemon keeps up to date; otherwise
+# starts the binary bundled with this extension (macOS universal, Linux x64 or arm64).
+installed="${MCPHUB_INSTALL_DIR:-$HOME/.local/bin}/McpHub"
+if [ -x "$installed" ]; then
+  exec "$installed" "$@"
+fi
+dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 case "$(uname -s)" in
   Darwin) bin="$dir/darwin/McpHub" ;;
   Linux)

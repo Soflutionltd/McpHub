@@ -14,7 +14,7 @@ import re
 import sys
 import time
 
-ASSET = re.compile(r"^(McpHub-.+\.(tar\.gz|zip)|mcphub\.mcpb|mcphub-client\.mjs)$")
+ASSET = re.compile(r"^(McpHub-.+\.(tar\.gz|zip)|mcphub-client\.mjs)$")
 
 
 def sha256(path):

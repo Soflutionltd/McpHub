@@ -1,8 +1,9 @@
 name: Release
 
 # Un tag vX.Y.Z publie la release : binaires macOS signés (Developer ID) et notarisés, Linux,
-# Windows, client Node en un fichier, extension Claude Desktop (.mcpb), puis latest.json signé
-# avec minisign, que les démons installés lisent pour se mettre à jour.
+# Windows, client Node en un fichier, puis latest.json signé avec minisign, que les démons
+# installés lisent pour se mettre à jour. L'extension Claude Desktop (.mcpb) est construite
+# ensuite par mcp-registry.yml à partir de .mcp/.
 #
 # Déploiement d'une release déjà publiée (sur le tag, pas sur une branche) :
 #   gh workflow run release.yml --ref vX.Y.Z -f action=pause|resume|full
@@ -196,24 +197,10 @@ jobs:
         with:
           path: artifacts
 
-      - name: Claude Desktop extension (.mcpb)
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          mkdir -p mcpb/server/darwin mcpb/server/linux-x64 mcpb/server/linux-arm64 mcpb/server/win32
-          tar xzf artifacts/macos/McpHub-macos-universal.tar.gz -C mcpb/server/darwin
-          tar xzf artifacts/McpHub-linux-amd64.tar.gz/McpHub-linux-amd64.tar.gz -C mcpb/server/linux-x64
-          tar xzf artifacts/McpHub-linux-arm64.tar.gz/McpHub-linux-arm64.tar.gz -C mcpb/server/linux-arm64
-          unzip -q artifacts/McpHub-windows-amd64.zip/McpHub-windows-amd64.zip -d mcpb/server/win32
-          cp packaging/mcpb/run.sh mcpb/server/run.sh
-          chmod +x mcpb/server/run.sh mcpb/server/*/McpHub
-          jq --arg v "$version" '.version = $v' packaging/mcpb/manifest.json > mcpb/manifest.json
-          (cd mcpb && zip -qr ../mcphub.mcpb manifest.json server)
-
       - name: Collect assets
         run: |
           mkdir -p dist
           find artifacts -type f \( -name 'McpHub-*' -o -name 'mcphub-client.mjs' \) -exec cp {} dist/ \;
-          mv mcphub.mcpb dist/
           (cd dist && for f in McpHub-*; do sha256sum "$f" > "$f.sha256"; done)
           ls -la dist
 
