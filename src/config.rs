@@ -56,6 +56,8 @@ pub struct ProxyConfig {
     pub guard: crate::toolguard::GuardConfig,
     /// Code mode (`mcphub_run`).
     pub code_mode: crate::codemode::CodeModeConfig,
+    /// Mise à jour automatique depuis les releases signées (`settings.autoUpdate`).
+    pub auto_update: bool,
 }
 
 impl Default for ProxyConfig {
@@ -75,6 +77,7 @@ impl Default for ProxyConfig {
             audit: crate::audit::AuditConfig::default(),
             guard: crate::toolguard::GuardConfig::default(),
             code_mode: crate::codemode::CodeModeConfig::default(),
+            auto_update: true,
         }
     }
 }
@@ -499,6 +502,11 @@ fn config_from_json(json: &Value, source_path: Option<&Path>) -> Result<ProxyCon
                 config.health_notifications = notify;
             }
         }
+        if let Some(auto_update) = settings.get("autoUpdate") {
+            config.auto_update = auto_update
+                .as_bool()
+                .ok_or("settings.autoUpdate doit valoir true ou false")?;
+        }
         if let Some(permissions) = settings.get("permissions") {
             config.permissions = crate::permissions::PermissionsConfig::from_json(permissions)?;
         }
@@ -713,9 +721,18 @@ mod tests {
         fs::write(&path, r#"{"servers": {}, "settings": {"permissions": {"rules": [{"action": "dney"}]}}}"#).unwrap();
         assert!(matches!(load_dedicated_from_path(&path), Dedicated::Invalid(_)));
 
+        fs::write(&path, r#"{"servers": {}, "settings": {"autoUpdate": "no"}}"#).unwrap();
+        assert!(matches!(load_dedicated_from_path(&path), Dedicated::Invalid(_)));
+
+        fs::write(&path, r#"{"servers": {}, "settings": {"autoUpdate": false}}"#).unwrap();
+        match load_dedicated_from_path(&path) {
+            Dedicated::Valid(c) => assert!(!c.auto_update),
+            _ => panic!("autoUpdate: false est valide"),
+        }
+
         fs::write(&path, r#"{"servers": {}}"#).unwrap();
         match load_dedicated_from_path(&path) {
-            Dedicated::Valid(c) => assert!(c.servers.is_empty()),
+            Dedicated::Valid(c) => assert!(c.servers.is_empty() && c.auto_update),
             _ => panic!("une config sans serveur est valide"),
         }
         fs::remove_dir_all(&dir).unwrap();
