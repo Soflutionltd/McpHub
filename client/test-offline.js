@@ -79,7 +79,7 @@ const client = new Client({ name: 'mcphub-offline-test', version: '1.0.0' });
 await client.connect(
   new StdioClientTransport({
     command: process.execPath,
-    args: ['index.js'],
+    args: [process.env.MCPHUB_CLIENT_ENTRY ?? 'index.js'],
     cwd: new URL('.', import.meta.url).pathname,
     env: {
       ...process.env,
