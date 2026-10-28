@@ -73,8 +73,8 @@ impl SearchEngine {
 
         // Phase 1: tokenize and compute term frequencies
         for (idx, tool) in self.tools.iter().enumerate() {
-            let text =
-                format!("{} {} {}", tool.original_name, tool.name, tool.description).to_lowercase();
+            // Pas de minuscules ici : tokenize découpe le camelCase avant de les appliquer.
+            let text = format!("{} {} {}", tool.original_name, tool.name, tool.description);
 
             let terms = tokenize(&text);
             let mut tf: HashMap<String, f64> = HashMap::new();
@@ -147,7 +147,7 @@ impl SearchEngine {
             return Vec::new();
         }
 
-        let query_terms = tokenize(&query.to_lowercase());
+        let query_terms = tokenize(query);
         if query_terms.is_empty() {
             return self
                 .tools
@@ -277,7 +277,7 @@ impl SearchEngine {
             return None;
         }
 
-        let query_terms = tokenize(&query.to_lowercase());
+        let query_terms = tokenize(query);
         let mut server_best_scores: HashMap<String, i32> = HashMap::new();
         let mut exact_match_servers = HashSet::new();
 
@@ -429,6 +429,19 @@ mod tests {
         assert!(terms.contains(&"read".to_string()));
         assert!(terms.contains(&"file".to_string()));
         assert!(terms.contains(&"disk".to_string()));
+    }
+
+    #[test]
+    fn camel_case_tool_found_through_the_index() {
+        let mut engine = SearchEngine::new();
+        engine.build_index(vec![
+            mock_tool("getUserProfile", "Returns data"),
+            mock_tool("listOrders", "Returns data"),
+        ]);
+        let results = engine.search("user profile", 5);
+        assert_eq!(results.first().map(|t| t.original_name.as_str()), Some("getUserProfile"));
+        let results = engine.search("orders", 5);
+        assert_eq!(results.first().map(|t| t.original_name.as_str()), Some("listOrders"));
     }
 
     #[test]

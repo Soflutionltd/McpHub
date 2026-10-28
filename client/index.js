@@ -555,8 +555,8 @@ async function readSchemaServers() {
 
 function tokenize(value) {
   return value
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
     .toLowerCase()
-    .replace(/([a-z])([A-Z])/g, '$1 $2')
     .split(/[^a-z0-9]+/)
     .filter(Boolean);
 }

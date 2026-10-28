@@ -1221,11 +1221,11 @@ impl ProxyServer {
             } else {
                 None
             };
-            // Fetch enough results to honor offset + top_k. Cap at 50 to avoid blowing memory.
-            let fetch_limit = (offset + top_k).min(50);
+            // Tous les résultats classés (des références, quelques milliers au plus) : le filtre de
+            // profil passe avant la pagination, et offset/has_more restent justes au-delà de 50.
             let results = engine.search_filtered_with_usage(
                 query,
-                fetch_limit,
+                engine.tool_count(),
                 allowed_servers.as_ref(),
                 &usage_boost,
             );
