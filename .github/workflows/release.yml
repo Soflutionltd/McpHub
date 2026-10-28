@@ -65,6 +65,8 @@ jobs:
           cd target/${{ matrix.target }}/release
           Compress-Archive -Path McpHub.exe -DestinationPath ../../../${{ matrix.asset }}
           cd ../../..
+          $hash = (Get-FileHash -Algorithm SHA256 ${{ matrix.asset }}).Hash.ToLower()
+          "$hash  ${{ matrix.asset }}" | Out-File -Encoding ascii -NoNewline ${{ matrix.asset }}.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

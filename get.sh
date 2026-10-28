@@ -28,15 +28,15 @@ trap 'rm -rf "$TMP"' EXIT
 
 echo "Downloading McpHub ($VERSION, $ASSET)..."
 curl -fsSL "$BASE/$ASSET" -o "$TMP/$ASSET"
-if curl -fsSL "$BASE/$ASSET.sha256" -o "$TMP/$ASSET.sha256" 2>/dev/null; then
-  echo "Verifying checksum..."
-  if command -v sha256sum >/dev/null; then
-    (cd "$TMP" && sha256sum -c "$ASSET.sha256" >/dev/null)
-  else
-    (cd "$TMP" && shasum -a 256 -c "$ASSET.sha256" >/dev/null)
-  fi
+if ! curl -fsSL "$BASE/$ASSET.sha256" -o "$TMP/$ASSET.sha256"; then
+  echo "No checksum published for $ASSET: refusing to install an unverified binary." >&2
+  exit 1
+fi
+echo "Verifying checksum..."
+if command -v sha256sum >/dev/null; then
+  (cd "$TMP" && sha256sum -c "$ASSET.sha256" >/dev/null)
 else
-  echo "No checksum published for this asset, skipping verification."
+  (cd "$TMP" && shasum -a 256 -c "$ASSET.sha256" >/dev/null)
 fi
 
 tar -xzf "$TMP/$ASSET" -C "$TMP"
