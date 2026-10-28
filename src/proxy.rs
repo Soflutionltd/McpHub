@@ -1554,9 +1554,22 @@ impl ProxyServer {
                             "tool": msg.get("tool").cloned().unwrap_or_default(),
                             "arguments": msg.get("args").cloned().unwrap_or(serde_json::json!({})),
                         });
-                        let resp = CODE_RUN
-                            .scope(run_state.clone(), Box::pin(self.handle_execute(None, call_args)))
-                            .await;
+                        // Le délai couvre aussi les appels : un outil lent ne prolonge pas
+                        // l'exécution au-delà de timeout_secs.
+                        let Ok(resp) = tokio::time::timeout_at(
+                            deadline,
+                            CODE_RUN.scope(run_state.clone(), Box::pin(self.handle_execute(None, call_args))),
+                        )
+                        .await
+                        else {
+                            outcome = Err(format!(
+                                "temps depasse ({} s) pendant l'appel {}/{} : son issue est inconnue, ne pas le relancer sans verifier",
+                                timeout_secs,
+                                msg.get("server").and_then(|v| v.as_str()).unwrap_or("?"),
+                                msg.get("tool").and_then(|v| v.as_str()).unwrap_or("?"),
+                            ));
+                            break;
+                        };
                         match (resp.result, resp.error) {
                             (_, Some(err)) => serde_json::json!({"id": req_id, "ok": false, "error": err.message}),
                             (Some(res), None) => {
@@ -1581,7 +1594,12 @@ impl ProxyServer {
                     if let Some(server) = msg.get("server").filter(|v| v.is_string()) {
                         search_args["server"] = server.clone();
                     }
-                    let resp = Box::pin(self.handle_discover(None, search_args)).await;
+                    let Ok(resp) =
+                        tokio::time::timeout_at(deadline, Box::pin(self.handle_discover(None, search_args))).await
+                    else {
+                        outcome = Err(format!("temps depasse ({} s) pendant une recherche", timeout_secs));
+                        break;
+                    };
                     let result = resp
                         .result
                         .as_ref()
