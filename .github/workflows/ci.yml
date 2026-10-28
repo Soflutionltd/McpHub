@@ -23,6 +23,14 @@ jobs:
           RUSTFLAGS: -D warnings
         run: cargo test --locked
 
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --locked
+
   client:
     runs-on: ubuntu-latest
     steps:
