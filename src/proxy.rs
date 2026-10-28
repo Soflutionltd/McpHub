@@ -1,7 +1,7 @@
 /// Core proxy server: reads JSON-RPC from stdin, routes to child servers.
 /// Two modes: discover (2 meta-tools) or passthrough (all tools exposed).
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
@@ -196,6 +196,23 @@ pub struct ProxyServer {
     response_cache: Arc<ResponseCache>,
     confirmations: Arc<ConfirmStore>,
     audit: Arc<AuditLogger>,
+    /// Requêtes en cours : le redémarrage après une mise à jour attend qu'il n'y en ait plus.
+    in_flight: Arc<AtomicUsize>,
+}
+
+struct InFlight(Arc<AtomicUsize>);
+
+impl InFlight {
+    fn enter(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter.clone())
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Résultat du contrôle de permission avant un appel d'outil.
@@ -227,7 +244,12 @@ impl ProxyServer {
             response_cache: Arc::new(ResponseCache::new()),
             confirmations: Arc::new(ConfirmStore::new()),
             audit: Arc::new(AuditLogger::new(crate::audit::default_path())),
+            in_flight: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
     }
 
     async fn audit_config(&self) -> AuditConfig {
@@ -864,6 +886,7 @@ impl ProxyServer {
     }
 
     pub async fn handle_request(&self, req: JsonRpcRequest) -> Option<JsonRpcResponse> {
+        let _in_flight = InFlight::enter(&self.in_flight);
         match req.method.as_str() {
             "initialize" => Some(self.handle_initialize(req.id, req.params).await),
             "notifications/initialized" => None,
