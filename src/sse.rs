@@ -36,6 +36,8 @@ const SESSION_TIMEOUT_SECS: u64 = 300;
 const REAPER_INTERVAL_SECS: u64 = 60;
 /// SSE keepalive interval.
 const KEEPALIVE_INTERVAL_SECS: u64 = 15;
+/// Attente maximale d'une place dans le canal d'une session avant de la fermer.
+const SEND_TIMEOUT_SECS: u64 = 30;
 
 impl SseManager {
     pub fn new() -> Self {
@@ -155,10 +157,16 @@ impl SseManager {
 
         let has_id = request.id.is_some();
 
-        // Process through proxy
-        let profile = {
+        // Session vérifiée AVANT d'exécuter : un 404 garantit au client que rien n'a tourné
+        // (il peut alors renvoyer la requête sans risque de double exécution).
+        let (profile, tx) = {
             let sessions = self.sessions.lock().await;
-            sessions.get(session_id).and_then(|s| s.profile.clone())
+            match sessions.get(session_id) {
+                Some(s) => (s.profile.clone(), s.tx.clone()),
+                None => {
+                    return http_response(404, "Not Found", "{\"error\":\"Session not found\"}")
+                }
+            }
         };
         let response = proxy.handle_request_in_profile(request, profile).await;
 
@@ -178,29 +186,32 @@ impl SseManager {
 
             let event = format!("event: message\ndata: {}\n\n", json);
 
-            // Update last_activity and send via channel
-            let mut sessions = self.sessions.lock().await;
-            if let Some(session) = sessions.get_mut(session_id) {
-                session.last_activity = Instant::now();
-                // try_send: non-blocking, if channel full the client is too slow
-                match session.tx.try_send(event) {
-                    Ok(_) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        eprintln!(
-                            "[McpHub][SSE] Session {} channel full, dropping message",
-                            session_id
-                        );
-                        // Don't kill the session, just drop this message
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        drop(sessions);
-                        // Session is dead, clean it up
-                        self.sessions.lock().await.remove(session_id);
-                        return http_response(410, "Gone", "{\"error\":\"Session closed\"}");
-                    }
+            touch_session(&self.sessions, session_id).await;
+            // Une réponse jetée laisserait le client attendre jusqu'à son délai. Canal plein trop
+            // longtemps = client bloqué : la session est fermée, le client voit la coupure.
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(SEND_TIMEOUT_SECS),
+                tx.send(event),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    self.sessions.lock().await.remove(session_id);
+                    return http_response(410, "Gone", "{\"error\":\"Session closed\"}");
                 }
-            } else {
-                return http_response(404, "Not Found", "{\"error\":\"Session not found\"}");
+                Err(_) => {
+                    eprintln!(
+                        "[McpHub][SSE] Session {} : client trop lent ({} s), session fermee",
+                        session_id, SEND_TIMEOUT_SECS
+                    );
+                    self.sessions.lock().await.remove(session_id);
+                    return http_response(
+                        503,
+                        "Service Unavailable",
+                        "{\"error\":\"Client too slow, session closed\"}",
+                    );
+                }
             }
         }
 
@@ -313,6 +324,21 @@ fn http_response(status: u16, status_text: &str, body: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn session_inconnue_refusee_avant_execution() {
+        let proxy = Arc::new(ProxyServer::new(crate::config::ProxyConfig {
+            audit: crate::audit::AuditConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        let manager = SseManager::new();
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mcphub_status","arguments":{}}}"#;
+        let response = manager.handle_message("absente", body, &proxy).await;
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 404"));
+    }
 
     #[tokio::test]
     async fn touch_session_refreshes_activity_for_keepalive() {
