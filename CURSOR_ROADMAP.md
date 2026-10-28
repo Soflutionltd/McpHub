@@ -44,6 +44,38 @@ src/
 - CI builds for macOS ARM, macOS Intel, Linux amd64
 - Dashboard with add/edit/toggle/rebuild servers
 
+## Reliability pass (branch `wip/fiabilite`, 2026-10-28)
+
+Invariants now enforced by tests. Do not regress them:
+
+- A `tools/call` that may have reached the child (timeout after send, child died after send) is never
+  replayed, neither by the daemon nor by the Node client. Only a call proven unsent is retried. Reads
+  (`prompts/get`, `resources/read`, `ping`) may be retried after a restart.
+- Every failure carries a status: `ok`, `error`, `not_executed`, `unknown_outcome`,
+  `confirmation_required` (`_meta.mcphub.status`, `_mcphub.status`, `error.data.status`).
+- Config is Missing, Invalid or Valid. An invalid file is never overwritten and never replaces the last
+  valid config on reload. Writes are atomic (new 600 file, fsync, rename).
+- Unknown sandbox or permission values are errors, never a silent "off" or "allow".
+- Agent installs (`registry_install`) ask for confirmation unless a rule says otherwise.
+- The response cache skips errors, is bounded in size, and is invalidated per server on mutating calls
+  and on every restart (epoch).
+- Only implemented MCP revisions are announced (`src/protocol.rs`).
+- `McpHub update` never downgrades, requires the published SHA-256, checks `--version` of the new binary
+  and rolls back on failure.
+
+Next, not done yet:
+
+- Persistent stdio reader per child: real cancellation (`notifications/cancelled` forwarded) and several
+  requests in flight per server.
+- Per-client credentials instead of one shared bearer token.
+- Paginated or resource-backed large results.
+- Native MCP revision 2026-07-28 (stateless, `server/discover`).
+- `GET /api/servers` returns env values: mask them. `McpHub install` prints the bearer token.
+- Toolguard and Code Mode settings are still parsed leniently.
+- Dashboard and registry read-modify-write `config.json` without a lock.
+- A profile change does not invalidate the response cache.
+- Reproducible benchmark protocol.
+
 ## IMPROVEMENTS TO IMPLEMENT
 
 Work through these in order. Each one should be a separate git commit with a clear message.
@@ -114,7 +146,9 @@ Also handle SIGTERM on Unix:
 - `McpHub install` should print the token
 - Cursor config becomes: `"url": "http://127.0.0.1:24680/sse"` with `"headers": {"Authorization": "Bearer <token>"}`
 
-#### 5. Retry on tools/call failure
+#### 5. Retry on tools/call failure (superseded)
+**Superseded by the reliability pass:** retrying a call that may already have run executes it twice
+(an email sent twice, a payment made twice). Only an unsent call is retried.
 **File:** `src/child.rs`, function `call_tool`
 **Problem:** If a child server crashes during a tool call, user gets an error. Server could be restarted and call retried.
 **Fix:** In `call_tool`, if the result is a write/read error (not an MCP error response), restart the server and retry once:
