@@ -54,7 +54,7 @@ USAGE:
   McpHub install      Register McpHub to auto-start at login
   McpHub uninstall    Remove auto-start registration
   McpHub status       Show detected servers, cache, and health config
-  McpHub doctor       Run full diagnostic of the installation
+  McpHub doctor       Run full diagnostic of the installation (--json for scripts)
   McpHub logs         Tail daemon logs in real time
   McpHub add          Interactively add a new server
   McpHub benchmark    Measure server startup plus discover routing quality
@@ -317,7 +317,7 @@ async fn main() {
         Some("help") | Some("--help") | Some("-h") => print_help(),
         Some("version") | Some("--version") | Some("-V") => println!("McpHub v{}", VERSION),
         Some("status") => cmd_status(),
-        Some("doctor") => doctor::run(),
+        Some("doctor") => doctor::run(args.iter().skip(2).any(|a| a == "--json")),
         Some("logs") => {
             let mut server = None;
             let mut level = None;
