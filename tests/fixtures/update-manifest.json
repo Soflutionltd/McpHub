@@ -1,0 +1,13 @@
+{
+  "assets": {
+    "McpHub-macos-universal.tar.gz": "a9fd078562420a276b6902ca3d8bf583c0366e38af72e23be99b16035a76b39a",
+    "mcphub-client.mjs": "948fe603f61dc036b5c596dc09fe3ce3f3d30dc90f024c85f3c82db2ccab679d"
+  },
+  "paused": false,
+  "published_at": 1793157852,
+  "rollout": {
+    "full_at": 1793244252,
+    "percent": 10
+  },
+  "version": "9.0.0"
+}

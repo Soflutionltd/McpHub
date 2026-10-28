@@ -70,7 +70,7 @@ USAGE:
   McpHub pins         Tool pinning (anti rug-pull): list, status, approve SERVER [TOOL], reset SERVER, scan
   McpHub registry     Library of the official MCP Registry: search, info, install, uninstall
   McpHub sync         Move the config to another machine with no plaintext secret (export, import)
-  McpHub update       Self-update to the latest version on GitHub
+  McpHub update       Install the latest signed release now (--check: only report it)
   McpHub version      Show version
   McpHub help         Show this help
 
@@ -274,9 +274,11 @@ async fn cmd_stdio() {
 /// Used by `McpHub serve` and auto-start (install).
 async fn cmd_serve() {
     eprintln!("McpHub v{} — serve mode (HTTP only)", VERSION);
+    update::startup_guard();
     let config = auto_detect();
     let proxy = std::sync::Arc::new(ProxyServer::new(config));
     proxy.init().await;
+    update::spawn_daemon_tasks(proxy.clone());
     eprintln!(
         "[McpHub][SERVE] Ready. Waiting for SSE connections on http://127.0.0.1:{}/sse",
         instance::port()
@@ -348,7 +350,7 @@ async fn main() {
         Some("dashboard") | Some("ui") | Some("web") => dashboard::start_dashboard().await,
         Some("install") => install::install(),
         Some("uninstall") => install::uninstall(),
-        Some("update") => update::run(),
+        Some("update") => update::run(args.iter().skip(2).any(|a| a == "--check")).await,
         Some("serve") => cmd_serve().await,
         Some("stdio") => cmd_stdio().await,
         Some("search") => {
