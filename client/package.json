@@ -6,7 +6,8 @@
   "main": "index.js",
   "scripts": {
     "check": "node --check index.js",
-    "test": "node test.js"
+    "test": "node test.js",
+    "test:offline": "node test-offline.js"
   },
   "keywords": [],
   "author": "",

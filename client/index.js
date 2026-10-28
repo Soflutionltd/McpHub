@@ -275,7 +275,6 @@ async function resetHubConnection() {
 
 // Une erreur JSON-RPC renvoyée par le hub (outil inconnu, arguments invalides,
 // échec métier) est une réponse valide : on ne doit ni reconnecter ni rejouer.
-// Seules les coupures de transport et les timeouts justifient un retry.
 function isTransportFailure(error) {
   if (!(error instanceof McpError)) return true;
   return (
@@ -284,10 +283,43 @@ function isTransportFailure(error) {
   );
 }
 
-async function callHubTool(name, args, retry = true) {
+// La requête n'a jamais atteint le hub : transport fermé avant l'envoi, connexion
+// refusée, ou session SSE inconnue (le démon la refuse avant toute exécution).
+// Une coupure ou un timeout après l'envoi ne garantit rien : l'outil a pu s'exécuter.
+const connectionRefusedCodes = new Set(['ECONNREFUSED', 'ENOENT', 'ENOTFOUND', 'EAI_AGAIN']);
+
+function requestNeverReachedHub(error) {
+  if (error instanceof McpError) return false;
+  const message = errorMessage(error);
+  if (message === 'Not connected') return true;
+  if (message.startsWith('Error POSTing to endpoint (HTTP 404)')) return true;
+  return connectionRefusedCodes.has(error?.cause?.code ?? error?.code);
+}
+
+class UnknownOutcomeError extends Error {
+  constructor(name, cause) {
+    super(
+      `[issue inconnue] ${name} : la requête a été envoyée au hub mais aucune réponse n'est arrivée (${errorMessage(cause)}). ` +
+        "L'action a pu s'exécuter : vérifier son effet avant de relancer."
+    );
+    this.status = 'unknown_outcome';
+  }
+}
+
+// `replaySafe` : lecture pure (recherche, recall MemoryPilot), rejouable même après
+// une coupure. Les appels d'outils et le code mode ne sont jamais rejoués une fois
+// envoyés.
+async function callHubTool(name, args, { replaySafe = false, retry = true } = {}) {
+  let connection;
   try {
-    const { client } = await connectHub();
-    const result = await client.callTool(
+    connection = await connectHub();
+  } catch (error) {
+    if (!retry) throw error;
+    await resetHubConnection();
+    return callHubTool(name, args, { replaySafe, retry: false });
+  }
+  try {
+    const result = await connection.client.callTool(
       { name, arguments: args },
       undefined,
       {
@@ -300,9 +332,13 @@ async function callHubTool(name, args, retry = true) {
     markUsageDirty();
     return result;
   } catch (error) {
-    if (!retry || !isTransportFailure(error)) throw error;
+    if (!isTransportFailure(error)) throw error;
     await resetHubConnection();
-    return callHubTool(name, args, false);
+    if (retry && (replaySafe || requestNeverReachedHub(error))) {
+      return callHubTool(name, args, { replaySafe, retry: false });
+    }
+    if (requestNeverReachedHub(error)) throw error;
+    throw new UnknownOutcomeError(name, error);
   }
 }
 
@@ -424,7 +460,7 @@ function recallContext(projectName, workspace, hints) {
       compact: true
     },
     bypass_cache: true
-  })
+  }, { replaySafe: true })
     .then((result) => ({ memory: extractText(result) }))
     .catch((error) => ({ memoryError: errorMessage(error) }))
     .finally(() => pendingBootstraps.delete(key));
@@ -472,18 +508,31 @@ function filterSearchResult(result, projectName, projectConfig, workingDirectory
 const unknownToolPattern = /\bUnknown tool '([^']+)' on server '([^']+)'/i;
 const unknownServerPattern = /\bUnknown server:? '?([^'\s]+)'?/i;
 
+// État réel d'un appel : ok, error, not_executed, unknown_outcome,
+// confirmation_required. `isError` seul ne le dit pas (une demande de
+// confirmation n'est pas une erreur, mais rien n'a été exécuté).
 function errorToResult(error) {
-  return textResult(errorMessage(error), true);
+  const status = error?.status ?? error?.data?.status ?? 'error';
+  return { ...textResult(errorMessage(error), true), _meta: { mcphub: { status } } };
 }
 
-async function callChildWithSuggestions({ server, tool, args, bypass_cache, visible }) {
+function callStatus(result) {
+  return (
+    result._meta?.mcphub?.status ??
+    result._mcphub?.status ??
+    (result.isError ? 'error' : 'ok')
+  );
+}
+
+async function callChildWithSuggestions({ server, tool, args, bypass_cache, confirmation_token, visible }) {
   let result;
   try {
     result = await callHubTool('mcphub_call', {
       server,
       tool,
       arguments: args,
-      bypass_cache
+      bypass_cache,
+      ...(confirmation_token ? { confirmation_token } : {})
     });
   } catch (error) {
     if (!(error instanceof McpError)) throw error;
@@ -694,7 +743,14 @@ server.registerTool(
   },
   async ({ project, working_dir, hints }) => {
     const [projectName, projectConfig] = resolveProject(project, working_dir);
-    const workspace = projectConfig?.workspaces[0] ?? working_dir;
+    // Le dossier de travail réel d'abord : un projet à plusieurs workspaces ne doit
+    // pas rappeler la mémoire du premier quand on travaille dans un autre.
+    const candidate = working_dir ? normalize(working_dir) : undefined;
+    const workspace =
+      (candidate &&
+        projectConfig?.workspaces.find((root) => insideWorkspace(candidate, root))) ??
+      working_dir ??
+      projectConfig?.workspaces[0];
     if (!workspace) {
       return textResult(
         { project: null, error: 'working_dir is required when no McpHub project mapping matches.' },
@@ -754,7 +810,7 @@ server.registerTool(
     usage.searches += 1;
     markUsageDirty();
     try {
-      const result = await callHubTool('mcphub_search', args);
+      const result = await callHubTool('mcphub_search', args, { replaySafe: true });
       return filterSearchResult(result, projectName, projectConfig, working_dir);
     } catch (error) {
       return textResult(errorMessage(error), true);
@@ -772,6 +828,10 @@ server.registerTool(
       tool: z.string(),
       arguments: z.record(z.string(), z.unknown()).optional(),
       bypass_cache: z.boolean().optional(),
+      confirmation_token: z
+        .string()
+        .optional()
+        .describe('Token returned by a CONFIRMATION REQUISE answer, only after the user explicitly agreed.'),
       ...projectFields
     }
   },
@@ -780,6 +840,7 @@ server.registerTool(
     tool,
     arguments: args = {},
     bypass_cache,
+    confirmation_token,
     project,
     working_dir
   }) => {
@@ -800,10 +861,11 @@ server.registerTool(
         tool,
         args: securedArgs,
         bypass_cache,
+        confirmation_token,
         visible: serverVisibility(projectConfig, working_dir)
       });
     } catch (error) {
-      return textResult(errorMessage(error), true);
+      return errorToResult(error);
     }
   }
 );
@@ -853,15 +915,25 @@ server.registerTool(
             bypass_cache: call.bypass_cache,
             visible: serverVisibility(projectConfig, working_dir)
           });
+          const status = callStatus(result);
           return {
             id: call.id,
-            ok: !result.isError,
-            result: extractText(result)
+            ok: status === 'ok',
+            status,
+            result: extractText(result),
+            ...(result.structuredContent ? { structuredContent: result.structuredContent } : {}),
+            ...(status === 'confirmation_required'
+              ? {
+                  confirmation_token:
+                    result._meta?.mcphub?.confirmation_token ?? result._mcphub?.confirmation_token
+                }
+              : {})
           };
         } catch (error) {
           return {
             id: call.id,
             ok: false,
+            status: error?.status ?? error?.data?.status ?? 'error',
             error: errorMessage(error)
           };
         }
