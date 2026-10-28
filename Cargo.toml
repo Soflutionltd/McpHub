@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["SOFLUTION LTD"]
 description = "Fastest MCP proxy — BM25 tool discovery + SSE transport + auto-start. Single binary, zero deps."
 license = "MIT"
-repository = "https://github.com/Soflution1/McpHub"
+repository = "https://github.com/Soflutionltd/McpHub"
 keywords = ["mcp", "cursor", "proxy", "ai", "llm"]
 categories = ["command-line-utilities", "development-tools"]
 
