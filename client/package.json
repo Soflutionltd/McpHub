@@ -1,6 +1,6 @@
 {
   "name": "mcphub-client",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "McpHub client for Cursor and Claude: MemoryPilot bootstrap, per-project policy, batching",
   "type": "module",
   "main": "index.js",

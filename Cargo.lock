@@ -894,7 +894,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-hub"
-version = "5.9.1"
+version = "5.10.0"
 dependencies = [
  "chacha20poly1305",
  "dirs",

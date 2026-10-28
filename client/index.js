@@ -206,7 +206,7 @@ async function readAuthToken() {
 }
 
 function createHubClient() {
-  return new Client({ name: 'mcphub-client', version: '1.1.0' });
+  return new Client({ name: 'mcphub-client', version: '1.2.0' });
 }
 
 async function connectDaemon() {
@@ -720,7 +720,7 @@ async function readDaemonStatus() {
 
 const server = new McpServer({
   name: 'McpHub',
-  version: '1.1.0'
+  version: '1.2.0'
 });
 
 const projectFields = {
