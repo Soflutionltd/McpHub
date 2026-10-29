@@ -79,7 +79,7 @@ impl RemoteClient {
             let resp = self.post(body, token.as_deref()).await?;
             if resp.status().as_u16() == 401 && self.oauth && !retried {
                 retried = true;
-                if let Ok(Some(t)) = crate::oauth::force_refresh(&self.server, &self.url).await {
+                if let Ok(Some(t)) = crate::oauth::force_refresh(&self.server, &self.url, token.as_deref()).await {
                     token = Some(t);
                     continue;
                 }

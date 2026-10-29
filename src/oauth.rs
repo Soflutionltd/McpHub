@@ -106,6 +106,91 @@ pub fn load(server: &str) -> Option<Stored> {
     Some(s)
 }
 
+/// Relit le Trousseau en ignorant le cache : un autre processus McpHub (démon, stdio,
+/// extension Claude) a peut-être renouvelé le jeton entre-temps.
+fn load_shared(server: &str) -> Option<Stored> {
+    let raw = crate::vault::get(&vault_name(server)).ok().flatten()?;
+    let s: Stored = serde_json::from_str(&raw).ok()?;
+    cache().insert(server.to_string(), s.clone());
+    Some(s)
+}
+
+/// Verrou exclusif partagé entre tous les processus McpHub de l'instance. Un jeton de
+/// renouvellement ne sert qu'une fois : sans ce verrou, deux processus le présentent
+/// chacun de leur côté, et le serveur d'autorisation révoque toute la session.
+/// Libéré à la fermeture du fichier, y compris si le processus meurt.
+struct CrossProcessLock(std::fs::File);
+
+impl Drop for CrossProcessLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+fn lock_path(server: &str) -> std::path::PathBuf {
+    crate::instance::hub_dir().join("oauth-locks").join(format!("{}.lock", vault_name(server)))
+}
+
+fn lock_file(path: &std::path::Path) -> Result<CrossProcessLock, String> {
+    use std::os::unix::io::AsRawFd;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("verrou OAuth : {}", e))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("verrou OAuth : {}", e))?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(format!("verrou OAuth : {}", std::io::Error::last_os_error()));
+    }
+    Ok(CrossProcessLock(file))
+}
+
+async fn cross_process_lock(server: &str) -> Result<CrossProcessLock, String> {
+    let path = lock_path(server);
+    tokio::task::spawn_blocking(move || lock_file(&path))
+        .await
+        .map_err(|e| format!("verrou OAuth : {}", e))?
+}
+
+fn is_fresh(tokens: &Tokens) -> bool {
+    tokens.expires_at.is_none_or(|e| e > now_ms() + 60_000)
+}
+
+/// Après un 401 : le jeton enregistré n'est plus celui qui a été refusé et reste valable.
+fn replaced_since(rejected: Option<&str>, stored: &Tokens) -> bool {
+    rejected.is_some_and(|r| r != stored.access_token) && is_fresh(stored)
+}
+
+#[derive(Debug, PartialEq)]
+enum Recovery {
+    UseStored(String),
+    RetryWith(String),
+    GiveUp,
+}
+
+/// Après un refus du serveur de jetons : un autre processus a-t-il enregistré un jeton
+/// plus récent que celui qui vient d'être présenté ?
+fn recovery_after_refusal(used_refresh: &str, latest: Option<&Tokens>) -> Recovery {
+    match latest {
+        Some(t) if t.refresh_token.as_deref() != Some(used_refresh) => {
+            if is_fresh(t) {
+                Recovery::UseStored(t.access_token.clone())
+            } else if let Some(next) = &t.refresh_token {
+                Recovery::RetryWith(next.clone())
+            } else {
+                Recovery::GiveUp
+            }
+        }
+        _ => Recovery::GiveUp,
+    }
+}
+
 pub fn save(server: &str, s: &Stored) -> Result<(), String> {
     let raw = serde_json::to_string(s).map_err(|e| e.to_string())?;
     crate::vault::set(&vault_name(server), &raw)?;
@@ -400,28 +485,42 @@ async fn token_request(meta: &AuthServerMeta, client: &ClientInfo, mut form: Vec
 pub async fn access_token(server: &str, url: &str) -> Result<Option<String>, String> {
     let lock = server_lock(server);
     let _g = lock.lock().await;
-    let Some(mut s) = load(server) else { return Ok(None) };
+    let Some(s) = load(server) else { return Ok(None) };
     if !same_target(&s.url, url) {
         // Jeton émis pour une autre adresse : ne jamais l'envoyer ailleurs.
         return Ok(None);
     }
     let Some(tokens) = s.tokens.clone() else { return Ok(None) };
-    let fresh = tokens.expires_at.map_or(true, |e| e > now_ms() + 60_000);
-    if fresh {
+    if is_fresh(&tokens) {
+        return Ok(Some(tokens.access_token));
+    }
+    let _shared = cross_process_lock(server).await?;
+    let Some(mut s) = load_shared(server) else { return Ok(None) };
+    if !same_target(&s.url, url) {
+        return Ok(None);
+    }
+    let Some(tokens) = s.tokens.clone() else { return Ok(None) };
+    if is_fresh(&tokens) {
         return Ok(Some(tokens.access_token));
     }
     refresh_locked(server, url, &mut s).await.map(Some)
 }
 
-/// Rafraîchit après un 401 (jeton révoqué avant son expiration annoncée).
-pub async fn force_refresh(server: &str, url: &str) -> Result<Option<String>, String> {
+/// Rafraîchit après un 401 (jeton révoqué avant son expiration annoncée). Si un autre
+/// processus a déjà remplacé le jeton refusé, on reprend le sien sans renouveler.
+pub async fn force_refresh(server: &str, url: &str, rejected: Option<&str>) -> Result<Option<String>, String> {
     let lock = server_lock(server);
     let _g = lock.lock().await;
-    let Some(mut s) = load(server) else { return Ok(None) };
+    let _shared = cross_process_lock(server).await?;
+    let Some(mut s) = load_shared(server) else { return Ok(None) };
     if !same_target(&s.url, url) {
         return Ok(None);
     }
-    if s.tokens.as_ref().and_then(|t| t.refresh_token.as_ref()).is_none() {
+    let Some(tokens) = s.tokens.clone() else { return Ok(None) };
+    if replaced_since(rejected, &tokens) {
+        return Ok(Some(tokens.access_token));
+    }
+    if tokens.refresh_token.is_none() {
         return Ok(None);
     }
     refresh_locked(server, url, &mut s).await.map(Some)
@@ -442,11 +541,29 @@ async fn refresh_locked(server: &str, url: &str, s: &mut Stored) -> Result<Strin
         s.scope = s.scope.clone().or(scope);
     }
     let meta = s.meta.clone().unwrap_or_default();
-    let mut form = vec![("grant_type", "refresh_token".to_string()), ("refresh_token", refresh.clone())];
-    if let Some(r) = &s.resource {
-        form.push(("resource", r.clone()));
-    }
-    let v = token_request(&meta, &client, form).await?;
+    let refresh_form = |refresh: &str| {
+        let mut form = vec![("grant_type", "refresh_token".to_string()), ("refresh_token", refresh.to_string())];
+        if let Some(r) = &s.resource {
+            form.push(("resource", r.clone()));
+        }
+        form
+    };
+    let (v, refresh) = match token_request(&meta, &client, refresh_form(&refresh)).await {
+        Ok(v) => (v, refresh),
+        Err(refused) => {
+            // Un processus qui ne prend pas encore le verrou (ancienne version) a pu
+            // renouveler pendant ce temps : on reprend le jeton enregistré, une fois.
+            let latest = load_shared(server).and_then(|stored| stored.tokens);
+            match recovery_after_refusal(&refresh, latest.as_ref()) {
+                Recovery::UseStored(access) => {
+                    s.tokens = latest;
+                    return Ok(access);
+                }
+                Recovery::RetryWith(next) => (token_request(&meta, &client, refresh_form(&next)).await?, next),
+                Recovery::GiveUp => return Err(refused),
+            }
+        }
+    };
     let new = parse_tokens(&v, Some(refresh))?;
     let access = new.access_token.clone();
     s.tokens = Some(new);
@@ -652,6 +769,59 @@ mod tests {
         );
         assert_eq!(www_param(h, "scope").as_deref(), Some("a b"));
         assert_eq!(www_param(h, "nope"), None);
+    }
+
+    fn tokens(access: &str, refresh: Option<&str>, expires_in_ms: i64) -> Tokens {
+        Tokens {
+            access_token: access.into(),
+            refresh_token: refresh.map(String::from),
+            expires_at: Some((now_ms() as i64 + expires_in_ms) as u64),
+            scope: None,
+        }
+    }
+
+    #[test]
+    fn refus_apres_renouvellement_par_un_autre_processus() {
+        // Le démon a renouvelé r0 en r1 ; le processus stdio présente encore r0.
+        let renewed = tokens("a1", Some("r1"), 3_600_000);
+        assert_eq!(recovery_after_refusal("r0", Some(&renewed)), Recovery::UseStored("a1".into()));
+        let renewed_but_expired = tokens("a1", Some("r1"), -1);
+        assert_eq!(recovery_after_refusal("r0", Some(&renewed_but_expired)), Recovery::RetryWith("r1".into()));
+    }
+
+    #[test]
+    fn refus_sans_jeton_plus_recent() {
+        let same = tokens("a0", Some("r0"), -1);
+        assert_eq!(recovery_after_refusal("r0", Some(&same)), Recovery::GiveUp);
+        assert_eq!(recovery_after_refusal("r0", None), Recovery::GiveUp);
+        assert_eq!(recovery_after_refusal("r0", Some(&tokens("a1", None, -1))), Recovery::GiveUp);
+    }
+
+    #[test]
+    fn jeton_refuse_deja_remplace() {
+        let stored = tokens("a1", Some("r1"), 3_600_000);
+        assert!(replaced_since(Some("a0"), &stored));
+        assert!(!replaced_since(Some("a1"), &stored));
+        assert!(!replaced_since(None, &stored));
+        assert!(!replaced_since(Some("a0"), &tokens("a1", Some("r1"), -1)));
+    }
+
+    #[test]
+    fn verrou_exclusif_entre_ouvertures() {
+        let dir = std::env::temp_dir().join(format!("mcphub-oauth-lock-{}", std::process::id()));
+        let path = dir.join("x.lock");
+        let first = lock_file(&path).expect("premier verrou");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiting = path.clone();
+        let handle = std::thread::spawn(move || {
+            let _second = lock_file(&waiting).expect("second verrou");
+            tx.send(()).unwrap();
+        });
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(200)).is_err());
+        drop(first);
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok());
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
