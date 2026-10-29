@@ -45,12 +45,17 @@ function fakeHub() {
 }
 
 const transports = new Map();
+let daemonUp = true;
 const http = createServer(async (req, res) => {
   if (req.headers.authorization !== `Bearer ${token}`) {
     res.writeHead(401).end();
     return;
   }
   const url = new URL(req.url, 'http://127.0.0.1');
+  if (!daemonUp) {
+    res.writeHead(503).end();
+    return;
+  }
   if (url.pathname === '/api/servers') {
     res.writeHead(200, { 'Content-Type': 'application/json' }).end('{"servers":[]}');
   } else if (url.pathname === '/sse') {
@@ -133,6 +138,34 @@ try {
   });
   assert.equal(text(confirmed), 'done delete_row');
   assert.equal(received.at(-1).confirmation_token, 'tok-1');
+
+  // The stdio fallback (its own copy of the OAuth tokens) is left as soon as the daemon is back.
+  daemonUp = false;
+  const fallbackClient = new Client({ name: 'mcphub-offline-fallback', version: '1.0.0' });
+  await fallbackClient.connect(
+    new StdioClientTransport({
+      command: process.execPath,
+      args: [process.env.MCPHUB_CLIENT_ENTRY ?? 'index.js'],
+      cwd: new URL('.', import.meta.url).pathname,
+      env: {
+        ...process.env,
+        MCPHUB_HOME: home,
+        MCPHUB_DAEMON_URL: `http://127.0.0.1:${port}`,
+        MCPHUB_BINARY: new URL('test-fixtures/fake-stdio-hub.js', import.meta.url).pathname,
+        MCPHUB_DAEMON_RETRY_MS: '100'
+      },
+      stderr: 'pipe'
+    })
+  );
+  try {
+    const read = { name: 'mcphub_call', arguments: { server: 'db', tool: 'read_row', arguments: { id: 2 } } };
+    assert.equal(text(await fallbackClient.callTool(read)), 'stdio read_row');
+    daemonUp = true;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(text(await fallbackClient.callTool(read)), 'done read_row');
+  } finally {
+    await fallbackClient.close();
+  }
 
   console.log('offline client tests: ok');
 } finally {

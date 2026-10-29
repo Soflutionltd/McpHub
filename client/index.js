@@ -38,7 +38,7 @@ const projectsPath = process.env.MCPHUB_PROJECTS ?? join(hubDirectory, 'projects
 const usagePath = join(hubDirectory, 'client-usage-stats.json');
 const schemaCachePath = join(hubDirectory, 'schema-cache.json');
 const authTokenPath = join(hubDirectory, 'auth-token');
-const hubBinaryPath = join(homedir(), '.local', 'bin', 'McpHub');
+const hubBinaryPath = process.env.MCPHUB_BINARY ?? join(homedir(), '.local', 'bin', 'McpHub');
 const daemonBaseUrl =
   process.env.MCPHUB_DAEMON_URL ?? `http://127.0.0.1:${process.env.MCPHUB_PORT || 24680}`;
 const daemonSseUrl = new URL('/sse', daemonBaseUrl);
@@ -48,6 +48,7 @@ const daemonApiUrl = new URL('/api/servers', daemonBaseUrl);
 // mais bornée pour ne jamais laisser une requête pendre indéfiniment.
 const childCallTimeoutMs = Number(process.env.MCPHUB_CALL_TIMEOUT_MS ?? 600_000);
 const daemonProbeTimeoutMs = 1_500;
+const daemonRetryIntervalMs = Number(process.env.MCPHUB_DAEMON_RETRY_MS ?? 60_000);
 const usageFlushDelayMs = 2_000;
 const unknownSuggestionCount = 5;
 
@@ -63,6 +64,8 @@ const serverOwners = buildServerOwners(projectsConfig.projects);
 let hubConnection;
 /** @type {Promise<{ client: Client, transport: 'daemon' | 'stdio' }> | undefined} */
 let hubConnecting;
+let hubCallsInFlight = 0;
+let lastDaemonProbeAt = 0;
 /** @type {Map<string, Promise<{ memory?: string, memoryError?: string }>>} */
 const pendingBootstraps = new Map();
 
@@ -232,6 +235,7 @@ async function connectStdio() {
 }
 
 async function openHubConnection() {
+  lastDaemonProbeAt = Date.now();
   const connection = (await daemonReachable())
     ? await connectDaemon()
     : await connectStdio();
@@ -309,14 +313,35 @@ class UnknownOutcomeError extends Error {
 // `replaySafe` : lecture pure (recherche, recall MemoryPilot), rejouable même après
 // une coupure. Les appels d'outils et le code mode ne sont jamais rejoués une fois
 // envoyés.
-async function callHubTool(name, args, { replaySafe = false, retry = true } = {}) {
+// Le secours stdio lance son propre McpHub, avec sa propre copie des jetons OAuth :
+// dès que le démon répond de nouveau, on le referme pour revenir au démon partagé.
+async function leaveStdioFallback() {
+  if (hubConnection?.transport !== 'stdio' || hubCallsInFlight > 0) return;
+  if (Date.now() - lastDaemonProbeAt < daemonRetryIntervalMs) return;
+  lastDaemonProbeAt = Date.now();
+  if (!(await daemonReachable())) return;
+  if (hubConnection?.transport !== 'stdio' || hubCallsInFlight > 0) return;
+  await resetHubConnection();
+}
+
+async function callHubTool(name, args, options = {}) {
+  if (options.retry !== false) await leaveStdioFallback();
+  hubCallsInFlight += 1;
+  try {
+    return await callHubToolOnce(name, args, options);
+  } finally {
+    hubCallsInFlight -= 1;
+  }
+}
+
+async function callHubToolOnce(name, args, { replaySafe = false, retry = true } = {}) {
   let connection;
   try {
     connection = await connectHub();
   } catch (error) {
     if (!retry) throw error;
     await resetHubConnection();
-    return callHubTool(name, args, { replaySafe, retry: false });
+    return callHubToolOnce(name, args, { replaySafe, retry: false });
   }
   try {
     const result = await connection.client.callTool(
@@ -335,7 +360,7 @@ async function callHubTool(name, args, { replaySafe = false, retry = true } = {}
     if (!isTransportFailure(error)) throw error;
     await resetHubConnection();
     if (retry && (replaySafe || requestNeverReachedHub(error))) {
-      return callHubTool(name, args, { replaySafe, retry: false });
+      return callHubToolOnce(name, args, { replaySafe, retry: false });
     }
     if (requestNeverReachedHub(error)) throw error;
     throw new UnknownOutcomeError(name, error);
