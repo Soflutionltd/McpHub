@@ -140,6 +140,9 @@ fn cmd_status() {
 
 async fn cmd_generate() {
     let config = auto_detect();
+    // Sans ça, la garde des outils tournait avec ses réglages par défaut (tout bloquer)
+    // et mettait en quarantaine des outils que toolSecurity autorise.
+    crate::toolguard::configure(config.guard.clone());
     if config.servers.is_empty() {
         eprintln!(
             "No servers found. Add servers to {}",

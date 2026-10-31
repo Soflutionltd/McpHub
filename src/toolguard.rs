@@ -409,7 +409,9 @@ pub fn quarantine_reason(pin: &Pin, settings: &GuardSettings) -> Option<String> 
     {
         return Some(format!("description suspecte : {}", pin.flags.join(", ")));
     }
-    if pin.new_unapproved {
+    // La quarantaine d'un nouvel outil suit le réglage actuel : passer newTools à "off"
+    // libère aussi les outils marqués auparavant.
+    if pin.new_unapproved && settings.new_tools == GuardMode::Block {
         return Some("nouvel outil apparu sur un serveur deja approuve".to_string());
     }
     None
@@ -1115,6 +1117,18 @@ mod tests {
         assert!(quarantine_reason(&pins.servers["srv"].tools["n"], &s).is_some());
         approve_pins(&mut pins, "srv", Some("n"));
         assert!(quarantine_reason(&pins.servers["srv"].tools["n"], &s).is_none());
+    }
+
+    #[test]
+    fn nouvel_outil_libere_quand_newtools_off() {
+        // Un outil marqué nouveau sous "block" ne reste pas bloqué une fois newTools à "off".
+        let block = GuardSettings { new_tools: GuardMode::Block, ..GuardSettings::default() };
+        let off = GuardSettings { new_tools: GuardMode::Off, ..GuardSettings::default() };
+        let mut pins = PinsFile::default();
+        review_pins(&mut pins, "srv", &[tool("a", "A")], &block, "t0");
+        review_pins(&mut pins, "srv", &[tool("a", "A"), tool("n", "N")], &block, "t1");
+        assert!(quarantine_reason(&pins.servers["srv"].tools["n"], &block).is_some());
+        assert!(quarantine_reason(&pins.servers["srv"].tools["n"], &off).is_none());
     }
 
     #[test]
