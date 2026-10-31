@@ -1,7 +1,7 @@
 // Offline tests: index.js against a fake McpHub daemon (SSE), no real servers,
 // no user files. Run with `npm run test:offline`.
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -31,6 +31,9 @@ function fakeHub() {
     async (args) => {
       received.push(args);
       if (args.tool === 'send_email') return new Promise(() => {});
+      if (args.tool === 'recall' && args.arguments?.episodes_only) {
+        return { content: [{ type: 'text', text: JSON.stringify({ episodes: [{ id: 'ep-1' }] }) }] };
+      }
       if (args.tool === 'delete_row' && !args.confirmation_token) {
         return {
           content: [{ type: 'text', text: 'CONFIRMATION REQUISE' }],
@@ -78,7 +81,17 @@ const port = http.address().port;
 
 const home = await mkdtemp(join(tmpdir(), 'mcphub-offline-'));
 await writeFile(join(home, 'auth-token'), token);
+await mkdir(join(home, 'memorypilot'));
+const clientEnv = {
+  MCPHUB_HOME: home,
+  MCPHUB_DAEMON_URL: `http://127.0.0.1:${port}`,
+  MEMORYPILOT_DB: join(home, 'memorypilot', 'memory.db')
+};
 await writeFile(join(home, 'projects.json'), '{"projects":{}}');
+await writeFile(
+  join(home, 'schema-cache.json'),
+  JSON.stringify({ servers: { db: [{ name: 'read_row', description: 'Read one row.' }] } })
+);
 
 const client = new Client({ name: 'mcphub-offline-test', version: '1.0.0' });
 await client.connect(
@@ -88,8 +101,7 @@ await client.connect(
     cwd: new URL('.', import.meta.url).pathname,
     env: {
       ...process.env,
-      MCPHUB_HOME: home,
-      MCPHUB_DAEMON_URL: `http://127.0.0.1:${port}`,
+      ...clientEnv,
       MCPHUB_CALL_TIMEOUT_MS: '1500'
     },
     stderr: 'pipe'
@@ -165,6 +177,70 @@ try {
     assert.equal(text(await fallbackClient.callTool(read)), 'done read_row');
   } finally {
     await fallbackClient.close();
+  }
+
+  // For Claude Code, a fresh trace from the MemoryPilot SessionStart hook means
+  // the memory is already in context: bootstrap only asks for the episodes
+  // matching the hints. HOME is the test folder, so a trace for ~ can be tested.
+  const workspace = join(home, 'workspace');
+  const traces = join(home, 'memorypilot', 'session-hook-injections.json');
+  const writeTrace = (ageMs, root = workspace) =>
+    writeFile(traces, JSON.stringify({ [root]: new Date(Date.now() - ageMs).toISOString() }));
+  const recalls = () => [
+    received.filter((call) => call.tool === 'recall' && !call.arguments?.episodes_only).length,
+    received.filter((call) => call.tool === 'recall' && call.arguments?.episodes_only).length
+  ];
+  const bootstrap = (hints) => ({
+    name: 'mcphub_bootstrap',
+    arguments: { working_dir: workspace, ...(hints ? { hints } : {}) }
+  });
+
+  const claudeCode = new Client({ name: 'claude-code', version: '2.0.0' });
+  await claudeCode.connect(
+    new StdioClientTransport({
+      command: process.execPath,
+      args: [process.env.MCPHUB_CLIENT_ENTRY ?? 'index.js'],
+      cwd: new URL('.', import.meta.url).pathname,
+      env: { ...process.env, ...clientEnv, HOME: home },
+      stderr: 'pipe'
+    })
+  );
+  try {
+    await claudeCode.callTool(bootstrap('deploy'));
+    assert.deepEqual(recalls(), [1, 0], 'no trace: full recall');
+
+    await writeTrace(60_000);
+    const fresh = JSON.parse(text(await claudeCode.callTool(bootstrap('deploy'))));
+    assert.deepEqual(recalls(), [1, 1], 'fresh trace: episodes only');
+    assert.match(fresh.memory, /SessionStart hook/);
+    assert.deepEqual(fresh.episodes, [{ id: 'ep-1' }]);
+
+    await claudeCode.callTool(bootstrap());
+    assert.deepEqual(recalls(), [1, 1], 'fresh trace, no hints: no call');
+
+    // Another client with the same fresh trace still recalls everything.
+    await client.callTool(bootstrap('deploy'));
+    assert.deepEqual(recalls(), [2, 1], 'not Claude Code: full recall');
+
+    await writeTrace(11 * 60_000);
+    await claudeCode.callTool(bootstrap('deploy'));
+    assert.deepEqual(recalls(), [3, 1], 'stale trace: full recall');
+
+    // A session opened in ~ did not get the memory of the projects inside it.
+    await writeTrace(60_000, home);
+    await claudeCode.callTool(bootstrap('deploy'));
+    assert.deepEqual(recalls(), [4, 1], 'trace for ~: full recall');
+
+    // Claude Code: names against names.
+    const savings = JSON.parse(text(await claudeCode.callTool({ name: 'mcphub_savings', arguments: {} })));
+    assert.equal(savings.client, 'claude-code');
+    const versus = savings.versusClaudeCodeDeferredLoading;
+    assert.equal(versus.directCatalogBytes, Buffer.byteLength('mcp__db__read_row\n'));
+    const hubNames = (await claudeCode.listTools()).tools.map((tool) => `mcp__McpHub__${tool.name}\n`);
+    assert.equal(hubNames.length, 6);
+    assert.equal(versus.hubCatalogBytes, Buffer.byteLength(hubNames.join('')));
+  } finally {
+    await claudeCode.close();
   }
 
   console.log('offline client tests: ok');

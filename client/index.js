@@ -2,7 +2,7 @@
 
 import { readFile, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join, normalize, sep } from 'node:path';
+import { dirname, join, normalize, parse, sep } from 'node:path';
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
@@ -52,10 +52,19 @@ const daemonRetryIntervalMs = Number(process.env.MCPHUB_DAEMON_RETRY_MS ?? 60_00
 const usageFlushDelayMs = 2_000;
 const unknownSuggestionCount = 5;
 
-// Nombre d'octets exposés par le client McpHub lui-même dans le catalogue Cursor
-// (6 outils, noms + descriptions + schémas). Mesuré via tools/list.
-const hubExposedCatalogBytes = 3_600;
 const cursorCatalogDescriptionLimit = 200;
+// Nom du serveur dans la config MCP du client : Claude Code préfixe chaque
+// outil par mcp__<nom>__.
+const hubServerName = 'McpHub';
+
+// Trace des injections du hook SessionStart de MemoryPilot (même dossier que
+// sa base) : workspace → horodatage de la dernière injection réussie.
+const memoryPilotDirectory = process.env.MEMORYPILOT_DB
+  ? dirname(process.env.MEMORYPILOT_DB)
+  : join(homedir(), '.MemoryPilot');
+const hookInjectionsPath = join(memoryPilotDirectory, 'session-hook-injections.json');
+// Au-delà, la session a pu être compactée ou reprise ailleurs : recall complet.
+const hookInjectionMaxAgeMs = 10 * 60_000;
 
 const projectsConfig = await readProjects(projectsPath);
 const serverOwners = buildServerOwners(projectsConfig.projects);
@@ -494,6 +503,56 @@ function recallContext(projectName, workspace, hints) {
   return recall;
 }
 
+function isClaudeCodeClient() {
+  return /^claude-code/i.test(server.server.getClientVersion()?.name ?? '');
+}
+
+// Une trace couvre son dossier exact, ou un dossier parent qui délimite un
+// projet : une session ouverte dans ~ ou à la racine n'a pas reçu la mémoire
+// des projets qu'ils contiennent.
+function traceCovers(candidate, root) {
+  const trimmed = (path) => normalize(path).replace(/[\\/]+$/, '') || sep;
+  const base = trimmed(root);
+  if (trimmed(candidate) === base) return true;
+  if (base === parse(base).root || base === trimmed(homedir())) return false;
+  return insideWorkspace(trimmed(candidate), base);
+}
+
+// Le hook SessionStart de MemoryPilot note chaque injection réussie. Pour
+// Claude Code, une trace récente pour ce workspace veut dire que la mémoire est
+// déjà dans le contexte : la rappeler ici la ferait payer deux fois. Les autres
+// clients font toujours le recall complet.
+async function recentHookInjection(workspace) {
+  if (!isClaudeCodeClient()) return undefined;
+  const traces = await readJson(hookInjectionsPath, {});
+  const candidate = normalize(workspace);
+  for (const [root, at] of Object.entries(traces ?? {})) {
+    if (!traceCovers(candidate, root)) continue;
+    const ageMs = Date.now() - Date.parse(at);
+    if (ageMs >= 0 && ageMs < hookInjectionMaxAgeMs) return { injectedAt: at };
+  }
+  return undefined;
+}
+
+// Faits et jalons déjà injectés par le hook : seuls les épisodes liés à la
+// tâche sont nouveaux, et MemoryPilot les filtre contre ce qu'il a injecté.
+function recallEpisodes(projectName, workspace, hints) {
+  if (!hints?.trim()) return Promise.resolve({ episodes: [] });
+  return callHubTool('mcphub_call', {
+    server: 'MemoryPilot',
+    tool: 'recall',
+    arguments: {
+      working_dir: workspace,
+      ...(projectName ? { project: projectName } : {}),
+      hints,
+      episodes_only: true
+    },
+    bypass_cache: true
+  }, { replaySafe: true })
+    .then((result) => ({ episodes: JSON.parse(extractText(result)).episodes ?? [] }))
+    .catch((error) => ({ memoryError: errorMessage(error) }));
+}
+
 function parseSearchPayload(result) {
   try {
     return JSON.parse(extractText(result));
@@ -749,6 +808,14 @@ const server = new McpServer({
   version: '1.3.0'
 });
 
+// Les 6 outils réellement enregistrés, pour mesurer ce que McpHub coûte
+// dans le catalogue du client (mcphub_savings).
+const hubTools = new Map();
+function registerHubTool(name, config, handler) {
+  hubTools.set(name, config);
+  return server.registerTool(name, config, handler);
+}
+
 const projectFields = {
   project: z.string().optional().describe('Persistent project alias.'),
   working_dir: z
@@ -757,11 +824,11 @@ const projectFields = {
     .describe('Workspace path used for automatic project routing.')
 };
 
-server.registerTool(
+registerHubTool(
   'mcphub_bootstrap',
   {
     description:
-      'Call once per conversation. Resolves project aliases and permissions, then recalls compact MemoryPilot context. This is the only tool that triggers MemoryPilot implicitly. When the result has securityAlerts, tell the user which tools McpHub blocked and why.',
+      'Call once per conversation. Resolves project aliases and permissions, then recalls compact MemoryPilot context (in Claude Code, when the MemoryPilot SessionStart hook injected it in the last 10 minutes, only the episodes matching hints). This is the only tool that triggers MemoryPilot implicitly. When the result has securityAlerts, tell the user which tools McpHub blocked and why.',
     inputSchema: {
       ...projectFields,
       hints: z.string().optional().describe('Current task keywords.')
@@ -785,8 +852,14 @@ server.registerTool(
     }
     usage.bootstrapCalls += 1;
     markUsageDirty();
+    const injection = await recentHookInjection(workspace);
     const [context, securityAlerts] = await Promise.all([
-      recallContext(projectName, workspace, hints),
+      injection
+        ? recallEpisodes(projectName, workspace, hints).then((episodes) => ({
+            memory: `Already in context: injected at ${injection.injectedAt} by the MemoryPilot SessionStart hook. Only episodes matching the hints follow. For a targeted lookup, call mcphub_call with server MemoryPilot, tool recall and hints.`,
+            ...episodes
+          }))
+        : recallContext(projectName, workspace, hints),
       readDaemonStatus()
         .then((s) => s.securityAlerts)
         .catch(() => [])
@@ -813,7 +886,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerHubTool(
   'mcphub_search',
   {
     description:
@@ -856,7 +929,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerHubTool(
   'mcphub_call',
   {
     description:
@@ -908,7 +981,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerHubTool(
   'mcphub_batch',
   {
     description:
@@ -981,7 +1054,7 @@ server.registerTool(
   }
 );
 
-server.registerTool(
+registerHubTool(
   'mcphub_status',
   {
     description:
@@ -1015,17 +1088,39 @@ server.registerTool(
 // côté tokens est donc « catalogue de N outils » vs « catalogue de 6 outils »,
 // pas « tous les schémas » vs « 6 outils ». Le gain principal est ailleurs :
 // un seul jeu de processus enfants partagé entre fenêtres Cursor.
+//
+// Claude Code va plus loin : ses outils différés n'entrent dans le contexte que
+// par leur nom (mcp__<serveur>__<outil>), sans description, ceux de McpHub
+// compris. La comparaison honnête y est donc noms contre noms.
 // ---------------------------------------------------------------------------
+
+function measureHubCatalog() {
+  let fullBytes = 0;
+  let nameBytes = 0;
+  for (const [name, config] of hubTools) {
+    fullBytes += Buffer.byteLength(
+      JSON.stringify({
+        name,
+        description: config.description,
+        inputSchema: z.toJSONSchema(z.object(config.inputSchema ?? {}))
+      })
+    );
+    nameBytes += Buffer.byteLength(`mcp__${hubServerName}__${name}\n`);
+  }
+  return { fullBytes, nameBytes };
+}
 
 async function readSchemaCatalog() {
   const servers = await readSchemaServers();
   let toolCount = 0;
   let fullSchemaBytes = 0;
   let cursorCatalogBytes = 0;
+  let claudeCodeNameBytes = 0;
 
-  for (const tools of Object.values(servers)) {
+  for (const [serverName, tools] of Object.entries(servers)) {
     for (const tool of tools ?? []) {
       toolCount += 1;
+      claudeCodeNameBytes += Buffer.byteLength(`mcp__${serverName}__${tool.name ?? ''}\n`);
       fullSchemaBytes += Buffer.byteLength(JSON.stringify(tool));
       const description = tool.description ?? '';
       cursorCatalogBytes +=
@@ -1043,15 +1138,16 @@ async function readSchemaCatalog() {
     serverCount: Object.keys(servers).length,
     toolCount,
     fullSchemaBytes,
-    cursorCatalogBytes
+    cursorCatalogBytes,
+    claudeCodeNameBytes
   };
 }
 
-server.registerTool(
+registerHubTool(
   'mcphub_savings',
   {
     description:
-      'Report McpHub call statistics and an honest context-size comparison against Cursor native deferred tool loading.',
+      'Report McpHub call statistics and an honest context-size comparison against native deferred tool loading (Cursor, and Claude Code when it is the client).',
     inputSchema: {}
   },
   async () => {
@@ -1059,17 +1155,31 @@ server.registerTool(
       const catalog = await readSchemaCatalog();
       const catalogSaved = Math.max(
         0,
-        catalog.cursorCatalogBytes - hubExposedCatalogBytes
+        catalog.cursorCatalogBytes - hubCatalog.fullBytes
       );
+      const claudeCodeSaved = Math.max(
+        0,
+        catalog.claudeCodeNameBytes - hubCatalog.nameBytes
+      );
+      const versusClaudeCodeDeferredLoading = {
+        directCatalogBytes: catalog.claudeCodeNameBytes,
+        hubCatalogBytes: hubCatalog.nameBytes,
+        savedBytes: claudeCodeSaved,
+        approximateTokensSavedPerConversation: Math.round(claudeCodeSaved / 4),
+        methodology:
+          'Names against names: Claude Code lists deferred tools as mcp__<server>__<tool> and loads schemas on demand, for the direct catalog as for the 6 McpHub tools. Not counted: usage costs on either side (schemas loaded on demand, mcphub_search results, extra round trips). Bytes divided by four; excludes prompts and tool results.'
+      };
       const legacySaved = Math.max(
         0,
-        catalog.fullSchemaBytes - hubExposedCatalogBytes
+        catalog.fullSchemaBytes - hubCatalog.fullBytes
       );
       return textResult({
+        client: server.server.getClientVersion()?.name ?? 'unknown',
+        ...(isClaudeCodeClient() ? { versusClaudeCodeDeferredLoading } : {}),
         catalog: {
           servers: catalog.serverCount,
           tools: catalog.toolCount,
-          hubExposedBytes: hubExposedCatalogBytes
+          hubExposedBytes: hubCatalog.fullBytes
         },
         versusCursorDeferredLoading: {
           directCatalogBytes: catalog.cursorCatalogBytes,
@@ -1102,6 +1212,9 @@ server.registerTool(
     }
   }
 );
+
+// Mesuré une fois, sur les outils tels que tools/list les décrit.
+const hubCatalog = measureHubCatalog();
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
