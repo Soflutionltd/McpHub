@@ -33,6 +33,9 @@ pub enum GuardMode {
     Off,
     Warn,
     Block,
+    /// newTools uniquement : un nouvel outil passe tout seul s'il est cohérent avec son serveur,
+    /// sans capacité sensible nouvelle et (si demandé) issu d'un commit signé ; sinon quarantaine.
+    Auto,
 }
 
 impl GuardMode {
@@ -41,14 +44,20 @@ impl GuardMode {
             Some(s) if s == "off" || s == "false" => GuardMode::Off,
             Some(s) if s == "warn" || s == "log" => GuardMode::Warn,
             Some(s) if s == "block" || s == "on" || s == "true" => GuardMode::Block,
+            Some(s) if s == "auto" || s == "smart" => GuardMode::Auto,
             _ => default,
         }
+    }
+    /// pinning et scan n'ont pas de mode automatique : "auto" y vaut "block".
+    fn strict(self) -> GuardMode {
+        if self == GuardMode::Auto { GuardMode::Block } else { self }
     }
     fn as_str(&self) -> &'static str {
         match self {
             GuardMode::Off => "off",
             GuardMode::Warn => "warn",
             GuardMode::Block => "block",
+            GuardMode::Auto => "auto",
         }
     }
 }
@@ -61,6 +70,10 @@ pub struct GuardSettings {
     pub scan: GuardMode,
     /// Nouvel outil apparu sur un serveur déjà connu.
     pub new_tools: GuardMode,
+    /// Mode auto : un nouvel outil d'un serveur lancé depuis un dépôt git local n'est accepté
+    /// que si le dernier commit de ce dépôt est signé par une clé de confiance (un compte GitHub
+    /// piraté ne peut pas signer).
+    pub require_signed_commits: bool,
 }
 
 impl Default for GuardSettings {
@@ -69,6 +82,7 @@ impl Default for GuardSettings {
             pinning: GuardMode::Block,
             scan: GuardMode::Block,
             new_tools: GuardMode::Block,
+            require_signed_commits: false,
         }
     }
 }
@@ -105,6 +119,61 @@ pub struct GuardConfig {
     pub settings: GuardSettings,
     pub filters: HashMap<String, ServerFilter>,
     pub profiles: HashMap<String, Profile>,
+    /// Dépôt git local d'où chaque serveur est lancé (commande ou argument dans un dépôt).
+    pub origins: HashMap<String, PathBuf>,
+}
+
+/// Dépôt git qui contient le programme d'un serveur local (premier chemin absolu de la
+/// commande ou des arguments situé dans un dossier versionné), sinon None.
+fn origin_repo(server: &Value) -> Option<PathBuf> {
+    let mut paths: Vec<String> = Vec::new();
+    if let Some(c) = server.get("command").and_then(|v| v.as_str()) {
+        paths.push(c.to_string());
+    }
+    if let Some(Value::Array(a)) = server.get("args") {
+        paths.extend(a.iter().filter_map(|x| x.as_str().map(String::from)));
+    }
+    for p in paths {
+        let path = PathBuf::from(&p);
+        if !path.is_absolute() || !path.exists() {
+            continue;
+        }
+        // Les outils système (node, python...) ne sont pas le code du serveur.
+        if p.contains("/.nvm/") || p.starts_with("/usr/") || p.starts_with("/opt/homebrew/") || p.starts_with("/bin/") {
+            continue;
+        }
+        let mut dir = if path.is_dir() { Some(path.as_path()) } else { path.parent() };
+        while let Some(d) = dir {
+            if d.join(".git").exists() {
+                return Some(d.to_path_buf());
+            }
+            dir = d.parent();
+        }
+    }
+    None
+}
+
+/// Le dernier commit du dépôt est-il signé par une clé de confiance ? Sinon, la raison.
+fn unsigned_origin(dir: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["log", "-1", "--format=%G? %h"])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s.starts_with('G') {
+                None
+            } else {
+                Some(format!(
+                    "code du serveur issu d'un commit non signe par une cle de confiance ({})",
+                    s.split_whitespace().nth(1).unwrap_or("?")
+                ))
+            }
+        }
+        _ => Some("signature du code du serveur impossible a verifier".into()),
+    }
 }
 
 fn str_list(v: Option<&Value>) -> Vec<String> {
@@ -127,10 +196,18 @@ pub fn parse_guard_config(raw: &Value) -> GuardConfig {
     if let Some(sec) = settings.and_then(|s| s.get("toolSecurity")) {
         let d = GuardSettings::default();
         cfg.settings = GuardSettings {
-            pinning: GuardMode::parse(sec.get("pinning"), d.pinning),
-            scan: GuardMode::parse(sec.get("scan"), d.scan),
+            pinning: GuardMode::parse(sec.get("pinning"), d.pinning).strict(),
+            scan: GuardMode::parse(sec.get("scan"), d.scan).strict(),
             new_tools: GuardMode::parse(sec.get("newTools"), d.new_tools),
+            require_signed_commits: sec.get("requireSignedCommits").and_then(|v| v.as_bool()).unwrap_or(false),
         };
+    }
+    if let Some(Value::Object(servers)) = raw.get("mcpServers").or_else(|| raw.get("servers")) {
+        for (name, s) in servers {
+            if let Some(dir) = origin_repo(s) {
+                cfg.origins.insert(name.clone(), dir);
+            }
+        }
     }
     if let Some(Value::Object(profiles)) = settings.and_then(|s| s.get("profiles")) {
         for (name, p) in profiles {
@@ -324,6 +401,216 @@ pub fn scan_tool(def: &ToolDef) -> (Vec<String>, Vec<String>) {
     (high, medium)
 }
 
+// ─── Filtre automatique des nouveaux outils (newTools = auto) ─────────────
+//
+// Un nouvel outil d'un serveur déjà connu passe seul s'il ressemble aux outils que ce serveur
+// expose déjà. Il est mis de côté (sans fenêtre : l'alerte remonte par mcphub_status et
+// mcphub_bootstrap) quand il sort de la convention de nommage du serveur, quand sa description
+// n'a rien à voir avec le reste du serveur, ou quand il apporte une capacité sensible que le
+// serveur n'avait pas (secrets, exécution de commandes, envoi de données vers l'extérieur).
+
+// Capacités sensibles, jugées sur ce que l'outil FAIT (son nom et ses paramètres texte), pas sur
+// ce que sa description raconte : "ne jamais garder de mot de passe" n'est pas un accès aux secrets.
+const SECRETS: &str = "acces aux secrets (mots de passe, cles, Trousseau)";
+const EXEC: &str = "execution de commandes ou de code";
+const EXFIL: &str = "envoi de donnees vers une adresse externe";
+
+/// Paramètres (découpés en mots) qui trahissent une capacité.
+const PARAM_SIGNS: &[(&str, &[&[&str]])] = &[
+    (SECRETS, &[&["password"], &["passwd"], &["passphrase"], &["secret"], &["private", "key"], &["api", "key"], &["apikey"], &["totp"], &["mnemonic"], &["seed", "phrase"], &["keychain"]]),
+    (EXFIL, &[&["webhook"], &["callback", "url"], &["upload", "url"], &["destination", "url"], &["exfil"]]),
+];
+/// Paramètres de code ou de commande : sensibles seulement si l'outil dit les exécuter.
+const CODE_PARAMS: &[&str] = &["code", "script", "command", "cmd", "shell", "bash", "javascript", "python"];
+const EXEC_WORDS: &[&str] = &["execute", "exec", "eval", "run", "shell", "spawn"];
+/// Formules assez précises pour suffire seules, où qu'elles apparaissent.
+const STRONG_PHRASES: &[(&str, &[&str])] = &[
+    (SECRETS, &["ssh key", "private key", "id_rsa", "id_ed25519", "keychain item", "seed phrase", "read the keychain"]),
+    (EXEC, &["shell command", "arbitrary code", "arbitrary command", "execute any command"]),
+    (EXFIL, &["exfiltrat", "send all data to", "forward all messages to"]),
+];
+
+const STOPWORDS: &[&str] = &[
+    "this", "that", "with", "from", "into", "your", "their", "them", "then", "than", "when", "what",
+    "which", "will", "would", "should", "could", "have", "been", "were", "they", "only", "also",
+    "each", "every", "other", "more", "most", "some", "such", "very", "just", "like", "over",
+    "after", "before", "about", "where", "while", "these", "those", "there", "here", "does",
+    "using", "used", "uses", "useful", "returns", "return", "given", "optional", "default",
+    "true", "false", "null", "string", "number", "boolean", "array", "object", "value", "values",
+    "pour", "avec", "dans", "sans", "sont", "cette", "votre", "leurs",
+];
+
+fn tool_text(def: &ToolDef) -> String {
+    let mut t = format!("{} {}", def.name.replace(['_', '-', '.'], " "), def.description);
+    if let Some(title) = &def.title {
+        t.push(' ');
+        t.push_str(title);
+    }
+    if let Some(Value::Object(props)) = def.input_schema.get("properties") {
+        for (k, v) in props {
+            t.push(' ');
+            t.push_str(&k.replace(['_', '-'], " "));
+            if let Some(d) = v.get("description").and_then(|d| d.as_str()) {
+                t.push(' ');
+                t.push_str(d);
+            }
+        }
+    }
+    t.to_lowercase()
+}
+
+fn words(text: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let mut cur = String::new();
+    for c in text.chars().chain(std::iter::once(' ')) {
+        if c.is_alphanumeric() {
+            cur.extend(c.to_lowercase());
+        } else if !cur.is_empty() {
+            // Racine grossière : pluriels et formes en -ing ne doivent pas compter comme des mots nouveaux.
+            let mut w = std::mem::take(&mut cur);
+            for suf in ["ing", "es", "s"] {
+                if w.len() > suf.len() + 3 && w.ends_with(suf) {
+                    w.truncate(w.len() - suf.len());
+                    break;
+                }
+            }
+            if w.chars().count() >= 4 && !STOPWORDS.contains(&w.as_str()) && !w.chars().all(|c| c.is_ascii_digit()) {
+                out.insert(w);
+            }
+        }
+    }
+    out
+}
+
+fn name_prefix(name: &str) -> Option<&str> {
+    let i = name.find(['_', '-', '.'])?;
+    (i > 0).then(|| &name[..i])
+}
+
+/// "byApiKey", "api_key", "webhook-url" -> ["by", "api", "key"]...
+fn ident_words(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut prev_lower = false;
+    for c in s.chars() {
+        if !c.is_alphanumeric() {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            prev_lower = false;
+            continue;
+        }
+        if c.is_uppercase() && prev_lower && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+        prev_lower = c.is_lowercase() || c.is_ascii_digit();
+        cur.extend(c.to_lowercase());
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn has_seq(words: &[String], seq: &[&str]) -> bool {
+    words.windows(seq.len()).any(|w| w.iter().zip(seq).all(|(a, b)| a == b))
+}
+
+fn sensitive_classes(def: &ToolDef) -> Vec<&'static str> {
+    let mut found: Vec<&'static str> = Vec::new();
+    let mut add = |c: &'static str| {
+        if !found.contains(&c) {
+            found.push(c);
+        }
+    };
+    // Paramètres texte seulement : un booléen "byApiKey" ne donne accès à aucune clé.
+    let mut params: Vec<Vec<String>> = Vec::new();
+    if let Some(Value::Object(props)) = def.input_schema.get("properties") {
+        for (k, v) in props {
+            let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("string");
+            if matches!(ty, "boolean" | "integer" | "number") {
+                continue;
+            }
+            params.push(ident_words(k));
+        }
+    }
+    let name = ident_words(&def.name);
+    for (class, signs) in PARAM_SIGNS {
+        if signs.iter().any(|s| has_seq(&name, s) || params.iter().any(|p| has_seq(p, s))) {
+            add(class);
+        }
+    }
+    let text = tool_text(def);
+    let says_exec = EXEC_WORDS.iter().any(|w| name.iter().any(|n| n == w) || words(&text).iter().any(|t| t == w));
+    if says_exec && params.iter().any(|p| p.iter().any(|w| CODE_PARAMS.contains(&w.as_str()))) {
+        add(EXEC);
+    }
+    let compact: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for (class, phrases) in STRONG_PHRASES {
+        if phrases.iter().any(|p| compact.contains(p)) {
+            add(class);
+        }
+    }
+    found
+}
+
+/// Raison de mettre de côté un nouvel outil, d'après les outils que son serveur a déjà, ou None.
+pub fn assess_new_tool(def: &ToolDef, existing: &[&ToolDef]) -> Option<String> {
+    if existing.is_empty() {
+        return None;
+    }
+    // 1. Convention de nommage : si presque tous les outils du serveur partagent un préfixe.
+    if existing.len() >= 3 {
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for t in existing {
+            if let Some(p) = name_prefix(&t.name) {
+                *counts.entry(p).or_default() += 1;
+            }
+        }
+        if let Some((p, n)) = counts.into_iter().max_by_key(|(_, n)| *n) {
+            if n * 10 >= existing.len() * 9 && name_prefix(&def.name) != Some(p) {
+                return Some(format!("nom hors de la convention du serveur (prefixe attendu \"{}_\")", p));
+            }
+        }
+    }
+    // 2. Capacité sensible absente du reste du serveur.
+    let have: Vec<&str> = existing.iter().flat_map(|t| sensitive_classes(t)).collect();
+    if let Some(c) = sensitive_classes(def).into_iter().find(|c| !have.contains(c)) {
+        return Some(format!("nouvelle capacite sensible pour ce serveur : {}", c));
+    }
+    // 3. Vocabulaire sans aucun rapport avec le serveur (seuil bas : un outil de facturation
+    //    dans un serveur d'apps partage peu de mots, mais en partage).
+    let corpus_text: String = existing.iter().map(|t| tool_text(t)).collect::<Vec<_>>().join(" ");
+    let corpus = words(&corpus_text);
+    let mine = words(&tool_text(def));
+    if mine.len() >= 8 && corpus.len() >= 20 {
+        let shared = mine.iter().filter(|w| corpus.contains(*w)).count();
+        if shared * 100 < mine.len() * 5 {
+            return Some(format!(
+                "description sans rapport avec les autres outils du serveur ({} mots sur {} en commun)",
+                shared,
+                mine.len()
+            ));
+        }
+    }
+    None
+}
+
+/// Rejoue le filtre sur un catalogue : chaque outil est traité comme s'il venait d'apparaître
+/// sur son serveur. Sert à vérifier qu'il ne bloque aucun outil légitime existant.
+pub fn simulate_auto(servers: &BTreeMap<String, Vec<ToolDef>>) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for (server, tools) in servers {
+        for (i, def) in tools.iter().enumerate() {
+            let others: Vec<&ToolDef> = tools.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, t)| t).collect();
+            if let Some(r) = assess_new_tool(def, &others) {
+                out.push((server.clone(), def.name.clone(), r));
+            }
+        }
+    }
+    out
+}
+
 // ─── Empreintes ──────────────────────────────────────────────
 
 pub fn tool_hash(def: &ToolDef) -> String {
@@ -366,6 +653,9 @@ pub struct Pin {
     /// Nouvel outil apparu alors que newTools = block, en attente d'approbation.
     #[serde(rename = "newUnapproved", default, skip_serializing_if = "is_false")]
     pub new_unapproved: bool,
+    /// newTools = auto : pourquoi le filtre automatique a mis ce nouvel outil de côté.
+    #[serde(rename = "autoReason", default, skip_serializing_if = "Option::is_none")]
+    pub auto_reason: Option<String>,
     /// Définition observée différente de l'épinglée, en attente d'approbation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending: Option<Pending>,
@@ -410,15 +700,25 @@ pub fn quarantine_reason(pin: &Pin, settings: &GuardSettings) -> Option<String> 
         return Some(format!("description suspecte : {}", pin.flags.join(", ")));
     }
     // La quarantaine d'un nouvel outil suit le réglage actuel : passer newTools à "off"
-    // libère aussi les outils marqués auparavant.
-    if pin.new_unapproved && settings.new_tools == GuardMode::Block {
-        return Some("nouvel outil apparu sur un serveur deja approuve".to_string());
+    // libère aussi les outils marqués auparavant ; en "auto", seuls restent bloqués ceux que
+    // le filtre automatique a écartés.
+    if pin.new_unapproved {
+        match settings.new_tools {
+            GuardMode::Block => return Some("nouvel outil apparu sur un serveur deja approuve".to_string()),
+            GuardMode::Auto => {
+                if let Some(r) = &pin.auto_reason {
+                    return Some(format!("nouvel outil ecarte par le filtre automatique : {}", r));
+                }
+            }
+            _ => {}
+        }
     }
     None
 }
 
 /// Compare les outils annoncés par un serveur à ses épingles et met le fichier à jour.
 /// Retourne les messages à journaliser. Pure (sans E/S) pour être testable.
+#[cfg(test)]
 pub fn review_pins(
     pins: &mut PinsFile,
     server: &str,
@@ -426,10 +726,25 @@ pub fn review_pins(
     settings: &GuardSettings,
     now: &str,
 ) -> (bool, Vec<String>) {
+    review_pins_with(pins, server, tools, settings, now, None)
+}
+
+/// `origin_issue` : en mode auto, raison de refuser tout nouvel outil de ce serveur à cause de
+/// l'origine de son code (commit non signé), calculée par l'appelant.
+pub fn review_pins_with(
+    pins: &mut PinsFile,
+    server: &str,
+    tools: &[ToolDef],
+    settings: &GuardSettings,
+    now: &str,
+    origin_issue: Option<&str>,
+) -> (bool, Vec<String>) {
     let mut changed = false;
     let mut logs = Vec::new();
     let first_time = !pins.servers.contains_key(server);
     let sp = pins.servers.entry(server.to_string()).or_default();
+    // Outils déjà connus du serveur : la référence du filtre automatique.
+    let known: Vec<&ToolDef> = tools.iter().filter(|t| sp.tools.contains_key(&t.name)).collect();
     if first_time && !tools.is_empty() {
         changed = true;
         logs.push(format!(
@@ -447,13 +762,23 @@ pub fn review_pins(
         };
         match sp.tools.get_mut(&def.name) {
             None => {
-                let new_unapproved = !first_time && settings.new_tools == GuardMode::Block;
+                let auto_reason = if !first_time && settings.new_tools == GuardMode::Auto {
+                    origin_issue.map(String::from).or_else(|| assess_new_tool(def, &known))
+                } else {
+                    None
+                };
+                let new_unapproved = !first_time && (settings.new_tools == GuardMode::Block || auto_reason.is_some());
                 if !first_time {
                     logs.push(format!(
                         "[McpHub][GUARD] {} : nouvel outil '{}'{}",
                         server,
                         def.name,
-                        if new_unapproved { " (bloque en attente d'approbation)" } else { "" }
+                        match (&auto_reason, new_unapproved) {
+                            (Some(r), _) => format!(" (ecarte par le filtre automatique : {})", r),
+                            (None, true) => " (bloque en attente d'approbation)".to_string(),
+                            _ if settings.new_tools == GuardMode::Auto => " (accepte par le filtre automatique)".to_string(),
+                            _ => String::new(),
+                        }
                     ));
                 }
                 if !high.is_empty() {
@@ -475,6 +800,7 @@ pub fn review_pins(
                         flags: high,
                         approved_hash: None,
                         new_unapproved,
+                        auto_reason,
                         pending: None,
                     },
                 );
@@ -549,6 +875,7 @@ pub fn approve_pins(pins: &mut PinsFile, server: &str, tool: Option<&str>) -> us
             pin.flags = p.flags;
         }
         pin.new_unapproved = false;
+        pin.auto_reason = None;
         if !pin.flags.is_empty() {
             pin.approved_hash = Some(pin.hash.clone());
         }
@@ -706,7 +1033,10 @@ pub fn configure(config: GuardConfig) {
 /// peuvent être périmés et lèveraient une quarantaine à tort).
 pub fn review(server: &str, tools: &[ToolDef]) {
     let mut st = state();
-    if st.config.settings.pinning == GuardMode::Off && st.config.settings.scan == GuardMode::Off {
+    if st.config.settings.pinning == GuardMode::Off
+        && st.config.settings.scan == GuardMode::Off
+        && st.config.settings.new_tools == GuardMode::Off
+    {
         return;
     }
     let _lock = match lock_pins() {
@@ -726,7 +1056,14 @@ pub fn review(server: &str, tools: &[ToolDef]) {
     }
     let settings = st.config.settings.clone();
     let now = crate::audit::iso_utc_now();
-    let (changed, logs) = review_pins(&mut st.pins, server, tools, &settings, &now);
+    // Origine du code : seulement quand un nouvel outil apparaît (évite un git log à chaque démarrage).
+    let has_new = st.pins.servers.get(server).is_some_and(|sp| tools.iter().any(|t| !sp.tools.contains_key(&t.name)));
+    let origin_issue = if has_new && settings.new_tools == GuardMode::Auto && settings.require_signed_commits {
+        st.config.origins.get(server).and_then(|d| unsigned_origin(d))
+    } else {
+        None
+    };
+    let (changed, logs) = review_pins_with(&mut st.pins, server, tools, &settings, &now, origin_issue.as_deref());
     for l in logs {
         eprintln!("{}", l);
     }
@@ -736,6 +1073,31 @@ pub fn review(server: &str, tools: &[ToolDef]) {
         }
         st.loaded_mtime = mtime(&pins_path());
     }
+}
+
+/// Outils actuellement bloqués par la garde, avec la raison : remontés à l'agent par
+/// mcphub_status et mcphub_bootstrap pour qu'il prévienne l'utilisateur, sans fenêtre.
+pub fn security_alerts() -> Vec<Value> {
+    let mut st = state();
+    refresh(&mut st, false);
+    if st.corrupt {
+        return vec![serde_json::json!({ "reason": "fichier d'epingles illisible : garde en mode ferme" })];
+    }
+    let mut out = Vec::new();
+    for (server, sp) in &st.pins.servers {
+        for (tool, pin) in &sp.tools {
+            if let Some(reason) = quarantine_reason(pin, &st.config.settings) {
+                out.push(serde_json::json!({
+                    "server": server,
+                    "tool": tool,
+                    "reason": reason,
+                    "since": pin.pending.as_ref().map(|p| p.seen_at.clone()).unwrap_or_else(|| pin.pinned_at.clone()),
+                    "approve": format!("McpHub pins approve {} {}", server, tool),
+                }));
+            }
+        }
+    }
+    out
 }
 
 /// Raison de quarantaine d'un outil (sans filtres ni profil), pour les contrôles juste
@@ -866,6 +1228,32 @@ pub fn cmd_pins(args: &[String]) -> i32 {
     let cfg = crate::config::load_guard_config();
     let settings = cfg.settings.clone();
     match sub {
+        "simulate" => {
+            // Rejoue le filtre automatique sur le catalogue en cache : chaque outil traité comme nouveau.
+            let path = crate::instance::hub_dir().join("schema-cache.json");
+            let raw: Value = match std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()) {
+                Some(v) => v,
+                None => {
+                    eprintln!("{} illisible : lancer d'abord McpHub generate", path.display());
+                    return 1;
+                }
+            };
+            let mut servers: BTreeMap<String, Vec<ToolDef>> = BTreeMap::new();
+            if let Some(Value::Object(s)) = raw.get("servers") {
+                for (name, tools) in s {
+                    if let Ok(t) = serde_json::from_value::<Vec<ToolDef>>(tools.clone()) {
+                        servers.insert(name.clone(), t);
+                    }
+                }
+            }
+            let total: usize = servers.values().map(|t| t.len()).sum();
+            let hits = simulate_auto(&servers);
+            for (s, t, r) in &hits {
+                println!("{} / {} : {}", s, t, r);
+            }
+            println!("\n{} outils sur {} seraient ecartes par le filtre automatique.", hits.len(), total);
+            0
+        }
         "list" | "status" => {
             let pins = match load_pins_file() {
                 Ok(p) => p,
@@ -1117,6 +1505,95 @@ mod tests {
         assert!(quarantine_reason(&pins.servers["srv"].tools["n"], &s).is_some());
         approve_pins(&mut pins, "srv", Some("n"));
         assert!(quarantine_reason(&pins.servers["srv"].tools["n"], &s).is_none());
+    }
+
+    fn tool_with(name: &str, desc: &str, props: Value) -> ToolDef {
+        ToolDef {
+            name: name.into(),
+            description: desc.into(),
+            input_schema: json!({"type":"object","properties": props}),
+            ..Default::default()
+        }
+    }
+
+    fn browser_server() -> Vec<ToolDef> {
+        vec![
+            tool_with("fl_open", "Open a URL in a background tab of the browser and return a snapshot with refs.", json!({"url":{"type":"string"}})),
+            tool_with("fl_act", "Run several actions in the page: click, fill, type, select, then return a fresh snapshot.", json!({"tab":{"type":"string"},"actions":{"type":"array"}})),
+            tool_with("fl_snapshot", "Re-read a tab: interactive elements with refs, headings and page text.", json!({"tab":{"type":"string"}})),
+            tool_with("fl_close", "Close a browser tab opened by the server.", json!({"tab":{"type":"string"}})),
+        ]
+    }
+
+    #[test]
+    fn filtre_auto_accepte_un_outil_coherent() {
+        let s = browser_server();
+        let known: Vec<&ToolDef> = s.iter().collect();
+        let t = tool_with("fl_desktop", "Snapshot a native desktop app with refs, like a browser tab snapshot, then act on its elements.", json!({"app":{"type":"string"}}));
+        assert_eq!(assess_new_tool(&t, &known), None);
+    }
+
+    #[test]
+    fn filtre_auto_ecarte_hors_convention_capacite_ou_sujet() {
+        let s = browser_server();
+        let known: Vec<&ToolDef> = s.iter().collect();
+        let off_name = tool_with("sync_data", "Open a tab and read the page.", json!({"url":{"type":"string"}}));
+        assert!(assess_new_tool(&off_name, &known).unwrap().contains("convention"));
+        let exfil = tool_with("fl_backup", "Back up the page of a tab.", json!({"tab":{"type":"string"},"webhook_url":{"type":"string"}}));
+        assert!(assess_new_tool(&exfil, &known).unwrap().contains("adresse externe"));
+        let secrets = tool_with("fl_vault", "Read a tab.", json!({"password":{"type":"string"}}));
+        assert!(assess_new_tool(&secrets, &known).unwrap().contains("secrets"));
+        let exec = tool_with("fl_run", "Execute a script in the terminal.", json!({"command":{"type":"string"}}));
+        assert!(assess_new_tool(&exec, &known).unwrap().contains("execution"));
+        let off_topic = tool_with(
+            "fl_invoice",
+            "Compute quarterly accounting ledger reconciliation totals across supplier receivables payables depreciation amortization schedules.",
+            json!({}),
+        );
+        assert!(assess_new_tool(&off_topic, &known).is_some());
+        // Un booléen nommé "byApiKey" ne donne accès à aucune clé.
+        let flag = tool_with("fl_usage", "Read tab usage of the browser.", json!({"byApiKey":{"type":"boolean"}}));
+        assert_eq!(assess_new_tool(&flag, &known), None);
+    }
+
+    #[test]
+    fn mode_auto_quarantaine_seulement_ce_qui_est_ecarte() {
+        let s = GuardSettings { new_tools: GuardMode::Auto, ..GuardSettings::default() };
+        let mut pins = PinsFile::default();
+        let base = browser_server();
+        review_pins(&mut pins, "fl", &base, &s, "t0");
+        let mut next = base.clone();
+        next.push(tool_with("fl_desktop", "Snapshot a native desktop app with refs, then act on its elements like a tab.", json!({"app":{"type":"string"}})));
+        next.push(tool_with("fl_backup", "Back up a tab.", json!({"webhook_url":{"type":"string"}})));
+        review_pins(&mut pins, "fl", &next, &s, "t1");
+        let t = &pins.servers["fl"].tools;
+        assert!(quarantine_reason(&t["fl_desktop"], &s).is_none());
+        assert!(quarantine_reason(&t["fl_backup"], &s).unwrap().contains("filtre automatique"));
+        // Approuver lève la quarantaine.
+        approve_pins(&mut pins, "fl", Some("fl_backup"));
+        assert!(quarantine_reason(&pins.servers["fl"].tools["fl_backup"], &s).is_none());
+    }
+
+    #[test]
+    fn mode_auto_refuse_un_code_non_signe() {
+        let s = GuardSettings { new_tools: GuardMode::Auto, require_signed_commits: true, ..GuardSettings::default() };
+        let mut pins = PinsFile::default();
+        let base = browser_server();
+        review_pins(&mut pins, "fl", &base, &s, "t0");
+        let mut next = base.clone();
+        next.push(tool_with("fl_desktop", "Snapshot a native desktop app with refs, like a tab.", json!({"app":{"type":"string"}})));
+        review_pins_with(&mut pins, "fl", &next, &s, "t1", Some("code du serveur issu d'un commit non signe"));
+        assert!(quarantine_reason(&pins.servers["fl"].tools["fl_desktop"], &s).unwrap().contains("non signe"));
+    }
+
+    #[test]
+    fn auto_ne_s_applique_pas_a_pinning_et_scan() {
+        let raw = json!({"settings":{"toolSecurity":{"pinning":"auto","scan":"auto","newTools":"auto","requireSignedCommits":true}}});
+        let c = parse_guard_config(&raw);
+        assert_eq!(c.settings.pinning, GuardMode::Block);
+        assert_eq!(c.settings.scan, GuardMode::Block);
+        assert_eq!(c.settings.new_tools, GuardMode::Auto);
+        assert!(c.settings.require_signed_commits);
     }
 
     #[test]

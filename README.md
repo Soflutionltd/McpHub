@@ -332,6 +332,19 @@ Descriptions and schemas are scanned for invisible Unicode and classic injection
 
 With `"pinning": "off"` (or `"warn"`), changed definitions are accepted automatically but scanned again: a new description that trips the scan is still blocked when `scan` is `block`.
 
+**Automatic review of new tools (`"newTools": "auto"`).** Instead of holding back every new tool, McpHub accepts a new tool on its own when it fits the server, and quarantines it when:
+
+- its name breaks the server's naming convention (a `sync_data` tool on a server whose tools all start with `fl_`);
+- it brings a sensitive capability the server did not have: a text parameter for a password, secret or API key, a code or command parameter on a tool that runs it, or a webhook / callback / upload URL. Capabilities are read from the tool's name and parameters, not from what its description mentions;
+- its description shares almost no vocabulary with the rest of the server;
+- with `"requireSignedCommits": true`, the server runs from a local git checkout whose last commit is not signed by a trusted key (`git log --format=%G?`). A hijacked GitHub account can push code, but cannot sign it with a key that only lives on your machine.
+
+```json
+"settings": { "toolSecurity": { "pinning": "off", "scan": "block", "newTools": "auto", "requireSignedCommits": true } }
+```
+
+There is no pop-up: blocked tools are listed under `securityAlerts` in `mcphub_status` and `mcphub_bootstrap`, so the agent tells you at the start of the next conversation, and a call to a blocked tool returns the reason. `McpHub pins simulate` replays the filter on every cached tool, as if each were new, to check it would not hold back legitimate tools.
+
 </details>
 
 <details>

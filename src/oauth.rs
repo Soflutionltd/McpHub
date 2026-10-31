@@ -123,10 +123,8 @@ struct CrossProcessLock(std::fs::File);
 
 impl Drop for CrossProcessLock {
     fn drop(&mut self) {
-        use std::os::unix::io::AsRawFd;
-        unsafe {
-            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
-        }
+        // Verrou de fichier de la bibliothèque standard : flock sous Unix, LockFileEx sous Windows.
+        let _ = self.0.unlock();
     }
 }
 
@@ -135,7 +133,6 @@ fn lock_path(server: &str) -> std::path::PathBuf {
 }
 
 fn lock_file(path: &std::path::Path) -> Result<CrossProcessLock, String> {
-    use std::os::unix::io::AsRawFd;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("verrou OAuth : {}", e))?;
     }
@@ -145,9 +142,7 @@ fn lock_file(path: &std::path::Path) -> Result<CrossProcessLock, String> {
         .write(true)
         .open(path)
         .map_err(|e| format!("verrou OAuth : {}", e))?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(format!("verrou OAuth : {}", std::io::Error::last_os_error()));
-    }
+    file.lock().map_err(|e| format!("verrou OAuth : {}", e))?;
     Ok(CrossProcessLock(file))
 }
 

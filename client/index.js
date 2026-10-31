@@ -209,7 +209,7 @@ async function readAuthToken() {
 }
 
 function createHubClient() {
-  return new Client({ name: 'mcphub-client', version: '1.2.1' });
+  return new Client({ name: 'mcphub-client', version: '1.3.0' });
 }
 
 async function connectDaemon() {
@@ -724,6 +724,7 @@ async function readDaemonStatus() {
     cacheExists: payload.cacheExists,
     totalTools: payload.totalTools,
     settings: payload.settings,
+    securityAlerts: payload.securityAlerts ?? [],
     servers: (payload.servers ?? []).map((server) => ({
       name: server.name,
       status: server.status,
@@ -745,7 +746,7 @@ async function readDaemonStatus() {
 
 const server = new McpServer({
   name: 'McpHub',
-  version: '1.2.1'
+  version: '1.3.0'
 });
 
 const projectFields = {
@@ -760,7 +761,7 @@ server.registerTool(
   'mcphub_bootstrap',
   {
     description:
-      'Call once per conversation. Resolves project aliases and permissions, then recalls compact MemoryPilot context. This is the only tool that triggers MemoryPilot implicitly.',
+      'Call once per conversation. Resolves project aliases and permissions, then recalls compact MemoryPilot context. This is the only tool that triggers MemoryPilot implicitly. When the result has securityAlerts, tell the user which tools McpHub blocked and why.',
     inputSchema: {
       ...projectFields,
       hints: z.string().optional().describe('Current task keywords.')
@@ -784,8 +785,20 @@ server.registerTool(
     }
     usage.bootstrapCalls += 1;
     markUsageDirty();
-    const context = await recallContext(projectName, workspace, hints);
+    const [context, securityAlerts] = await Promise.all([
+      recallContext(projectName, workspace, hints),
+      readDaemonStatus()
+        .then((s) => s.securityAlerts)
+        .catch(() => [])
+    ]);
     return textResult({
+      ...(securityAlerts.length
+        ? {
+            securityAlerts,
+            securityNotice:
+              'McpHub has blocked these tools. Tell the user now, in one or two sentences: which server and tool, and why. Do not approve them yourself; the user decides after review.'
+          }
+        : {}),
       project: projectName,
       workspace,
       ...(projectConfig
@@ -972,7 +985,7 @@ server.registerTool(
   'mcphub_status',
   {
     description:
-      'Show redacted child-server health, authentication state and the active hub transport. Never returns commands, arguments, environment variables, or secrets.',
+      'Show redacted child-server health, authentication state, the active hub transport and securityAlerts (tools the guard blocked, with the reason). Never returns commands, arguments, environment variables, or secrets.',
     inputSchema: {
       server: z.string().optional(),
       working_dir: projectFields.working_dir

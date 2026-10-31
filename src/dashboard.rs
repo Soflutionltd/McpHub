@@ -393,7 +393,8 @@ fn handle_get_servers() -> Vec<u8> {
         "servers": result,
         "settings": config.get("settings").unwrap_or(&json!({})),
         "totalTools": total_tools,
-        "cacheExists": cache.is_some()
+        "cacheExists": cache.is_some(),
+        "securityAlerts": crate::toolguard::security_alerts()
     }))
 }
 
