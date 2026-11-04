@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { readFile, stat, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, normalize, parse, sep } from 'node:path';
 
@@ -57,12 +58,16 @@ const cursorCatalogDescriptionLimit = 200;
 // outil par mcp__<nom>__.
 const hubServerName = 'McpHub';
 
-// Trace des injections du hook SessionStart de MemoryPilot (même dossier que
-// sa base) : workspace → horodatage de la dernière injection réussie.
-const memoryPilotDirectory = process.env.MEMORYPILOT_DB
-  ? dirname(process.env.MEMORYPILOT_DB)
-  : join(homedir(), '.MemoryPilot');
-const hookInjectionsPath = join(memoryPilotDirectory, 'session-hook-injections.json');
+// Trace des injections du hook SessionStart de MemoryPilot : workspace →
+// horodatage de la dernière injection réussie. À côté de MEMORYPILOT_DB quand
+// il est défini (tests), sinon dans state/ (MemoryPilot --migrate-layout),
+// sinon à la racine pour une installation pas encore rangée.
+const memoryPilotRoot = join(homedir(), '.MemoryPilot');
+const hookInjectionsPath = process.env.MEMORYPILOT_DB
+  ? join(dirname(process.env.MEMORYPILOT_DB), 'session-hook-injections.json')
+  : existsSync(join(memoryPilotRoot, 'state'))
+    ? join(memoryPilotRoot, 'state', 'session-hook-injections.json')
+    : join(memoryPilotRoot, 'session-hook-injections.json');
 // Au-delà, la session a pu être compactée ou reprise ailleurs : recall complet.
 const hookInjectionMaxAgeMs = 10 * 60_000;
 
