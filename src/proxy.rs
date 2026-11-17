@@ -1477,6 +1477,14 @@ impl ProxyServer {
         let Some(code) = args.get("code").and_then(|v| v.as_str()).map(String::from) else {
             return JsonRpcResponse::error(id, -32602, "Missing 'code' parameter".into());
         };
+        // Règles de projet : contrôlées avant de lancer quoi que ce soit.
+        let policy = match args.get("policy").map(crate::codemode::RunPolicy::from_json) {
+            None => None,
+            Some(Ok(policy)) => Some(policy),
+            Some(Err(e)) => {
+                return JsonRpcResponse::error(id, -32602, format!("Invalid 'policy' parameter: {}", e));
+            }
+        };
         let timeout_secs = args
             .get("timeout_secs")
             .and_then(|v| v.as_u64())
@@ -1550,6 +1558,13 @@ impl ProxyServer {
                     calls += 1;
                     if calls > cfg.max_calls {
                         serde_json::json!({"id": req_id, "ok": false, "error": format!("limite de {} appels atteinte", cfg.max_calls)})
+                    } else if let Some(Err(refusal)) = policy.as_ref().map(|p| {
+                        p.check_call(
+                            msg.get("server").and_then(|v| v.as_str()).unwrap_or(""),
+                            msg.get("args").unwrap_or(&serde_json::Value::Null),
+                        )
+                    }) {
+                        serde_json::json!({"id": req_id, "ok": false, "error": refusal})
                     } else {
                         let call_args = serde_json::json!({
                             "server": msg.get("server").cloned().unwrap_or_default(),
@@ -1588,26 +1603,44 @@ impl ProxyServer {
                     }
                 }
                 "search" => {
-                    let mut search_args = serde_json::json!({
-                        "query": msg.get("query").cloned().unwrap_or_default(),
-                        "top_k": 10,
-                        "expand": true,
-                    });
-                    if let Some(server) = msg.get("server").filter(|v| v.is_string()) {
-                        search_args["server"] = server.clone();
-                    }
-                    let Ok(resp) =
-                        tokio::time::timeout_at(deadline, Box::pin(self.handle_discover(None, search_args))).await
-                    else {
-                        outcome = Err(format!("temps depasse ({} s) pendant une recherche", timeout_secs));
-                        break;
-                    };
-                    let result = resp
-                        .result
+                    const SEARCH_RESULTS: usize = 10;
+                    let server_filter = msg.get("server").and_then(|v| v.as_str());
+                    let refusal = policy
                         .as_ref()
-                        .map(crate::codemode::simplify_result)
-                        .unwrap_or_default();
-                    serde_json::json!({"id": req_id, "ok": true, "result": result.get("results").cloned().unwrap_or(result)})
+                        .zip(server_filter)
+                        .and_then(|(p, server)| p.check_server(server).err());
+                    if let Some(refusal) = refusal {
+                        serde_json::json!({"id": req_id, "ok": false, "error": refusal})
+                    } else {
+                        let mut search_args = serde_json::json!({
+                            "query": msg.get("query").cloned().unwrap_or_default(),
+                            // Sous policy, on cherche plus large : le filtrage retire des résultats.
+                            "top_k": if policy.is_some() { 50 } else { SEARCH_RESULTS },
+                            "expand": true,
+                        });
+                        if let Some(server) = server_filter {
+                            search_args["server"] = serde_json::json!(server);
+                        }
+                        let Ok(resp) =
+                            tokio::time::timeout_at(deadline, Box::pin(self.handle_discover(None, search_args))).await
+                        else {
+                            outcome = Err(format!("temps depasse ({} s) pendant une recherche", timeout_secs));
+                            break;
+                        };
+                        let result = resp
+                            .result
+                            .as_ref()
+                            .map(crate::codemode::simplify_result)
+                            .unwrap_or_default();
+                        let found = match &policy {
+                            Some(p) => p.filter_search_results(
+                                result.get("results").unwrap_or(&serde_json::Value::Null),
+                                SEARCH_RESULTS,
+                            ),
+                            None => result.get("results").cloned().unwrap_or(result),
+                        };
+                        serde_json::json!({"id": req_id, "ok": true, "result": found})
+                    }
                 }
                 "done" => {
                     logs = msg.get("logs").cloned().unwrap_or(logs);
@@ -1641,7 +1674,7 @@ impl ProxyServer {
             error: outcome.as_ref().err().cloned(),
         })
         .await;
-        let mut payload = serde_json::json!({ "calls": calls, "duration_ms": elapsed, "logs": logs });
+        let mut payload = crate::codemode::run_payload(calls, elapsed, logs, policy.is_some());
         let is_error = outcome.is_err();
         match outcome {
             Ok(v) => payload["result"] = v,
@@ -2322,7 +2355,7 @@ fn server_matches_filter(server_name: &str, filter: &str) -> bool {
     normalized_server_name == normalized_filter || server_name.eq_ignore_ascii_case(filter)
 }
 
-fn normalize_server_key(value: &str) -> String {
+pub(crate) fn normalize_server_key(value: &str) -> String {
     value.to_lowercase().replace(['-', '_', ' '], "")
 }
 
@@ -2898,6 +2931,25 @@ mod tests {
             .handle_hub_tool(Some(json!(1)), "registry_install", json!({"name": "io.example/x"}), None)
             .await;
         assert!(response.error.expect("refus").message.contains("interdit"));
+    }
+
+    #[tokio::test]
+    async fn policy_mal_formee_refusee_avant_tout_lancement() {
+        let hub = hub_with_permissions(crate::permissions::PermissionsConfig::default());
+        for invalid in [
+            json!("supabase"),
+            json!({"allowed_servers": "supabase"}),
+            json!({"denied_servers": [1]}),
+            json!({"pinned_args": {"supabase": "xyz"}}),
+            json!({"allowed_server": ["supabase"]}),
+        ] {
+            let response = hub
+                .handle_run(Some(json!(1)), json!({"code": "return 1", "policy": invalid}))
+                .await;
+            let error = response.error.expect("policy refusee");
+            assert_eq!(error.code, -32602);
+            assert!(error.message.contains("policy"), "{}", error.message);
+        }
     }
 
     #[test]
