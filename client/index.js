@@ -14,6 +14,7 @@ import {
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
+import { encode as encodeToon } from '@toon-format/toon';
 import { z } from 'zod';
 
 // Instance nommée (un McpHub par client) : mêmes règles que le moteur Rust.
@@ -234,14 +235,18 @@ const shapingFields = {
     .min(1_000)
     .optional()
     .describe('Cut the result text beyond this size; the rest stays readable by handle.'),
+  format: z
+    .enum(['json', 'toon'])
+    .optional()
+    .describe('toon writes a JSON result as TOON: each list of rows as one header line plus one line per row.'),
   raw: z
     .boolean()
     .optional()
     .describe('Return the child result untouched (no pruning, no cut).')
 };
 
-function pickShaping({ fields, max_rows, max_chars, raw }) {
-  return { fields, max_rows, max_chars, raw };
+function pickShaping({ fields, max_rows, max_chars, format, raw }) {
+  return { fields, max_rows, max_chars, format, raw };
 }
 
 /** @type {Map<string, { text: string, server: string }>} poignée → texte complet, les plus anciens sortent en premier */
@@ -380,6 +385,10 @@ function shapeText(text, shaping, notes, server) {
       notes.push(
         `Large result: ${shaped.length} chars for ${rows} rows. Next time pass fields (keys to keep) and max_rows to this call.`
       );
+    }
+    if (shaping.format === 'toon') {
+      shaped = encodeToon(json);
+      json = undefined;
     }
   }
   const limit = shaping.max_chars ?? defaultResultMaxChars;
@@ -732,6 +741,47 @@ function enforceProjectPolicy({ projectName, projectConfig, server, tool, args, 
   return securedArgs;
 }
 
+// Dans un script mcphub_run les appels partent du moteur, pas d'ici : les
+// règles du projet lui sont transmises et c'est lui qui les applique à chaque
+// mcp.call. Reprend exactement ce que enforceProjectPolicy vérifie.
+function runPolicyFor(projectConfig, workingDirectory) {
+  const denied = [...serverOwners.keys()].filter((server) => !ownerAllows(server, workingDirectory));
+  if (!projectConfig) return denied.length ? { denied_servers: denied } : undefined;
+
+  const aliases = projectConfig.aliases ?? {};
+  const pinned = {
+    ...(aliases.supabaseProjectId ? { supabase: { project_id: aliases.supabaseProjectId } } : {}),
+    ...(aliases.appStoreAppId
+      ? {
+          'app-store-connect': { appId: aliases.appStoreAppId },
+          'appstore-operator': { appId: aliases.appStoreAppId }
+        }
+      : {}),
+    ...(aliases.cloudflareProject
+      ? { 'cf-orchestrator': { cf_project_name: aliases.cloudflareProject } }
+      : {})
+  };
+  return {
+    allowed_servers: [...allowedServersOf(projectConfig)].filter((server) =>
+      ownerAllows(server, workingDirectory)
+    ),
+    ...(denied.length ? { denied_servers: denied } : {}),
+    ...(Object.keys(pinned).length ? { pinned_args: pinned } : {})
+  };
+}
+
+// Un moteur plus ancien ignorerait la policy sans le dire : on ne lui confie un
+// script soumis à des règles que s'il déclare savoir les appliquer.
+async function daemonEnforcesRunPolicy() {
+  const connection = await connectHub();
+  if (connection.enforcesRunPolicy === undefined) {
+    const { tools } = await connection.client.listTools();
+    const run = tools.find((tool) => tool.name === 'mcphub_run');
+    connection.enforcesRunPolicy = Boolean(run?.inputSchema?.properties?.policy);
+  }
+  return connection.enforcesRunPolicy;
+}
+
 // Le recall MemoryPilot n'est déclenché que par mcphub_bootstrap : il ne doit
 // jamais retarder un appel Supabase ou Cloudflare qui n'en a pas besoin.
 // Le processus vit aussi longtemps que la fenêtre Cursor, donc sur plusieurs
@@ -1072,7 +1122,7 @@ const server = new McpServer(
   }
 );
 
-// Les 6 outils réellement enregistrés, pour mesurer ce que McpHub coûte
+// Les 7 outils réellement enregistrés, pour mesurer ce que McpHub coûte
 // dans le catalogue du client (mcphub_savings).
 const hubTools = new Map();
 function registerHubTool(name, config, handler) {
@@ -1326,6 +1376,52 @@ registerHubTool(
 );
 
 registerHubTool(
+  'mcphub_run',
+  {
+    description:
+      'Run JavaScript that chains several child MCP tool calls in a sandbox and returns only the final value: use it for multi-step or bulk work instead of many mcphub_call round-trips. Inside the code: `await mcp.call(server, tool, args)` returns the tool result, `await mcp.search(query, server?)` finds tools, console.log is captured, `return` gives the output. No filesystem, network or require. Project permissions apply to every call.',
+    inputSchema: {
+      code: z
+        .string()
+        .describe(
+          "Body of an async function, e.g. const p = await mcp.call('supabase','list_projects',{}); return p.length;"
+        ),
+      timeout_secs: z.number().int().min(5).max(300).optional(),
+      max_chars: shapingFields.max_chars,
+      ...projectFields
+    }
+  },
+  async ({ code, timeout_secs, max_chars, project, working_dir }) => {
+    try {
+      const [, projectConfig] = resolveProject(project, working_dir);
+      const policy = runPolicyFor(projectConfig, working_dir);
+      if (policy && !(await daemonEnforcesRunPolicy())) {
+        return textResult(
+          'mcphub_run is unavailable here: this folder has project rules and the running McpHub daemon is too old to enforce them inside a script. Update McpHub, or use mcphub_call and mcphub_batch.',
+          true
+        );
+      }
+      usage.runs = (usage.runs ?? 0) + 1;
+      markUsageDirty();
+      const result = await callHubTool('mcphub_run', {
+        code,
+        ...(timeout_secs ? { timeout_secs } : {}),
+        ...(policy ? { policy } : {})
+      });
+      if (policy && !result.isError && parseJsonContainer(extractText(result))?.policy !== 'enforced') {
+        return textResult(
+          'mcphub_run ran but the daemon did not confirm that the project rules were enforced: result withheld. Update McpHub.',
+          true
+        );
+      }
+      return shapeChildResult(result, { max_chars }, hubLocalServer).result;
+    } catch (error) {
+      return errorToResult(error);
+    }
+  }
+);
+
+registerHubTool(
   'mcphub_status',
   {
     description:
@@ -1438,7 +1534,7 @@ registerHubTool(
         savedBytes: claudeCodeSaved,
         approximateTokensSavedPerConversation: Math.round(claudeCodeSaved / 4),
         methodology:
-          'Names against names: Claude Code lists deferred tools as mcp__<server>__<tool> and loads schemas on demand, for the direct catalog as for the 6 McpHub tools. Not counted: usage costs on either side (schemas loaded on demand, mcphub_search results, extra round trips). Bytes divided by four; excludes prompts and tool results.'
+          'Names against names: Claude Code lists deferred tools as mcp__<server>__<tool> and loads schemas on demand, for the direct catalog as for the 7 McpHub tools. Not counted: usage costs on either side (schemas loaded on demand, mcphub_search results, extra round trips). Bytes divided by four; excludes prompts and tool results.'
       };
       const legacySaved = Math.max(
         0,

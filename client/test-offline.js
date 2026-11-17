@@ -14,6 +14,9 @@ import { z } from 'zod';
 
 const token = 'mcphub_test_token';
 const received = [];
+const runs = [];
+// A daemon that predates script policies does not declare `policy` on mcphub_run.
+let declareRunPolicy = true;
 
 function fakeHub() {
   const hub = new McpServer({ name: 'fake-hub', version: '1.0.0' });
@@ -61,6 +64,21 @@ function fakeHub() {
       return { content: [{ type: 'text', text: `done ${args.tool}` }] };
     }
   );
+  hub.registerTool(
+    'mcphub_run',
+    {
+      inputSchema: {
+        code: z.string(),
+        timeout_secs: z.number().optional(),
+        ...(declareRunPolicy ? { policy: z.record(z.string(), z.unknown()).optional() } : {})
+      }
+    },
+    async (args) => {
+      runs.push(args);
+      const payload = { calls: 2, duration_ms: 5, logs: [], result: 42, ...(args.policy ? { policy: 'enforced' } : {}) };
+      return { content: [{ type: 'text', text: JSON.stringify(payload) }] };
+    }
+  );
   return hub;
 }
 
@@ -104,7 +122,20 @@ const clientEnv = {
   MCPHUB_DAEMON_URL: `http://127.0.0.1:${port}`,
   MEMORYPILOT_DB: join(home, 'memorypilot', 'memory.db')
 };
-await writeFile(join(home, 'projects.json'), '{"projects":{}}');
+const acme = join(home, 'acme');
+await writeFile(
+  join(home, 'projects.json'),
+  JSON.stringify({
+    projects: {
+      acme: {
+        workspaces: [acme],
+        aliases: { supabaseProjectId: 'ref-acme' },
+        allowedServers: ['db', 'supabase'],
+        ownedServers: ['acme-crm']
+      }
+    }
+  })
+);
 await writeFile(
   join(home, 'schema-cache.json'),
   JSON.stringify({ servers: { db: [{ name: 'read_row', description: 'Read one row.' }] } })
@@ -232,6 +263,22 @@ try {
   // The advice reaches every client at startup.
   assert.match(client.getInstructions() ?? '', /pass fields .* and max_rows/);
 
+  // format toon writes the rows once under one header line.
+  const toon = await client.callTool(call('list_rows', { format: 'toon', fields: ['id', 'name'] }));
+  assert.equal(text(toon), 'rows[3]{id,name}:\n  1,alpha\n  2,beta\n  3,gamma\ntags: []');
+
+  // A script outside any project runs without a policy, except for servers owned by a project.
+  const run = (extra = {}) => client.callTool({ name: 'mcphub_run', arguments: { code: 'return 42;', ...extra } });
+  assert.equal(JSON.parse(text(await run())).result, 42);
+  assert.deepEqual(runs.at(-1).policy, { denied_servers: ['acme-crm'] });
+
+  // Inside a project the daemon receives the same rules mcphub_call enforces.
+  assert.equal(JSON.parse(text(await run({ working_dir: acme }))).policy, 'enforced');
+  assert.deepEqual(runs.at(-1).policy, {
+    allowed_servers: ['db', 'supabase', 'acme-crm'],
+    pinned_args: { supabase: { project_id: 'ref-acme' } }
+  });
+
   // A long text is cut and the rest is read by handle, to the last character.
   const cut = await client.callTool(call('big_text', { max_chars: 1000 }));
   assert.equal(text(cut), 'a'.repeat(1000));
@@ -312,6 +359,7 @@ try {
     arguments: { working_dir: workspace, ...(hints ? { hints } : {}) }
   });
 
+  declareRunPolicy = false;
   const claudeCode = new Client({ name: 'claude-code', version: '2.0.0' });
   await claudeCode.connect(
     new StdioClientTransport({
@@ -354,7 +402,17 @@ try {
     const versus = savings.versusClaudeCodeDeferredLoading;
     assert.equal(versus.directCatalogBytes, Buffer.byteLength('mcp__db__read_row\n'));
     const hubNames = (await claudeCode.listTools()).tools.map((tool) => `mcp__McpHub__${tool.name}\n`);
-    assert.equal(hubNames.length, 6);
+    assert.equal(hubNames.length, 7);
+
+    // A daemon too old to enforce project rules in a script never receives one.
+    const runsBefore = runs.length;
+    const refused = await claudeCode.callTool({
+      name: 'mcphub_run',
+      arguments: { code: 'return 1;', working_dir: acme }
+    });
+    assert.equal(refused.isError, true);
+    assert.match(text(refused), /too old to enforce/);
+    assert.equal(runs.length, runsBefore);
     assert.equal(versus.hubCatalogBytes, Buffer.byteLength(hubNames.join('')));
   } finally {
     await claudeCode.close();
