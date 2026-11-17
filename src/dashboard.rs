@@ -6,9 +6,11 @@ use crate::protocol::JsonRpcRequest;
 use crate::proxy::ProxyServer;
 use crate::sse::{extract_session_id, SseManager};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -93,14 +95,81 @@ fn save_config(config: &Value) -> Result<(), Vec<u8>> {
         .map_err(|e| json_err(500, &format!("Failed to save config: {}", e)))
 }
 
-fn read_cache() -> Option<Value> {
+/// What the dashboard needs from schema-cache.json, per server: tool names and
+/// an estimate of the schema size in tokens, plus the cached start errors.
+struct CacheSummary {
+    servers: HashMap<String, CachedServer>,
+    errors: HashMap<String, String>,
+}
+
+struct CachedServer {
+    tool_names: Vec<String>,
+    schema_tokens: usize,
+}
+
+fn summarize_cache(cache: &Value) -> CacheSummary {
+    let servers = cache
+        .get("servers")
+        .and_then(|v| v.as_object())
+        .map(|servers| {
+            servers
+                .iter()
+                .map(|(name, tools)| {
+                    let tool_names = tools
+                        .as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let schema_tokens = tools.to_string().len() / 4;
+                    (name.clone(), CachedServer { tool_names, schema_tokens })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let errors = cache
+        .get("errors")
+        .and_then(|v| v.as_object())
+        .map(|errors| {
+            errors
+                .iter()
+                .filter_map(|(name, error)| error.as_str().map(|e| (name.clone(), e.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    CacheSummary { servers, errors }
+}
+
+/// Modification time and size of the cache file: the summary is rebuilt only
+/// when one of them changes (the hub rewrites the whole file on every update).
+type CacheStamp = (SystemTime, u64);
+
+static CACHE_SUMMARY: Mutex<Option<(CacheStamp, Arc<CacheSummary>)>> = Mutex::new(None);
+
+/// Parsing the 10+ MB schema cache on every /api/servers request cost about
+/// 250 ms; the summary is kept in memory and reused while the file is unchanged.
+fn read_cache_summary() -> Option<Arc<CacheSummary>> {
     let path = cache_path();
-    if !path.exists() {
-        return None;
+    let metadata = fs::metadata(&path).ok()?;
+    let stamp = metadata.modified().ok().map(|modified| (modified, metadata.len()));
+    let mut slot = CACHE_SUMMARY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let (Some(stamp), Some((cached_stamp, summary))) = (stamp, slot.as_ref()) {
+        if stamp == *cached_stamp {
+            return Some(Arc::clone(summary));
+        }
     }
-    fs::read_to_string(&path)
+    let parsed: Option<Value> = fs::read_to_string(&path)
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
+        .and_then(|s| serde_json::from_str(&s).ok());
+    let Some(cache) = parsed else {
+        *slot = None;
+        return None;
+    };
+    let summary = Arc::new(summarize_cache(&cache));
+    *slot = stamp.map(|stamp| (stamp, Arc::clone(&summary)));
+    Some(summary)
 }
 
 // ─── HTTP Parsing ────────────────────────────────────────────
@@ -327,22 +396,10 @@ fn handle_get_servers() -> Vec<u8> {
         Ok(c) => c,
         Err(resp) => return resp,
     };
-    let cache = read_cache();
+    let cache = read_cache_summary();
     let servers_obj = config
         .get("mcpServers")
         .or_else(|| config.get("servers"))
-        .and_then(|v| v.as_object())
-        .cloned()
-        .unwrap_or_default();
-    let cached_servers = cache
-        .as_ref()
-        .and_then(|c| c.get("servers"))
-        .and_then(|v| v.as_object())
-        .cloned()
-        .unwrap_or_default();
-    let cached_errors = cache
-        .as_ref()
-        .and_then(|c| c.get("errors"))
         .and_then(|v| v.as_object())
         .cloned()
         .unwrap_or_default();
@@ -353,20 +410,14 @@ fn handle_get_servers() -> Vec<u8> {
 
     for name in &names {
         let srv = &servers_obj[name];
-        let cached = cached_servers.get(name);
-        let tools: Vec<String> = cached
-            .and_then(|c| c.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let cached = cache.as_ref().and_then(|c| c.servers.get(name));
+        let tools: Vec<String> = cached.map(|c| c.tool_names.clone()).unwrap_or_default();
         let tool_count = tools.len();
 
-        let error_msg = cached_errors
-            .get(name)
-            .and_then(|v| v.as_str())
+        let error_msg = cache
+            .as_ref()
+            .and_then(|c| c.errors.get(name))
+            .map(String::as_str)
             .unwrap_or("");
 
         result.push(json!({
@@ -376,7 +427,7 @@ fn handle_get_servers() -> Vec<u8> {
             "env": srv.get("env").unwrap_or(&json!({})),
             "disabled": srv.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false),
             "tools": tool_count,
-            "schemaTokens": cached.map(|c| c.to_string().len() / 4).unwrap_or(0),
+            "schemaTokens": cached.map(|c| c.schema_tokens).unwrap_or(0),
             "url": srv.get("url").and_then(|v| v.as_str()).unwrap_or(""),
             "toolNames": tools,
             "status": if cached.is_some() { "cached" } else if !error_msg.is_empty() { "error" } else { "uncached" },
@@ -1601,5 +1652,32 @@ mod oauth_page_tests {
         assert!(oauth_callback_page(OauthPage::Connected, true).contains("Connexion réussie"));
         assert!(oauth_callback_page(OauthPage::Connected, false).contains("You're connected"));
         assert!(oauth_callback_page(OauthPage::Expired, false).contains("McpHub oauth login SERVER"));
+    }
+}
+
+#[cfg(test)]
+mod cache_summary_tests {
+    use super::*;
+
+    #[test]
+    fn summary_keeps_tool_names_sizes_and_errors() {
+        let tools = json!([{ "name": "deploy", "inputSchema": {} }, { "name": "rollback" }, { "title": "sans nom" }]);
+        let cache = json!({
+            "servers": { "cf": tools.clone() },
+            "errors": { "broken": "spawn failed", "ignored": 42 }
+        });
+        let summary = summarize_cache(&cache);
+        let cf = &summary.servers["cf"];
+        assert_eq!(cf.tool_names, vec!["deploy".to_string(), "rollback".to_string()]);
+        assert_eq!(cf.schema_tokens, tools.to_string().len() / 4);
+        assert_eq!(summary.errors.get("broken").map(String::as_str), Some("spawn failed"));
+        assert!(!summary.errors.contains_key("ignored"));
+    }
+
+    #[test]
+    fn empty_cache_gives_empty_summary() {
+        let summary = summarize_cache(&json!({}));
+        assert!(summary.servers.is_empty());
+        assert!(summary.errors.is_empty());
     }
 }
