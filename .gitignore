@@ -7,3 +7,6 @@ dashboard/.svelte-kit/
 *.bak-*
 dist/
 client/node_modules/
+
+# Rapports locaux de scan de secrets (jamais dans git)
+secrets-trouves.csv
