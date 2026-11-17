@@ -94,6 +94,9 @@ pub struct GlobalMetrics {
     /// Per-tool call counts (key = "server__tool"). Used to boost BM25 ranking
     /// so frequently-used tools surface first. Persisted to ~/.McpHub/usage-stats.json.
     pub tool_calls: HashMap<String, u64>,
+    /// Par outil ("serveur__outil") : appels réels, erreurs, hits de cache, p50 et p95 sur
+    /// les 200 dernières durées. En mémoire seulement (remis à zéro au redémarrage).
+    pub tools: HashMap<String, crate::metrics::ToolMetrics>,
 }
 
 impl GlobalMetrics {
@@ -106,6 +109,7 @@ impl GlobalMetrics {
             execute_routing: ExecuteRoutingMetrics::default(),
             servers: HashMap::new(),
             tool_calls: load_usage_stats(),
+            tools: HashMap::new(),
         }
     }
 }
@@ -124,16 +128,6 @@ fn load_usage_stats() -> HashMap<String, u64> {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
-}
-
-fn save_usage_stats(stats: &HashMap<String, u64>) {
-    let path = usage_stats_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(json) = serde_json::to_string(stats) {
-        let _ = std::fs::write(&path, json);
-    }
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
@@ -198,6 +192,8 @@ pub struct ProxyServer {
     pub metrics: Arc<Mutex<GlobalMetrics>>,
     catalog_refresh_in_progress: Arc<AtomicBool>,
     response_cache: Arc<ResponseCache>,
+    /// Écriture différée de usage-stats.json (au plus une toutes les 2 secondes).
+    usage_writer: Arc<crate::metrics::UsageWriter>,
     confirmations: Arc<ConfirmStore>,
     audit: Arc<AuditLogger>,
     /// Requêtes en cours : le redémarrage après une mise à jour attend qu'il n'y en ait plus.
@@ -233,6 +229,8 @@ enum PolicyGate {
 impl ProxyServer {
     pub fn new(config: ProxyConfig) -> Self {
         crate::toolguard::configure(config.guard.clone());
+        let response_cache = ResponseCache::new();
+        response_cache.set_ttl_secs(config.response_cache.ttl_secs);
         let child_manager = Arc::new(ChildManager::new(
             config.servers.clone(),
             config.idle_timeout_ms,
@@ -245,7 +243,11 @@ impl ProxyServer {
             search_engine: Arc::new(Mutex::new(SearchEngine::new())),
             metrics: Arc::new(Mutex::new(GlobalMetrics::new())),
             catalog_refresh_in_progress: Arc::new(AtomicBool::new(false)),
-            response_cache: Arc::new(ResponseCache::new()),
+            response_cache: Arc::new(response_cache),
+            usage_writer: Arc::new(crate::metrics::UsageWriter::new(
+                usage_stats_path(),
+                crate::metrics::USAGE_WRITE_INTERVAL,
+            )),
             confirmations: Arc::new(ConfirmStore::new()),
             audit: Arc::new(AuditLogger::new(crate::audit::default_path())),
             in_flight: Arc::new(AtomicUsize::new(0)),
@@ -801,6 +803,8 @@ impl ProxyServer {
     }
 
     pub async fn shutdown(&self) {
+        // Les compteurs d'usage en attente d'écriture différée ne sont pas perdus à l'arrêt.
+        self.usage_writer.flush();
         self.child_manager.stop_all().await;
     }
 
@@ -1541,6 +1545,14 @@ impl ProxyServer {
         let Some(code) = args.get("code").and_then(|v| v.as_str()).map(String::from) else {
             return JsonRpcResponse::error(id, -32602, "Missing 'code' parameter".into());
         };
+        // Règles de projet : contrôlées avant de lancer quoi que ce soit.
+        let policy = match args.get("policy").map(crate::codemode::RunPolicy::from_json) {
+            None => None,
+            Some(Ok(policy)) => Some(policy),
+            Some(Err(e)) => {
+                return JsonRpcResponse::error(id, -32602, format!("Invalid 'policy' parameter: {}", e));
+            }
+        };
         let timeout_secs = args
             .get("timeout_secs")
             .and_then(|v| v.as_u64())
@@ -1614,6 +1626,13 @@ impl ProxyServer {
                     calls += 1;
                     if calls > cfg.max_calls {
                         serde_json::json!({"id": req_id, "ok": false, "error": format!("limite de {} appels atteinte", cfg.max_calls)})
+                    } else if let Some(Err(refusal)) = policy.as_ref().map(|p| {
+                        p.check_call(
+                            msg.get("server").and_then(|v| v.as_str()).unwrap_or(""),
+                            msg.get("args").unwrap_or(&serde_json::Value::Null),
+                        )
+                    }) {
+                        serde_json::json!({"id": req_id, "ok": false, "error": refusal})
                     } else {
                         let call_args = serde_json::json!({
                             "server": msg.get("server").cloned().unwrap_or_default(),
@@ -1652,26 +1671,44 @@ impl ProxyServer {
                     }
                 }
                 "search" => {
-                    let mut search_args = serde_json::json!({
-                        "query": msg.get("query").cloned().unwrap_or_default(),
-                        "top_k": 10,
-                        "expand": true,
-                    });
-                    if let Some(server) = msg.get("server").filter(|v| v.is_string()) {
-                        search_args["server"] = server.clone();
-                    }
-                    let Ok(resp) =
-                        tokio::time::timeout_at(deadline, Box::pin(self.handle_discover(None, search_args))).await
-                    else {
-                        outcome = Err(format!("temps depasse ({} s) pendant une recherche", timeout_secs));
-                        break;
-                    };
-                    let result = resp
-                        .result
+                    const SEARCH_RESULTS: usize = 10;
+                    let server_filter = msg.get("server").and_then(|v| v.as_str());
+                    let refusal = policy
                         .as_ref()
-                        .map(crate::codemode::simplify_result)
-                        .unwrap_or_default();
-                    serde_json::json!({"id": req_id, "ok": true, "result": result.get("results").cloned().unwrap_or(result)})
+                        .zip(server_filter)
+                        .and_then(|(p, server)| p.check_server(server).err());
+                    if let Some(refusal) = refusal {
+                        serde_json::json!({"id": req_id, "ok": false, "error": refusal})
+                    } else {
+                        let mut search_args = serde_json::json!({
+                            "query": msg.get("query").cloned().unwrap_or_default(),
+                            // Sous policy, on cherche plus large : le filtrage retire des résultats.
+                            "top_k": if policy.is_some() { 50 } else { SEARCH_RESULTS },
+                            "expand": true,
+                        });
+                        if let Some(server) = server_filter {
+                            search_args["server"] = serde_json::json!(server);
+                        }
+                        let Ok(resp) =
+                            tokio::time::timeout_at(deadline, Box::pin(self.handle_discover(None, search_args))).await
+                        else {
+                            outcome = Err(format!("temps depasse ({} s) pendant une recherche", timeout_secs));
+                            break;
+                        };
+                        let result = resp
+                            .result
+                            .as_ref()
+                            .map(crate::codemode::simplify_result)
+                            .unwrap_or_default();
+                        let found = match &policy {
+                            Some(p) => p.filter_search_results(
+                                result.get("results").unwrap_or(&serde_json::Value::Null),
+                                SEARCH_RESULTS,
+                            ),
+                            None => result.get("results").cloned().unwrap_or(result),
+                        };
+                        serde_json::json!({"id": req_id, "ok": true, "result": found})
+                    }
                 }
                 "done" => {
                     logs = msg.get("logs").cloned().unwrap_or(logs);
@@ -1705,7 +1742,7 @@ impl ProxyServer {
             error: outcome.as_ref().err().cloned(),
         })
         .await;
-        let mut payload = serde_json::json!({ "calls": calls, "duration_ms": elapsed, "logs": logs });
+        let mut payload = crate::codemode::run_payload(calls, elapsed, logs, policy.is_some());
         let is_error = outcome.is_err();
         match outcome {
             Ok(v) => payload["result"] = v,
@@ -1884,12 +1921,17 @@ impl ProxyServer {
             .get("bypass_cache")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let indexed_server_name = {
+        let (indexed_server_name, cache_settings) = {
             let config = self.config.lock().await;
             let configured_server_names: Vec<String> = config.servers.keys().cloned().collect();
-            resolve_server_name(&server, &configured_server_names).unwrap_or_else(|| server.clone())
+            (
+                resolve_server_name(&server, &configured_server_names).unwrap_or_else(|| server.clone()),
+                config.response_cache.clone(),
+            )
         };
-        let (tool, execute_strategy, tool_schema, tool_untrusted) = {
+        // La durée suit la config en cours (rechargée à chaud).
+        self.response_cache.set_ttl_secs(cache_settings.ttl_secs);
+        let (tool, execute_strategy, tool_schema, tool_untrusted, read_only_hint) = {
             let engine = self.search_engine.lock().await;
             if engine.has_server(&indexed_server_name) {
                 if let Some(indexed_tool) = engine.find_tool(&indexed_server_name, &tool) {
@@ -1900,6 +1942,7 @@ impl ProxyServer {
                         ExecuteRouteStrategy::ExactCatalogMatch,
                         Some(schema),
                         untrusted,
+                        indexed_tool.tool_def.read_only_hint(),
                     )
                 } else if let Some(indexed_tool) =
                     engine.find_tool_case_insensitive(&indexed_server_name, &tool)
@@ -1911,6 +1954,7 @@ impl ProxyServer {
                         ExecuteRouteStrategy::CaseInsensitiveCatalogMatch,
                         Some(schema),
                         untrusted,
+                        indexed_tool.tool_def.read_only_hint(),
                     )
                 } else {
                     if let Some(reason) = crate::toolguard::block_reason(
@@ -1958,6 +2002,7 @@ impl ProxyServer {
                     ExecuteRouteStrategy::UncataloguedBypass,
                     None,
                     assume_untrusted,
+                    None,
                 )
             }
         };
@@ -2000,8 +2045,11 @@ impl ProxyServer {
         };
 
         // Cache hit short-circuit: only for idempotent tools, only when caller didn't bypass.
-        let cacheable = !bypass_cache && ResponseCache::is_cacheable(&tool);
-        let mutating = !ResponseCache::is_cacheable(&tool);
+        // Lecture : par le nom, par l'annotation readOnlyHint ou par settings.responseCache.tools.
+        let read_only = cache_settings.is_cacheable(&server, &tool, read_only_hint);
+        let cacheable = !bypass_cache && read_only;
+        // Règle inchangée : tout appel non cacheable vide le cache de son serveur.
+        let mutating = !read_only;
         let epoch = self.child_manager.epoch();
         if cacheable {
             if let Some(hit) = self.response_cache.get(&server, &tool, &arguments, epoch) {
@@ -2024,6 +2072,14 @@ impl ProxyServer {
                         );
                     }
                 }
+                // Compté à part : un hit ne passe pas par le serveur et ne fausse pas p50 / p95.
+                self.metrics
+                    .lock()
+                    .await
+                    .tools
+                    .entry(format!("{}__{}", server, tool))
+                    .or_default()
+                    .record_cache_hit();
                 self.record_execute_route(execute_strategy).await;
                 self.record_audit(AuditEntry {
                     status: "cache_hit",
@@ -2060,14 +2116,21 @@ impl ProxyServer {
             if let Err(ref e) = res {
                 sm.error_count += 1;
                 sm.last_error = Some(e.clone());
-            } else {
-                *m.tool_calls.entry(usage_key).or_insert(0) += 1;
             }
-            m.tool_calls.clone()
+            m.tools
+                .entry(usage_key.clone())
+                .or_default()
+                .record_call(elapsed, res.is_err());
+            if res.is_ok() {
+                *m.tool_calls.entry(usage_key).or_insert(0) += 1;
+                Some(m.tool_calls.clone())
+            } else {
+                None
+            }
         };
 
-        if res.is_ok() {
-            tokio::task::spawn_blocking(move || save_usage_stats(&usage_snapshot));
+        if let Some(snapshot) = usage_snapshot {
+            self.usage_writer.schedule(snapshot);
         }
 
         self.record_execute_route(execute_strategy).await;
@@ -2360,7 +2423,7 @@ fn server_matches_filter(server_name: &str, filter: &str) -> bool {
     normalized_server_name == normalized_filter || server_name.eq_ignore_ascii_case(filter)
 }
 
-fn normalize_server_key(value: &str) -> String {
+pub(crate) fn normalize_server_key(value: &str) -> String {
     value.to_lowercase().replace(['-', '_', ' '], "")
 }
 
@@ -3143,6 +3206,25 @@ done
             .handle_hub_tool(Some(json!(1)), "registry_install", json!({"name": "io.example/x"}), None)
             .await;
         assert!(response.error.expect("refus").message.contains("interdit"));
+    }
+
+    #[tokio::test]
+    async fn policy_mal_formee_refusee_avant_tout_lancement() {
+        let hub = hub_with_permissions(crate::permissions::PermissionsConfig::default());
+        for invalid in [
+            json!("supabase"),
+            json!({"allowed_servers": "supabase"}),
+            json!({"denied_servers": [1]}),
+            json!({"pinned_args": {"supabase": "xyz"}}),
+            json!({"allowed_server": ["supabase"]}),
+        ] {
+            let response = hub
+                .handle_run(Some(json!(1)), json!({"code": "return 1", "policy": invalid}))
+                .await;
+            let error = response.error.expect("policy refusee");
+            assert_eq!(error.code, -32602);
+            assert!(error.message.contains("policy"), "{}", error.message);
+        }
     }
 
     #[test]

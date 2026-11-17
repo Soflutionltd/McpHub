@@ -62,6 +62,8 @@ pub struct ProxyConfig {
     pub code_mode: crate::codemode::CodeModeConfig,
     /// Mise à jour automatique depuis les releases signées (`settings.autoUpdate`).
     pub auto_update: bool,
+    /// Cache des lectures (`settings.responseCache`).
+    pub response_cache: crate::response_cache::CacheSettings,
 }
 
 impl Default for ProxyConfig {
@@ -85,6 +87,7 @@ impl Default for ProxyConfig {
             guard: crate::toolguard::GuardConfig::default(),
             code_mode: crate::codemode::CodeModeConfig::default(),
             auto_update: true,
+            response_cache: crate::response_cache::CacheSettings::default(),
         }
     }
 }
@@ -518,6 +521,9 @@ fn config_from_json(json: &Value, source_path: Option<&Path>) -> Result<ProxyCon
                 .as_bool()
                 .ok_or("settings.autoUpdate doit valoir true ou false")?;
         }
+        if let Some(response_cache) = settings.get("responseCache") {
+            config.response_cache = crate::response_cache::CacheSettings::from_json(response_cache)?;
+        }
         if let Some(permissions) = settings.get("permissions") {
             config.permissions = crate::permissions::PermissionsConfig::from_json(permissions)?;
         }
@@ -755,6 +761,18 @@ mod tests {
 
         fs::write(&path, r#"{"servers": {}, "settings": {"autoUpdate": "no"}}"#).unwrap();
         assert!(matches!(load_dedicated_from_path(&path), Dedicated::Invalid(_)));
+
+        fs::write(&path, r#"{"servers": {}, "settings": {"responseCache": {"ttlSecs": 99999}}}"#).unwrap();
+        assert!(matches!(load_dedicated_from_path(&path), Dedicated::Invalid(_)));
+
+        fs::write(&path, r#"{"servers": {}, "settings": {"responseCache": {"ttlSecs": 0, "tools": ["context7__resolve-library-id"]}}}"#).unwrap();
+        match load_dedicated_from_path(&path) {
+            Dedicated::Valid(c) => {
+                assert_eq!(c.response_cache.ttl_secs, 0);
+                assert!(c.response_cache.tools.contains("context7__resolve-library-id"));
+            }
+            _ => panic!("responseCache valide"),
+        }
 
         fs::write(&path, r#"{"servers": {}, "settings": {"autoUpdate": false}}"#).unwrap();
         match load_dedicated_from_path(&path) {

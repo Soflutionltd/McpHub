@@ -10,6 +10,7 @@
 //! réseau ni écriture. Son seul accès au monde passe par `mcp.call` / `mcp.search`, relayés par
 //! McpHub et donc soumis aux permissions, à la quarantaine, aux profils et au journal d'audit.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 
@@ -214,6 +215,131 @@ pub fn simplify_result(v: &Value) -> Value {
     v.clone()
 }
 
+/// Règles de projet appliquées à une exécution de `mcphub_run` (argument `policy`, ajouté par
+/// le client McpHub, pas par le modèle). Les noms de serveur sont comparés après la même
+/// normalisation que la résolution des serveurs : ni la casse, ni les tirets, ni les
+/// underscores ne permettent de contourner une règle.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RunPolicy {
+    /// Présent : seuls ces serveurs sont joignables.
+    allowed: Option<HashSet<String>>,
+    /// Toujours refusés, même s'ils figurent dans `allowed`.
+    denied: HashSet<String>,
+    /// Par serveur : arguments dont la valeur, si elle est fournie, doit être celle-ci.
+    pinned: HashMap<String, serde_json::Map<String, Value>>,
+}
+
+fn policy_server_list(policy: &serde_json::Map<String, Value>, key: &str) -> Result<Option<HashSet<String>>, String> {
+    let Some(value) = policy.get(key) else {
+        return Ok(None);
+    };
+    let Some(items) = value.as_array() else {
+        return Err(format!("{} must be an array of server names", key));
+    };
+    let mut names = HashSet::new();
+    for item in items {
+        let name = item
+            .as_str()
+            .map(crate::proxy::normalize_server_key)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| format!("{} must be an array of server names", key))?;
+        names.insert(name);
+    }
+    Ok(Some(names))
+}
+
+impl RunPolicy {
+    /// Tout écart de forme est une erreur (clé inconnue comprise) : une règle mal écrite ne
+    /// doit jamais être ignorée en silence.
+    pub fn from_json(value: &Value) -> Result<Self, String> {
+        let Some(object) = value.as_object() else {
+            return Err("policy must be an object".into());
+        };
+        if let Some(unknown) = object
+            .keys()
+            .find(|k| !["allowed_servers", "denied_servers", "pinned_args"].contains(&k.as_str()))
+        {
+            return Err(format!("unknown policy key \"{}\"", unknown));
+        }
+        let mut policy = Self {
+            allowed: policy_server_list(object, "allowed_servers")?,
+            denied: policy_server_list(object, "denied_servers")?.unwrap_or_default(),
+            pinned: HashMap::new(),
+        };
+        if let Some(pinned) = object.get("pinned_args") {
+            let Some(servers) = pinned.as_object() else {
+                return Err("pinned_args must be an object of { server: { key: value } }".into());
+            };
+            for (server, args) in servers {
+                let key = crate::proxy::normalize_server_key(server);
+                let Some(args) = args.as_object().filter(|_| !key.is_empty()) else {
+                    return Err(format!("pinned_args for server \"{}\" must be an object", server));
+                };
+                if policy.pinned.insert(key, args.clone()).is_some() {
+                    return Err(format!("pinned_args names server \"{}\" twice", server));
+                }
+            }
+        }
+        Ok(policy)
+    }
+
+    /// Le serveur est-il joignable sous cette règle ?
+    pub fn check_server(&self, server: &str) -> Result<(), String> {
+        let key = crate::proxy::normalize_server_key(server);
+        let allowed = self.allowed.as_ref().is_none_or(|list| list.contains(&key));
+        if self.denied.contains(&key) || !allowed {
+            return Err(format!("Server \"{}\" is not allowed by the project policy.", server));
+        }
+        Ok(())
+    }
+
+    /// Contrôle d'un `mcp.call` : serveur joignable, et aucun argument épinglé contredit.
+    /// Un argument épinglé absent de l'appel n'est pas ajouté : l'appel part tel quel.
+    pub fn check_call(&self, server: &str, args: &Value) -> Result<(), String> {
+        self.check_server(server)?;
+        let Some(pinned) = self.pinned.get(&crate::proxy::normalize_server_key(server)) else {
+            return Ok(());
+        };
+        for (key, expected) in pinned {
+            if args.get(key).is_some_and(|given| given != expected) {
+                return Err(format!("{} mismatch for server \"{}\"", key, server));
+            }
+        }
+        Ok(())
+    }
+
+    /// Résultats de `mcp.search` : seuls les outils de serveurs joignables restent. Un
+    /// résultat sans serveur lisible est retiré.
+    pub fn filter_search_results(&self, results: &Value, limit: usize) -> Value {
+        let kept = results
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|item| {
+                        item.get("server")
+                            .and_then(|s| s.as_str())
+                            .is_some_and(|server| self.check_server(server).is_ok())
+                    })
+                    .take(limit)
+                    .cloned()
+                    .collect::<Vec<Value>>()
+            })
+            .unwrap_or_default();
+        Value::Array(kept)
+    }
+}
+
+/// Résultat de `mcphub_run` renvoyé à l'appelant. `"policy": "enforced"` n'apparaît que si une
+/// règle de projet a été fournie et appliquée à cette exécution.
+pub fn run_payload(calls: usize, duration_ms: u64, logs: Value, policy_enforced: bool) -> Value {
+    let mut payload = serde_json::json!({ "calls": calls, "duration_ms": duration_ms, "logs": logs });
+    if policy_enforced {
+        payload["policy"] = serde_json::json!("enforced");
+    }
+    payload
+}
+
 pub fn tool_definition() -> Value {
     serde_json::json!({
         "name": "mcphub_run",
@@ -230,6 +356,10 @@ pub fn tool_definition() -> Value {
                     "description": "Max run time in seconds (5 to 300).",
                     "minimum": 5,
                     "maximum": 300
+                },
+                "policy": {
+                    "type": "object",
+                    "description": "Set by the McpHub client, not by the model."
                 }
             },
             "required": ["code"]
@@ -254,6 +384,130 @@ mod tests {
             simplify_result(&json!({"content": [{"type":"text","text":"bonjour"}]})),
             json!("bonjour")
         );
+    }
+
+    fn policy(value: Value) -> RunPolicy {
+        RunPolicy::from_json(&value).expect("policy valide")
+    }
+
+    #[test]
+    fn policy_allowed_servers() {
+        let p = policy(json!({"allowed_servers": ["supabase", "Cloudflare-Docs"]}));
+        assert!(p.check_call("supabase", &json!({})).is_ok());
+        assert_eq!(
+            p.check_call("github", &json!({})).unwrap_err(),
+            "Server \"github\" is not allowed by the project policy."
+        );
+        // Meme normalisation que la resolution des serveurs : casse, tirets, underscores.
+        assert!(p.check_call("SUPABASE", &json!({})).is_ok());
+        assert!(p.check_call("cloudflare_docs", &json!({})).is_ok());
+        assert!(p.check_call("mcphub", &json!({})).is_err(), "les outils internes aussi");
+        assert!(p.check_call("", &json!({})).is_err());
+        // Liste vide : rien n'est joignable.
+        assert!(policy(json!({"allowed_servers": []})).check_server("supabase").is_err());
+        // Sans policy de serveurs : tout passe.
+        assert!(policy(json!({})).check_call("github", &json!({"a": 1})).is_ok());
+    }
+
+    #[test]
+    fn policy_denied_servers() {
+        let p = policy(json!({"denied_servers": ["stripe"]}));
+        assert!(p.check_call("supabase", &json!({})).is_ok());
+        for alias in ["stripe", "Stripe", "STRIPE", "s-tripe", "stri_pe"] {
+            assert_eq!(
+                p.check_call(alias, &json!({})).unwrap_err(),
+                format!("Server \"{}\" is not allowed by the project policy.", alias)
+            );
+        }
+        // Refuse meme s'il figure aussi dans allowed_servers.
+        let p = policy(json!({"allowed_servers": ["stripe", "supabase"], "denied_servers": ["stripe"]}));
+        assert!(p.check_server("stripe").is_err());
+        assert!(p.check_server("supabase").is_ok());
+    }
+
+    #[test]
+    fn policy_pinned_args() {
+        let p = policy(json!({"pinned_args": {"supabase": {"project_id": "xyz"}}}));
+        assert!(p.check_call("supabase", &json!({"project_id": "xyz", "query": "select 1"})).is_ok());
+        assert_eq!(
+            p.check_call("supabase", &json!({"project_id": "autre"})).unwrap_err(),
+            "project_id mismatch for server \"supabase\""
+        );
+        assert!(p.check_call("Supa-Base", &json!({"project_id": "autre"})).is_err());
+        assert!(p.check_call("supabase", &json!({"project_id": null})).is_err());
+        // Cle absente : l'appel passe tel quel.
+        assert!(p.check_call("supabase", &json!({"query": "select 1"})).is_ok());
+        assert!(p.check_call("supabase", &json!(null)).is_ok());
+        // Les autres serveurs ne sont pas concernes.
+        assert!(p.check_call("github", &json!({"project_id": "autre"})).is_ok());
+    }
+
+    #[test]
+    fn policy_filtre_les_resultats_de_recherche() {
+        let results = json!([
+            {"server": "supabase", "tool": "list_tables"},
+            {"server": "stripe", "tool": "list_customers"},
+            {"server": "Supabase", "tool": "execute_sql"},
+            {"server": "github", "tool": "list_issues"},
+            {"tool": "sans_serveur"},
+            "texte"
+        ]);
+        let allowed = policy(json!({"allowed_servers": ["supabase", "stripe"], "denied_servers": ["stripe"]}));
+        assert_eq!(
+            allowed.filter_search_results(&results, 10),
+            json!([
+                {"server": "supabase", "tool": "list_tables"},
+                {"server": "Supabase", "tool": "execute_sql"}
+            ])
+        );
+        assert_eq!(allowed.filter_search_results(&results, 1).as_array().unwrap().len(), 1);
+        let denied = policy(json!({"denied_servers": ["stripe"]}));
+        let kept = denied.filter_search_results(&results, 10);
+        assert_eq!(kept.as_array().unwrap().len(), 3);
+        assert!(kept.as_array().unwrap().iter().all(|r| r["server"] != "stripe"));
+        // Une reponse qui n'est pas une liste ne laisse rien passer.
+        assert_eq!(allowed.filter_search_results(&json!({"available_servers": ["github"]}), 10), json!([]));
+        // Filtre `server` de mcp.search hors liste : erreur.
+        assert!(allowed.check_server("github").is_err());
+        assert!(allowed.check_server("stripe").is_err());
+    }
+
+    #[test]
+    fn policy_mal_formee_refusee() {
+        for invalid in [
+            json!(null),
+            json!("supabase"),
+            json!(["supabase"]),
+            json!({"allowed_servers": "supabase"}),
+            json!({"allowed_servers": [1]}),
+            json!({"allowed_servers": [""]}),
+            json!({"denied_servers": {"stripe": true}}),
+            json!({"denied_servers": [null]}),
+            json!({"pinned_args": ["supabase"]}),
+            json!({"pinned_args": {"supabase": "xyz"}}),
+            json!({"pinned_args": {"supabase": {"a": 1}, "Supa-base": {"a": 2}}}),
+            json!({"allowed_server": ["supabase"]}),
+        ] {
+            assert!(RunPolicy::from_json(&invalid).is_err(), "{} doit etre refusee", invalid);
+        }
+    }
+
+    #[test]
+    fn policy_declaree_dans_le_schema_de_mcphub_run() {
+        let def = tool_definition();
+        let policy = &def["inputSchema"]["properties"]["policy"];
+        assert_eq!(policy["type"], "object");
+        assert_eq!(policy["description"], "Set by the McpHub client, not by the model.");
+        assert_eq!(def["inputSchema"]["required"], json!(["code"]), "policy reste optionnelle");
+    }
+
+    #[test]
+    fn policy_enforced_seulement_si_appliquee() {
+        let with = run_payload(2, 15, json!(["a"]), true);
+        assert_eq!(with, json!({"calls": 2, "duration_ms": 15, "logs": ["a"], "policy": "enforced"}));
+        let without = run_payload(2, 15, json!([]), false);
+        assert!(without.get("policy").is_none());
+        assert_eq!(without, json!({"calls": 2, "duration_ms": 15, "logs": []}));
     }
 
     #[test]
