@@ -666,6 +666,16 @@ function resolveProject(projectName, workingDirectory) {
   );
 }
 
+// allowedServers: ["*"] laisse passer tous les serveurs : le projet ne garde que
+// ses identifiants épinglés, et un serveur ajouté plus tard n'est pas bloqué.
+function allowsEveryServer(projectConfig) {
+  return (projectConfig.allowedServers ?? []).includes('*');
+}
+
+function projectAllows(projectConfig, server) {
+  return allowsEveryServer(projectConfig) || allowedServersOf(projectConfig).has(server);
+}
+
 function allowedServersOf(projectConfig) {
   return new Set([
     ...(projectConfig.allowedServers ?? []),
@@ -690,15 +700,14 @@ function assertOwnership(server, workingDirectory) {
 }
 
 function serverVisibility(projectConfig, workingDirectory) {
-  const allowed = projectConfig ? allowedServersOf(projectConfig) : null;
   return (server) =>
-    (!allowed || allowed.has(server)) && ownerAllows(server, workingDirectory);
+    (!projectConfig || projectAllows(projectConfig, server)) && ownerAllows(server, workingDirectory);
 }
 
 function enforceProjectPolicy({ projectName, projectConfig, server, tool, args, workingDirectory }) {
   assertOwnership(server, workingDirectory);
   if (!projectConfig) return { ...args };
-  if (!allowedServersOf(projectConfig).has(server)) {
+  if (!projectAllows(projectConfig, server)) {
     throw new Error(
       `Server "${server}" is not allowed for project "${projectName}".`
     );
@@ -762,9 +771,13 @@ function runPolicyFor(projectConfig, workingDirectory) {
       : {})
   };
   return {
-    allowed_servers: [...allowedServersOf(projectConfig)].filter((server) =>
-      ownerAllows(server, workingDirectory)
-    ),
+    ...(allowsEveryServer(projectConfig)
+      ? {}
+      : {
+          allowed_servers: [...allowedServersOf(projectConfig)].filter((server) =>
+            ownerAllows(server, workingDirectory)
+          )
+        }),
     ...(denied.length ? { denied_servers: denied } : {}),
     ...(Object.keys(pinned).length ? { pinned_args: pinned } : {})
   };
@@ -1225,7 +1238,7 @@ registerHubTool(
     if (
       projectConfig &&
       args.server &&
-      !allowedServersOf(projectConfig).has(args.server)
+      !projectAllows(projectConfig, args.server)
     ) {
       return textResult(
         `Server "${args.server}" is not allowed for project "${projectName}".`,

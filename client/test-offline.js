@@ -132,6 +132,11 @@ await writeFile(
         aliases: { supabaseProjectId: 'ref-acme' },
         allowedServers: ['db', 'supabase'],
         ownedServers: ['acme-crm']
+      },
+      open: {
+        workspaces: [join(home, 'open')],
+        aliases: { supabaseProjectId: 'ref-open' },
+        allowedServers: ['*']
       }
     }
   })
@@ -277,6 +282,25 @@ try {
   assert.deepEqual(runs.at(-1).policy, {
     allowed_servers: ['db', 'supabase', 'acme-crm'],
     pinned_args: { supabase: { project_id: 'ref-acme' } }
+  });
+
+  // allowedServers ["*"] opens every server and keeps the pinned identifiers.
+  const open = join(home, 'open');
+  const anyServer = await client.callTool({
+    name: 'mcphub_call',
+    arguments: { server: 'mail', tool: 'read_row', arguments: {}, working_dir: open }
+  });
+  assert.equal(text(anyServer), 'done read_row');
+  const wrongProject = await client.callTool({
+    name: 'mcphub_call',
+    arguments: { server: 'supabase', tool: 'read_row', arguments: { project_id: 'other' }, working_dir: open }
+  });
+  assert.equal(wrongProject.isError, true);
+  assert.match(text(wrongProject), /Supabase project mismatch for open/);
+  await run({ working_dir: open });
+  assert.deepEqual(runs.at(-1).policy, {
+    denied_servers: ['acme-crm'],
+    pinned_args: { supabase: { project_id: 'ref-open' } }
   });
 
   // A long text is cut and the rest is read by handle, to the last character.

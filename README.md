@@ -195,7 +195,7 @@ Use `http://127.0.0.1:24680/sse` with the same `Authorization` header.
 - `mcphub_run`: the daemon's code mode. A script chains several tool calls in the sandbox and only its final value comes back. The project rules (`allowedServers`, owned servers, the pinned Supabase, App Store and Cloudflare identifiers) are handed to the daemon, which applies them to every `mcp.call`; a daemon too old to do so is never given a script from a folder that has rules.
 - `mcphub_status`, `mcphub_savings`: server health and an honest context-size comparison.
 
-Per-project policy lives in `~/.McpHub/projects.json` (or the path in `MCPHUB_PROJECTS`), see [`client/projects.example.json`](client/projects.example.json). For a workspace listed there, only its `allowedServers` are reachable, and a call aimed at another Supabase project, App Store app or Cloudflare project is refused. Without the file there is no policy; an unreadable file is an error, never silently ignored.
+Per-project policy lives in `~/.McpHub/projects.json` (or the path in `MCPHUB_PROJECTS`), see [`client/projects.example.json`](client/projects.example.json). For a workspace listed there, only its `allowedServers` are reachable (`["*"]` opens every server and keeps the identifier checks), and a call aimed at another Supabase project, App Store app or Cloudflare project is refused. Without the file there is no policy; an unreadable file is an error, never silently ignored.
 
 Each release ships the client as a single file, `mcphub-client.mjs`, which the daemon keeps up to date in `~/.McpHub/client/` (Node 20 or later, no `npm install`). Editors pick up a new version the next time they start the server:
 
