@@ -355,7 +355,7 @@ impl StdioProcess {
 }
 
 enum Link {
-    Stdio(StdioProcess),
+    Stdio(Box<StdioProcess>),
     Http(Arc<crate::remote::RemoteClient>),
 }
 
@@ -590,11 +590,14 @@ fn child_stderr(name: &str) -> Stdio {
 /// au lieu de relancer chacun trois tentatives.
 const START_FAILURE_MEMORY: Duration = Duration::from_secs(5);
 
+/// Verrou de démarrage d'un serveur : dernier échec (instant, message) s'il y en a un.
+type StartLock = Arc<Mutex<Option<(Instant, String)>>>;
+
 pub struct ChildManager {
     configs: Arc<Mutex<HashMap<String, ServerConfig>>>,
     pools: Arc<Mutex<HashMap<String, Arc<ServerPool>>>>,
     /// Un verrou de démarrage par serveur : vingt premières requêtes = un seul démarrage.
-    starting: Mutex<HashMap<String, Arc<Mutex<Option<(Instant, String)>>>>>,
+    starting: Mutex<HashMap<String, StartLock>>,
     idle_timeout_ms: u64,
     request_timeout_secs: u64,
     /// Augmente à chaque serveur perdu, relancé ou arrêté : les réponses mises en cache avant
@@ -1137,7 +1140,7 @@ async fn start_instance(
             return Err("No stdio".into());
         };
         (
-            Link::Stdio(StdioProcess::start(name, child, stdin, stdout)),
+            Link::Stdio(Box::new(StdioProcess::start(name, child, stdin, stdout))),
             KillHandle::Pid(pid),
         )
     };

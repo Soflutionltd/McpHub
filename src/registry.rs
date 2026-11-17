@@ -701,7 +701,7 @@ fn icon(server: &Value) -> Value {
 
 fn kinds(server: &Value) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    if server.get("remotes").and_then(|r| r.as_array()).map_or(false, |a| !a.is_empty()) {
+    if server.get("remotes").and_then(|r| r.as_array()).is_some_and(|a| !a.is_empty()) {
         out.push("remote".into());
     }
     for p in server.get("packages").and_then(|p| p.as_array()).into_iter().flatten() {
@@ -1163,7 +1163,7 @@ fn env_var_name(slug: &str, label: &str) -> String {
         out = out.replace("__", "_");
     }
     let out = out.trim_matches('_').to_string();
-    if out.chars().next().map_or(true, |c| c.is_ascii_digit()) {
+    if out.chars().next().is_none_or(|c| c.is_ascii_digit()) {
         format!("MCP_{}", out)
     } else {
         out
@@ -1195,7 +1195,7 @@ impl<'a> Builder<'a> {
     }
 
     fn known_secret(&self, var: &str) -> bool {
-        std::env::var(var).map_or(false, |v| !v.is_empty()) || self.known.iter().any(|k| k == var)
+        std::env::var(var).is_ok_and(|v| !v.is_empty()) || self.known.iter().any(|k| k == var)
     }
 
     /// Valeur d'une entrée : littérale, ou `${VAR}` pour un secret (rangé au Trousseau).
@@ -1806,7 +1806,7 @@ pub async fn install(req: InstallRequest) -> Result<Value, String> {
     if let Some(sb) = &sandbox {
         cfg["sandbox"] = sb.clone();
     }
-    if cfg.get("env").and_then(|e| e.as_object()).map_or(false, |e| e.is_empty()) {
+    if cfg.get("env").and_then(|e| e.as_object()).is_some_and(|e| e.is_empty()) {
         cfg.as_object_mut().map(|o| o.remove("env"));
     }
     cfg["registry"] = json!({

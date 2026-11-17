@@ -63,6 +63,7 @@ pub fn current_profile() -> Option<String> {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+#[derive(Default)]
 pub struct ServerMetrics {
     pub call_count: u64,
     pub error_count: u64,
@@ -71,17 +72,6 @@ pub struct ServerMetrics {
     pub last_error: Option<String>,
 }
 
-impl Default for ServerMetrics {
-    fn default() -> Self {
-        Self {
-            call_count: 0,
-            error_count: 0,
-            total_latency_ms: 0,
-            last_call_time: None,
-            last_error: None,
-        }
-    }
-}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GlobalMetrics {
@@ -216,6 +206,14 @@ impl Drop for InFlight {
 }
 
 /// Résultat du contrôle de permission avant un appel d'outil.
+/// L'appel soumis au contrôle des permissions : mode d'appel, serveur, outil et arguments.
+struct GateTarget<'a> {
+    mode: &'static str,
+    server: &'a str,
+    tool: &'a str,
+    arguments: &'a serde_json::Value,
+}
+
 enum PolicyGate {
     /// L'appel peut partir. `decision` = "allow" ou "confirmed", `policy` = source de la règle.
     Proceed {
@@ -328,7 +326,8 @@ impl ProxyServer {
             .map(|t| t.declared_destructive())
             .unwrap_or(false);
         let decision = permissions.decide_with(server, tool, declared_destructive);
-        self.permission_gate(id, mode, server, tool, arguments, confirmation_token, &permissions, decision)
+        let target = GateTarget { mode, server, tool, arguments };
+        self.permission_gate(id, target, confirmation_token, &permissions, decision)
             .await
     }
 
@@ -349,21 +348,20 @@ impl ProxyServer {
                 source: "mcphub:install".into(),
                 reason: Some("installe et lance un nouveau serveur MCP sur cette machine".into()),
             });
-        self.permission_gate(id, "library", "mcphub", tool, arguments, confirmation_token, &permissions, decision)
+        let target = GateTarget { mode: "library", server: "mcphub", tool, arguments };
+        self.permission_gate(id, target, confirmation_token, &permissions, decision)
             .await
     }
 
     async fn permission_gate(
         &self,
         id: &Option<serde_json::Value>,
-        mode: &'static str,
-        server: &str,
-        tool: &str,
-        arguments: &serde_json::Value,
+        target: GateTarget<'_>,
         confirmation_token: Option<&str>,
         permissions: &crate::permissions::PermissionsConfig,
         decision: crate::permissions::Decision,
     ) -> PolicyGate {
+        let GateTarget { mode, server, tool, arguments } = target;
         if DIALOG_OPEN.load(std::sync::atomic::Ordering::SeqCst) && controls_computer(server) {
             return PolicyGate::Respond(JsonRpcResponse::error(
                 id.clone(),
@@ -739,9 +737,11 @@ impl ProxyServer {
                 reason,
                 self.child_manager.clone(),
                 self.search_engine.clone(),
-                refresh_server_names,
-                removed_server_names,
-                configured_server_hashes,
+                CatalogChanges {
+                    names_to_refresh: refresh_server_names,
+                    removed_names: removed_server_names,
+                    server_hashes: configured_server_hashes,
+                },
                 preload_delay_ms,
                 self.catalog_refresh_in_progress.clone(),
             );
@@ -2739,16 +2739,22 @@ async fn preload_servers(manager: Arc<ChildManager>, names: Vec<String>, delay_m
     }
 }
 
+/// Ce qui a changé dans la config : serveurs à réindexer, serveurs retirés, empreintes à jour.
+struct CatalogChanges {
+    names_to_refresh: Vec<String>,
+    removed_names: Vec<String>,
+    server_hashes: HashMap<String, String>,
+}
+
 fn spawn_catalog_refresh(
     reason: String,
     manager: Arc<ChildManager>,
     engine: Arc<Mutex<SearchEngine>>,
-    names_to_refresh: Vec<String>,
-    removed_names: Vec<String>,
-    server_hashes: HashMap<String, String>,
+    changes: CatalogChanges,
     delay_ms: u64,
     in_progress: Arc<AtomicBool>,
 ) {
+    let CatalogChanges { names_to_refresh, removed_names, server_hashes } = changes;
     if names_to_refresh.is_empty() && removed_names.is_empty() {
         return;
     }
@@ -2915,9 +2921,11 @@ async fn apply_config_change(
         "config changed".to_string(),
         child_manager.clone(),
         engine.clone(),
-        refresh_server_names,
-        removed_server_names,
-        new_server_hashes,
+        CatalogChanges {
+            names_to_refresh: refresh_server_names,
+            removed_names: removed_server_names,
+            server_hashes: new_server_hashes,
+        },
         delay_ms,
         catalog_refresh_in_progress.clone(),
     );

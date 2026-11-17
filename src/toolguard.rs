@@ -281,7 +281,7 @@ fn first_word(tool: &str) -> String {
 /// Outil considéré comme lecture seule : annotation readOnlyHint, ou verbe de lecture en tête,
 /// et jamais un nom destructeur ni une annotation destructiveHint.
 pub fn looks_read_only(tool: &str, def: Option<&ToolDef>) -> bool {
-    if is_destructive(tool) || def.map_or(false, |d| d.declared_destructive()) {
+    if is_destructive(tool) || def.is_some_and(|d| d.declared_destructive()) {
         return false;
     }
     if def.and_then(|d| d.read_only_hint()) == Some(true) {
@@ -866,7 +866,7 @@ pub fn approve_pins(pins: &mut PinsFile, server: &str, tool: Option<&str>) -> us
     };
     let mut n = 0;
     for (name, pin) in sp.tools.iter_mut() {
-        if tool.map_or(false, |t| t != name) {
+        if tool.is_some_and(|t| t != name) {
             continue;
         }
         let before = pin.clone();

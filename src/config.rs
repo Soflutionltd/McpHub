@@ -347,7 +347,7 @@ pub fn load_guard_config() -> crate::toolguard::GuardConfig {
 pub enum Dedicated {
     Missing,
     Invalid(String),
-    Valid(ProxyConfig),
+    Valid(Box<ProxyConfig>),
 }
 
 /// `config.json` brut, pour le modifier. `None` si absent. Illisible ou invalide = erreur :
@@ -431,7 +431,7 @@ fn load_dedicated_from_path(path: &Path) -> Dedicated {
         Err(e) => return Dedicated::Invalid(format!("{} : JSON invalide : {}", path.display(), e)),
     };
     match config_from_json(&json, Some(path)) {
-        Ok(c) => Dedicated::Valid(c),
+        Ok(c) => Dedicated::Valid(Box::new(c)),
         Err(e) => Dedicated::Invalid(format!("{} : {}", path.display(), e)),
     }
 }
@@ -582,7 +582,7 @@ pub fn try_auto_detect() -> Result<ProxyConfig, String> {
                 config.servers.len(),
                 mode_str
             );
-            Ok(apply_env_overrides(config))
+            Ok(apply_env_overrides(*config))
         }
         Dedicated::Invalid(e) => Err(e),
         Dedicated::Missing => Ok(editors_config()),

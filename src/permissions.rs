@@ -516,8 +516,7 @@ mod tests {
 
     #[test]
     fn annotation_durcit_mais_n_assouplit_pas() {
-        let mut cfg = PermissionsConfig::default();
-        cfg.auto_classify = true;
+        let mut cfg = PermissionsConfig { auto_classify: true, ..Default::default() };
         let d = cfg.decide_with("srv", "apply_changes", true);
         assert_eq!(d.action, Action::Confirm);
         assert_eq!(d.source, "auto:annotation");

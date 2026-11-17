@@ -9,7 +9,7 @@
 use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -219,11 +219,11 @@ fn append_line(path: &PathBuf, line: &str, max: u64, keep: usize) -> std::io::Re
     Ok(())
 }
 
-fn rotated_name(path: &PathBuf, n: usize) -> PathBuf {
+fn rotated_name(path: &Path, n: usize) -> PathBuf {
     path.with_extension(format!("{}.jsonl", n))
 }
 
-fn rotate(path: &PathBuf, keep: usize) {
+fn rotate(path: &Path, keep: usize) {
     let _ = fs::remove_file(rotated_name(path, keep));
     for n in (1..keep).rev() {
         let from = rotated_name(path, n);

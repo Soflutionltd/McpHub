@@ -132,7 +132,7 @@ impl RemoteClient {
                 crate::redaction::redact_text(&text.chars().take(300).collect::<String>())
             ));
         }
-        if resp.content_length().map_or(false, |l| l as usize > MAX_SSE_BYTES) {
+        if resp.content_length().is_some_and(|l| l as usize > MAX_SSE_BYTES) {
             return Err(format!("Read error: reponse de {} trop volumineuse", self.server));
         }
         let message = if ctype.starts_with("text/event-stream") {

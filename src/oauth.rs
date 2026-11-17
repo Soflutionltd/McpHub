@@ -374,7 +374,7 @@ pub async fn discover(url: &str, www_authenticate: Option<&str>) -> Result<(Auth
             let get = |k: &str| v.get(k).and_then(|x| x.as_str()).map(String::from);
             if let (Some(a), Some(t)) = (get("authorization_endpoint"), get("token_endpoint")) {
                 let reg = get("registration_endpoint");
-                if !secure_url(&a) || !secure_url(&t) || reg.as_deref().map_or(false, |r| !secure_url(r)) {
+                if !secure_url(&a) || !secure_url(&t) || reg.as_deref().is_some_and(|r| !secure_url(r)) {
                     return Err("points d'acces OAuth non HTTPS refuses".into());
                 }
                 return Ok((
@@ -698,7 +698,7 @@ pub fn import_mcp_remote(server: &str, url: &str) -> Result<bool, String> {
         .map_err(|e| format!("{} : {}", root.display(), e))?
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.is_dir() && p.file_name().and_then(|n| n.to_str()).map_or(false, |n| n.starts_with("mcp-remote")))
+        .filter(|p| p.is_dir() && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("mcp-remote")))
         .collect();
     // Les plus récents d'abord.
     dirs_found.sort_by_key(|p| std::cmp::Reverse(std::fs::metadata(p.join(format!("{}_tokens.json", hash))).and_then(|m| m.modified()).ok()));
@@ -736,127 +736,6 @@ pub fn import_mcp_remote(server: &str, url: &str) -> Result<bool, String> {
         return Ok(true);
     }
     Ok(false)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn base64url_et_pkce() {
-        assert_eq!(b64url(b"f"), "Zg");
-        assert_eq!(b64url(b"fo"), "Zm8");
-        assert_eq!(b64url(b"foo"), "Zm9v");
-        assert_eq!(b64url(&[0xfb, 0xff]), "-_8");
-        // Exemple de la RFC 7636, annexe B.
-        assert_eq!(
-            pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
-            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
-        );
-    }
-
-    #[test]
-    fn en_tete_www_authenticate() {
-        let h = r#"Bearer error="invalid_token", resource_metadata="https://mcp.x.com/.well-known/oauth-protected-resource", scope="a b""#;
-        assert_eq!(
-            www_param(h, "resource_metadata").as_deref(),
-            Some("https://mcp.x.com/.well-known/oauth-protected-resource")
-        );
-        assert_eq!(www_param(h, "scope").as_deref(), Some("a b"));
-        assert_eq!(www_param(h, "nope"), None);
-    }
-
-    fn tokens(access: &str, refresh: Option<&str>, expires_in_ms: i64) -> Tokens {
-        Tokens {
-            access_token: access.into(),
-            refresh_token: refresh.map(String::from),
-            expires_at: Some((now_ms() as i64 + expires_in_ms) as u64),
-            scope: None,
-        }
-    }
-
-    #[test]
-    fn refus_apres_renouvellement_par_un_autre_processus() {
-        // Le démon a renouvelé r0 en r1 ; le processus stdio présente encore r0.
-        let renewed = tokens("a1", Some("r1"), 3_600_000);
-        assert_eq!(recovery_after_refusal("r0", Some(&renewed)), Recovery::UseStored("a1".into()));
-        let renewed_but_expired = tokens("a1", Some("r1"), -1);
-        assert_eq!(recovery_after_refusal("r0", Some(&renewed_but_expired)), Recovery::RetryWith("r1".into()));
-    }
-
-    #[test]
-    fn refus_sans_jeton_plus_recent() {
-        let same = tokens("a0", Some("r0"), -1);
-        assert_eq!(recovery_after_refusal("r0", Some(&same)), Recovery::GiveUp);
-        assert_eq!(recovery_after_refusal("r0", None), Recovery::GiveUp);
-        assert_eq!(recovery_after_refusal("r0", Some(&tokens("a1", None, -1))), Recovery::GiveUp);
-    }
-
-    #[test]
-    fn jeton_refuse_deja_remplace() {
-        let stored = tokens("a1", Some("r1"), 3_600_000);
-        assert!(replaced_since(Some("a0"), &stored));
-        assert!(!replaced_since(Some("a1"), &stored));
-        assert!(!replaced_since(None, &stored));
-        assert!(!replaced_since(Some("a0"), &tokens("a1", Some("r1"), -1)));
-    }
-
-    #[test]
-    fn verrou_exclusif_entre_ouvertures() {
-        let dir = std::env::temp_dir().join(format!("mcphub-oauth-lock-{}", std::process::id()));
-        let path = dir.join("x.lock");
-        let first = lock_file(&path).expect("premier verrou");
-        let (tx, rx) = std::sync::mpsc::channel();
-        let waiting = path.clone();
-        let handle = std::thread::spawn(move || {
-            let _second = lock_file(&waiting).expect("second verrou");
-            tx.send(()).unwrap();
-        });
-        assert!(rx.recv_timeout(std::time::Duration::from_millis(200)).is_err());
-        drop(first);
-        assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok());
-        handle.join().unwrap();
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn nom_dans_le_trousseau() {
-        assert_eq!(vault_name("tiktok-ads"), "MCPHUB_OAUTH_TIKTOK_ADS");
-        assert!(crate::vault::is_valid_name(&vault_name("cloudflare.api")));
-    }
-
-    #[test]
-    fn urls_sures_et_ressource() {
-        assert!(secure_url("https://a.com/x"));
-        assert!(secure_url("http://localhost:3000/cb"));
-        assert!(!secure_url("http://a.com/x"));
-        assert!(!secure_url("file:///Applications/Evil.app"));
-        assert!(!secure_url("smb://host/share"));
-        assert!(resource_matches("https://mcp.sentry.dev/mcp", "https://mcp.sentry.dev/mcp"));
-        assert!(resource_matches("https://mcp.sentry.dev", "https://mcp.sentry.dev/mcp"));
-        assert!(!resource_matches("https://api.github.com", "https://mcp.sentry.dev/mcp"));
-        assert!(same_target("https://a.com/mcp/", "https://a.com/mcp"));
-        assert!(!same_target("https://a.com/mcp", "https://b.com/mcp"));
-    }
-
-    #[test]
-    fn options_mcp_remote_non_prises_en_charge() {
-        let ok = serde_json::json!(["-y", "mcp-remote@0.15.1", "https://x.com/mcp", "--header", "Authorization: Bearer ${T}"]);
-        let (u, h) = mcp_remote_args(ok.as_array().unwrap()).unwrap();
-        assert_eq!(u, "https://x.com/mcp");
-        assert_eq!(h[0].0, "Authorization");
-        let ko = serde_json::json!(["-y", "mcp-remote", "https://x.com/mcp", "--transport", "sse-only"]);
-        assert!(mcp_remote_args(ko.as_array().unwrap()).is_none());
-    }
-
-    #[test]
-    fn jetons() {
-        let v = serde_json::json!({"access_token":"a","expires_in":60,"scope":"x"});
-        let t = parse_tokens(&v, Some("r".into())).unwrap();
-        assert_eq!(t.refresh_token.as_deref(), Some("r"));
-        assert!(t.expires_at.unwrap() > now_ms());
-        assert!(parse_tokens(&serde_json::json!({}), None).is_err());
-    }
 }
 
 // ─── Commande `McpHub oauth` ─────────────────────────────────
@@ -1033,7 +912,7 @@ pub async fn run_cli(args: &[String]) -> i32 {
             };
             let mut changed = 0;
             for (name, entry) in servers.iter_mut() {
-                if !only.is_empty() && !only.iter().any(|o| *o == name) {
+                if !only.is_empty() && !only.contains(&name) {
                     continue;
                 }
                 let Some((url, headers)) = entry.get("args").and_then(|a| a.as_array()).and_then(|a| mcp_remote_args(a)) else {
@@ -1105,5 +984,126 @@ pub async fn run_cli(args: &[String]) -> i32 {
             eprintln!("Usage : McpHub oauth [status | login SERVEUR | logout SERVEUR | migrate [SERVEUR...] [--apply]]");
             2
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64url_et_pkce() {
+        assert_eq!(b64url(b"f"), "Zg");
+        assert_eq!(b64url(b"fo"), "Zm8");
+        assert_eq!(b64url(b"foo"), "Zm9v");
+        assert_eq!(b64url(&[0xfb, 0xff]), "-_8");
+        // Exemple de la RFC 7636, annexe B.
+        assert_eq!(
+            pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
+
+    #[test]
+    fn en_tete_www_authenticate() {
+        let h = r#"Bearer error="invalid_token", resource_metadata="https://mcp.x.com/.well-known/oauth-protected-resource", scope="a b""#;
+        assert_eq!(
+            www_param(h, "resource_metadata").as_deref(),
+            Some("https://mcp.x.com/.well-known/oauth-protected-resource")
+        );
+        assert_eq!(www_param(h, "scope").as_deref(), Some("a b"));
+        assert_eq!(www_param(h, "nope"), None);
+    }
+
+    fn tokens(access: &str, refresh: Option<&str>, expires_in_ms: i64) -> Tokens {
+        Tokens {
+            access_token: access.into(),
+            refresh_token: refresh.map(String::from),
+            expires_at: Some((now_ms() as i64 + expires_in_ms) as u64),
+            scope: None,
+        }
+    }
+
+    #[test]
+    fn refus_apres_renouvellement_par_un_autre_processus() {
+        // Le démon a renouvelé r0 en r1 ; le processus stdio présente encore r0.
+        let renewed = tokens("a1", Some("r1"), 3_600_000);
+        assert_eq!(recovery_after_refusal("r0", Some(&renewed)), Recovery::UseStored("a1".into()));
+        let renewed_but_expired = tokens("a1", Some("r1"), -1);
+        assert_eq!(recovery_after_refusal("r0", Some(&renewed_but_expired)), Recovery::RetryWith("r1".into()));
+    }
+
+    #[test]
+    fn refus_sans_jeton_plus_recent() {
+        let same = tokens("a0", Some("r0"), -1);
+        assert_eq!(recovery_after_refusal("r0", Some(&same)), Recovery::GiveUp);
+        assert_eq!(recovery_after_refusal("r0", None), Recovery::GiveUp);
+        assert_eq!(recovery_after_refusal("r0", Some(&tokens("a1", None, -1))), Recovery::GiveUp);
+    }
+
+    #[test]
+    fn jeton_refuse_deja_remplace() {
+        let stored = tokens("a1", Some("r1"), 3_600_000);
+        assert!(replaced_since(Some("a0"), &stored));
+        assert!(!replaced_since(Some("a1"), &stored));
+        assert!(!replaced_since(None, &stored));
+        assert!(!replaced_since(Some("a0"), &tokens("a1", Some("r1"), -1)));
+    }
+
+    #[test]
+    fn verrou_exclusif_entre_ouvertures() {
+        let dir = std::env::temp_dir().join(format!("mcphub-oauth-lock-{}", std::process::id()));
+        let path = dir.join("x.lock");
+        let first = lock_file(&path).expect("premier verrou");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiting = path.clone();
+        let handle = std::thread::spawn(move || {
+            let _second = lock_file(&waiting).expect("second verrou");
+            tx.send(()).unwrap();
+        });
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(200)).is_err());
+        drop(first);
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok());
+        handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn nom_dans_le_trousseau() {
+        assert_eq!(vault_name("tiktok-ads"), "MCPHUB_OAUTH_TIKTOK_ADS");
+        assert!(crate::vault::is_valid_name(&vault_name("cloudflare.api")));
+    }
+
+    #[test]
+    fn urls_sures_et_ressource() {
+        assert!(secure_url("https://a.com/x"));
+        assert!(secure_url("http://localhost:3000/cb"));
+        assert!(!secure_url("http://a.com/x"));
+        assert!(!secure_url("file:///Applications/Evil.app"));
+        assert!(!secure_url("smb://host/share"));
+        assert!(resource_matches("https://mcp.sentry.dev/mcp", "https://mcp.sentry.dev/mcp"));
+        assert!(resource_matches("https://mcp.sentry.dev", "https://mcp.sentry.dev/mcp"));
+        assert!(!resource_matches("https://api.github.com", "https://mcp.sentry.dev/mcp"));
+        assert!(same_target("https://a.com/mcp/", "https://a.com/mcp"));
+        assert!(!same_target("https://a.com/mcp", "https://b.com/mcp"));
+    }
+
+    #[test]
+    fn options_mcp_remote_non_prises_en_charge() {
+        let ok = serde_json::json!(["-y", "mcp-remote@0.15.1", "https://x.com/mcp", "--header", "Authorization: Bearer ${T}"]);
+        let (u, h) = mcp_remote_args(ok.as_array().unwrap()).unwrap();
+        assert_eq!(u, "https://x.com/mcp");
+        assert_eq!(h[0].0, "Authorization");
+        let ko = serde_json::json!(["-y", "mcp-remote", "https://x.com/mcp", "--transport", "sse-only"]);
+        assert!(mcp_remote_args(ko.as_array().unwrap()).is_none());
+    }
+
+    #[test]
+    fn jetons() {
+        let v = serde_json::json!({"access_token":"a","expires_in":60,"scope":"x"});
+        let t = parse_tokens(&v, Some("r".into())).unwrap();
+        assert_eq!(t.refresh_token.as_deref(), Some("r"));
+        assert!(t.expires_at.unwrap() > now_ms());
+        assert!(parse_tokens(&serde_json::json!({}), None).is_err());
     }
 }

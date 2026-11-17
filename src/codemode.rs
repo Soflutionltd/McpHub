@@ -11,7 +11,7 @@
 //! McpHub et donc soumis aux permissions, à la quarantaine, aux profils et au journal d'audit.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use serde_json::Value;
@@ -134,7 +134,7 @@ pub fn parse(settings: Option<&Value>) -> CodeModeConfig {
     c
 }
 
-fn node_major(path: &PathBuf) -> u32 {
+fn node_major(path: &Path) -> u32 {
     // ~/.nvm/versions/node/v25.0.0/bin/node -> 25
     path.components()
         .filter_map(|c| c.as_os_str().to_str())
@@ -147,7 +147,7 @@ fn node_major(path: &PathBuf) -> u32 {
 pub fn find_node(cfg: &CodeModeConfig) -> Option<PathBuf> {
     if let Some(n) = &cfg.node {
         let p = PathBuf::from(n);
-        return (p.exists() && node_version(&p).map_or(false, node_supported)).then_some(p);
+        return (p.exists() && node_version(&p).is_some_and(node_supported)).then_some(p);
     }
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(home) = dirs::home_dir() {
@@ -167,7 +167,7 @@ pub fn find_node(cfg: &CodeModeConfig) -> Option<PathBuf> {
     );
     candidates
         .into_iter()
-        .find(|p| node_version(p).map_or(false, node_supported))
+        .find(|p| node_version(p).is_some_and(node_supported))
 }
 
 pub fn spawn(node: &PathBuf) -> std::io::Result<tokio::process::Child> {
@@ -558,7 +558,7 @@ mod tests {
         let mut r = tokio::io::BufReader::new(&data[..]);
         assert_eq!(read_line_limited(&mut r, 10).await.unwrap().as_deref(), Some("court"));
         assert_eq!(read_line_limited(&mut r, 10).await.unwrap(), None);
-        let big = vec![b'x'; 100];
+        let big = [b'x'; 100];
         let mut r = tokio::io::BufReader::new(&big[..]);
         assert!(read_line_limited(&mut r, 10).await.is_err());
     }

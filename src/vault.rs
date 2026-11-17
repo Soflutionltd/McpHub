@@ -194,7 +194,7 @@ fn parse_password_line(rest: &str) -> Option<String> {
     let rest = rest.trim_end();
     if let Some(hex) = rest.strip_prefix("0x") {
         let hex: String = hex.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
-        if hex.len() % 2 != 0 {
+        if !hex.len().is_multiple_of(2) {
             return None;
         }
         let bytes: Option<Vec<u8>> = (0..hex.len())

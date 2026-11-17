@@ -622,7 +622,7 @@ mod tests {
         std::fs::write(home.join(".ssh/deploy.p8"), "k").unwrap();
         let shield = SandboxSpec { mode: SandboxMode::Shield, network: false, allow_read: vec![], allow_write: vec!["~/.mcp-auth".into()], allow_exec: vec![] };
         let key = format!("{}/.ssh/deploy.p8", h);
-        let a = bwrap_args(&shield, &h, &[key.clone()]).join(" ");
+        let a = bwrap_args(&shield, &h, std::slice::from_ref(&key)).join(" ");
         assert!(a.starts_with("--die-with-parent --new-session --dev-bind / /"), "{}", a);
         assert!(a.contains(&format!("--tmpfs {}/.ssh", h)));
         assert!(a.contains(&format!("{}/.netrc", h)) && a.contains("mcphub-empty-"));

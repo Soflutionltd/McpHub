@@ -25,7 +25,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn unhex(s: &str) -> Result<Vec<u8>, String> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err("hexadecimal invalide".into());
     }
     (0..s.len())
@@ -103,7 +103,7 @@ fn var_name(server: &str, label: &str) -> String {
         out = out.replace("__", "_");
     }
     let out = out.trim_matches('_').to_string();
-    if out.chars().next().map_or(true, |c| c.is_ascii_digit()) {
+    if out.chars().next().is_none_or(|c| c.is_ascii_digit()) {
         format!("MCP_{}", out)
     } else {
         out
@@ -154,7 +154,7 @@ impl Cleaner {
 
     /// Valeur littérale secrète -> ${NOM}, valeur gardée à part.
     fn take(&mut self, var: String, value: &str) -> String {
-        let var = if self.moved.get(&var).map_or(false, |v| v != value) {
+        let var = if self.moved.get(&var).is_some_and(|v| v != value) {
             format!("{}_{}", var, self.moved.len() + 1)
         } else {
             var

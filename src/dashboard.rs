@@ -1221,16 +1221,13 @@ async fn route(
         ("PUT", "/api/settings") => handle_update_settings(&req.body),
         ("POST", "/api/generate") => handle_generate().await,
         _ => {
-            if path.starts_with("/api/servers/") {
-                let rest = &path["/api/servers/".len()..];
+            if let Some(rest) = path.strip_prefix("/api/servers/") {
                 if (rest.ends_with("/toggle") || rest.ends_with("/repair")) && req.method != "POST" {
                     json_err(405, "Method not allowed")
-                } else if rest.ends_with("/toggle") {
-                    let name = &rest[..rest.len() - "/toggle".len()];
+                } else if let Some(name) = rest.strip_suffix("/toggle") {
                     let decoded = urldecode(name);
                     handle_toggle_server(&decoded, &req.body)
-                } else if rest.ends_with("/repair") {
-                    let name = &rest[..rest.len() - "/repair".len()];
+                } else if let Some(name) = rest.strip_suffix("/repair") {
                     let decoded = urldecode(name);
                     handle_repair_server(&decoded).await
                 } else {
@@ -1603,7 +1600,7 @@ async fn handle_connection(
                         if !line_trim.is_empty() {
                             let json_msg = serde_json::json!({ "line": line_trim });
                             let event =
-                                format!("event: message\ndata: {}\n\n", json_msg.to_string());
+                                format!("event: message\ndata: {}\n\n", json_msg);
                             if stream.write_all(event.as_bytes()).await.is_err() {
                                 break;
                             }

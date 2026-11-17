@@ -65,7 +65,7 @@ fn collect() -> Report {
                 status: "ok",
                 detail: format!("{} ({} servers)", config_path.display(), c.servers.len()),
             });
-            Some(c)
+            Some(*c)
         }
         Dedicated::Missing => {
             checks.push(Check {

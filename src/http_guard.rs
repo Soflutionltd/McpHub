@@ -47,7 +47,7 @@ fn split_host_port(value: &str) -> (String, Option<u16>) {
 pub fn host_allowed(host: Option<&str>, port: u16) -> bool {
     let Some(host) = host else { return true };
     let (h, p) = split_host_port(host);
-    LOCAL_HOSTS.contains(&h.as_str()) && p.map_or(true, |p| p == port)
+    LOCAL_HOSTS.contains(&h.as_str()) && p.is_none_or(|p| p == port)
 }
 
 /// Origin, s'il est envoyé (navigateurs), doit être le tableau de bord local.
@@ -110,7 +110,7 @@ pub fn api_authorized(headers: &HashMap<String, String>, query_session: Option<&
             return true;
         }
     }
-    query_session.map_or(false, |t| token_matches(t, session_secret()))
+    query_session.is_some_and(|t| token_matches(t, session_secret()))
 }
 
 /// Jeton au format actuel (32 octets aléatoires) ; sinon il est régénéré.
