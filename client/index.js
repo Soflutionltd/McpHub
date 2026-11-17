@@ -60,6 +60,8 @@ if (!Number.isInteger(defaultResultMaxChars) || defaultResultMaxChars < 1_000) {
   );
 }
 const storedResultLimit = 16;
+// Au-delà, un résultat en lignes rappelle à l'agent fields et max_rows.
+const shapingHintMinChars = 8_000;
 const hubLocalServer = 'mcphub';
 
 const cursorCatalogDescriptionLimit = 200;
@@ -347,6 +349,14 @@ function hasUnsafeNumber(text) {
   return false;
 }
 
+// Nombre de lignes du plus grand tableau de lignes du résultat (voir shapeRows).
+function countRows(value) {
+  const rowsOf = (child) => (Array.isArray(child) && child.some(isRow) ? child.length : 0);
+  if (Array.isArray(value)) return rowsOf(value);
+  if (!isRow(value)) return 0;
+  return Math.max(0, ...Object.values(value).map(rowsOf));
+}
+
 function parseJsonContainer(text) {
   const first = text.trimStart()[0];
   if (first !== '{' && first !== '[') return undefined;
@@ -365,6 +375,12 @@ function shapeText(text, shaping, notes, server) {
     json = pruneEmpty(json);
     if (shaping.fields || shaping.max_rows) json = shapeRows(json, shaping, notes);
     shaped = JSON.stringify(json);
+    const rows = shaping.fields || shaping.max_rows ? 0 : countRows(json);
+    if (rows > 1 && shaped.length >= shapingHintMinChars) {
+      notes.push(
+        `Large result: ${shaped.length} chars for ${rows} rows. Next time pass fields (keys to keep) and max_rows to this call.`
+      );
+    }
   }
   const limit = shaping.max_chars ?? defaultResultMaxChars;
   if (shaped.length <= limit) return { text: shaped, json };
@@ -1045,10 +1061,16 @@ async function readDaemonStatus() {
 // Serveur MCP exposé à Cursor
 // ---------------------------------------------------------------------------
 
-const server = new McpServer({
-  name: 'McpHub',
-  version: '1.3.0'
-});
+const server = new McpServer(
+  {
+    name: 'McpHub',
+    version: '1.3.0'
+  },
+  {
+    instructions:
+      'On mcphub_call and on each call of mcphub_batch, pass fields (keys to keep in each row) and max_rows whenever you expect a list (rows, logs, issues, invoices): the result comes back several times smaller.'
+  }
+);
 
 // Les 6 outils réellement enregistrés, pour mesurer ce que McpHub coûte
 // dans le catalogue du client (mcphub_savings).
@@ -1175,7 +1197,7 @@ registerHubTool(
   'mcphub_call',
   {
     description:
-      'Call one child MCP tool directly with project-level resource and server guards. Unknown tool or server names return the closest matching tools; wrong arguments return the input schema.',
+      'Call one child MCP tool directly with project-level resource and server guards. Unknown tool or server names return the closest matching tools; wrong arguments return the input schema. For a list result, pass fields and max_rows to keep it small.',
     inputSchema: {
       server: z.string(),
       tool: z.string(),

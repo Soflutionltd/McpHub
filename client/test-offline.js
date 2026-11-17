@@ -222,6 +222,16 @@ try {
   assert.equal(inside.isError, true);
   assert.match(text(inside), /inside a character/);
 
+  // A large list answered without fields or max_rows reminds the agent of them; a shaped one does not.
+  const manyRows = JSON.stringify({ rows: Array.from({ length: 200 }, (_, id) => ({ id, label: 'x'.repeat(40) })) });
+  const hinted = await fixed(manyRows);
+  assert.equal(text(hinted), manyRows);
+  assert.match(hinted.content[1].text, /Large result: \d+ chars for 200 rows\. Next time pass fields/);
+  assert.equal((await fixed(manyRows, { max_rows: 150 })).content[1].text, '[McpHub] rows: kept 150 of 200 rows (max_rows).');
+
+  // The advice reaches every client at startup.
+  assert.match(client.getInstructions() ?? '', /pass fields .* and max_rows/);
+
   // A long text is cut and the rest is read by handle, to the last character.
   const cut = await client.callTool(call('big_text', { max_chars: 1000 }));
   assert.equal(text(cut), 'a'.repeat(1000));
