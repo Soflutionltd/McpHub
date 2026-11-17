@@ -1,5 +1,4 @@
 /target
-Cargo.lock
 mcp.json.full-backup
 *.bak
 dashboard/node_modules/
