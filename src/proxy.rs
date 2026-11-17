@@ -2051,6 +2051,8 @@ impl ProxyServer {
         // Règle inchangée : tout appel non cacheable vide le cache de son serveur.
         let mutating = !read_only;
         let epoch = self.child_manager.epoch();
+        // Relevée avant l'appel : une écriture concurrente la fait avancer.
+        let cache_generation = self.response_cache.generation(&server);
         if cacheable {
             if let Some(hit) = self.response_cache.get(&server, &tool, &arguments, epoch) {
                 let mut value = hit.value;
@@ -2147,7 +2149,14 @@ impl ProxyServer {
                 let mut normalized = self.normalize_result_for_profile(result).await;
                 if cacheable {
                     self.response_cache
-                        .put(&server, &tool, &arguments, normalized.clone(), epoch);
+                        .put_if_current(
+                            &server,
+                            &tool,
+                            &arguments,
+                            normalized.clone(),
+                            epoch,
+                            cache_generation,
+                        );
                 }
                 if tool_untrusted {
                     if let Some(obj) = normalized.as_object_mut() {

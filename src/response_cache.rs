@@ -149,6 +149,9 @@ struct Entry {
 struct Store {
     entries: HashMap<String, Entry>,
     total_bytes: usize,
+    /// Nombre d'invalidations par serveur : une lecture lancée avant une écriture et
+    /// terminée après elle ne doit pas entrer dans le cache avec l'état d'avant.
+    generations: HashMap<String, u64>,
 }
 
 impl Store {
@@ -287,7 +290,31 @@ impl ResponseCache {
         })
     }
 
+    /// À relever avant l'appel au serveur, puis à rendre à `put_if_current`.
+    pub fn generation(&self, server: &str) -> u64 {
+        self.store
+            .lock()
+            .map(|store| store.generations.get(server).copied().unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
     pub fn put(&self, server: &str, tool: &str, args: &Value, value: Value, epoch: u64) {
+        let generation = self.generation(server);
+        self.put_if_current(server, tool, args, value, epoch, generation);
+    }
+
+    /// N'enregistre rien si le serveur a été invalidé depuis `generation` : la réponse a pu
+    /// être lue avant une écriture qui s'est terminée entre-temps.
+    pub fn put_if_current(
+        &self,
+        server: &str,
+        tool: &str,
+        args: &Value,
+        value: Value,
+        epoch: u64,
+        generation: u64,
+    ) {
         let ttl = self.ttl();
         if ttl.is_zero() {
             return;
@@ -305,6 +332,9 @@ impl ResponseCache {
         let Ok(mut store) = self.store.lock() else {
             return;
         };
+        if store.generations.get(server).copied().unwrap_or(0) != generation {
+            return;
+        }
         store.remove(&key);
         store.retain(|e| e.stored_at.elapsed() <= ttl && e.epoch == epoch);
         while !store.entries.is_empty()
@@ -341,6 +371,7 @@ impl ResponseCache {
     pub fn invalidate_server(&self, server: &str) {
         if let Ok(mut store) = self.store.lock() {
             store.retain(|e| e.server != server);
+            *store.generations.entry(server.to_string()).or_insert(0) += 1;
         }
     }
 }
@@ -355,6 +386,24 @@ impl Default for ResponseCache {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn lecture_lancee_avant_une_ecriture_jamais_mise_en_cache() {
+        let cache = ResponseCache::new();
+        let args = json!({});
+        // La lecture lente part, puis une écriture invalide le serveur avant son retour.
+        let generation = cache.generation("db");
+        cache.invalidate_server("db");
+        cache.put_if_current("db", "list_items", &args, json!({"items": []}), 0, generation);
+        assert!(cache.get("db", "list_items", &args, 0).is_none());
+
+        // Une lecture lancée après l'écriture entre normalement, sans gêner un autre serveur.
+        let generation = cache.generation("db");
+        cache.put_if_current("db", "list_items", &args, json!({"items": ["x"]}), 0, generation);
+        assert_eq!(cache.get("db", "list_items", &args, 0).map(|hit| hit.value), Some(json!({"items": ["x"]})));
+        cache.invalidate_server("other");
+        assert!(cache.get("db", "list_items", &args, 0).is_some());
+    }
 
     fn small(max_entries: usize) -> ResponseCache {
         ResponseCache::with_limits(60, max_entries, 1024, 1024 * 1024)
