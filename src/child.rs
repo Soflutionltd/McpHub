@@ -1,7 +1,8 @@
 /// Child process manager: spawn MCP servers, communicate over stdio, manage lifecycle.
 ///
 /// Verrous : la table globale des pools n'est jamais tenue pendant une attente (appel, ping,
-/// verrou d'un processus). Chaque processus a son propre verrou, tenu le temps d'un échange.
+/// verrou d'un processus). Chaque processus local a son propre verrou, tenu le temps d'un
+/// échange. Un serveur distant n'en a pas : ses requêtes HTTP partent en parallèle.
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -54,43 +55,101 @@ impl CallError {
     }
 }
 
-enum Link {
-    Stdio {
-        child: Child,
-        stdin: tokio::process::ChildStdin,
-        stdout_lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
-    },
-    Http(Arc<crate::remote::RemoteClient>),
-}
-
-struct ChildProcess {
-    link: Link,
+struct StdioProcess {
+    child: Child,
+    stdin: tokio::process::ChildStdin,
+    stdout_lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
     next_id: u64,
     server_name: String,
 }
 
-impl ChildProcess {
+impl StdioProcess {
     async fn kill(&mut self) {
-        match &mut self.link {
-            Link::Stdio { child, .. } => {
-                if let Some(pid) = child.id() {
-                    kill_group(pid);
-                }
-                let _ = child.kill().await;
-            }
+        if let Some(pid) = self.child.id() {
+            kill_group(pid);
+        }
+        let _ = self.child.kill().await;
+    }
+
+    fn exited(&mut self) -> Result<Option<String>, String> {
+        match self.child.try_wait() {
+            Ok(Some(status)) => Ok(Some(status.to_string())),
+            Ok(None) => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
+enum Link {
+    Stdio(Mutex<StdioProcess>),
+    Http(Arc<crate::remote::RemoteClient>),
+}
+
+/// Une instance du pool et le nombre d'appels qu'elle traite en ce moment.
+struct Instance {
+    link: Link,
+    in_flight: AtomicUsize,
+}
+
+/// Compte un appel en cours, y compris si son futur est abandonné (délai dépassé).
+struct InFlight<'a>(&'a AtomicUsize);
+
+impl<'a> InFlight<'a> {
+    fn enter(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl Instance {
+    fn new(link: Link) -> Self {
+        Self { link, in_flight: AtomicUsize::new(0) }
+    }
+
+    fn busy(&self) -> bool {
+        self.in_flight.load(Ordering::SeqCst) > 0
+    }
+
+    async fn kill(&self) {
+        match &self.link {
+            Link::Stdio(proc) => proc.lock().await.kill().await,
             Link::Http(remote) => remote.close().await,
         }
     }
 
-    /// Processus terminé ? (toujours vivant pour un serveur distant)
-    fn exited(&mut self) -> Result<Option<String>, String> {
-        match &mut self.link {
-            Link::Stdio { child, .. } => match child.try_wait() {
-                Ok(Some(status)) => Ok(Some(status.to_string())),
-                Ok(None) => Ok(None),
-                Err(e) => Err(e.to_string()),
-            },
-            Link::Http(_) => Ok(None),
+    /// Un échange JSON-RPC. Le verrou d'un processus local est tenu pendant tout l'échange
+    /// (une seule lecture de stdout à la fois) ; un serveur distant n'attend aucun verrou.
+    async fn request(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        sent: &AtomicBool,
+    ) -> Result<serde_json::Value, CallError> {
+        match &self.link {
+            Link::Http(remote) => {
+                sent.store(true, Ordering::SeqCst);
+                remote.request(method, params).await.map_err(CallError::Server)
+            }
+            Link::Stdio(proc) => {
+                let mut proc = proc.lock().await;
+                stdio_request(&mut proc, method, params, sent).await
+            }
+        }
+    }
+
+    async fn notify(&self, method: &str, params: serde_json::Value) -> Result<(), String> {
+        match &self.link {
+            Link::Http(remote) => remote.notify(method, params).await,
+            Link::Stdio(proc) => {
+                let mut proc = proc.lock().await;
+                stdio_notify(&mut proc, method, params).await
+            }
         }
     }
 }
@@ -126,7 +185,7 @@ fn now_ms() -> u64 {
 }
 
 struct ServerPool {
-    procs: Vec<Arc<Mutex<ChildProcess>>>,
+    procs: Vec<Arc<Instance>>,
     handles: Vec<KillHandle>,
     tools: Vec<ToolDef>,
     request_timeout_secs: u64,
@@ -143,13 +202,13 @@ impl ServerPool {
         Duration::from_millis(now_ms().saturating_sub(self.last_used_ms.load(Ordering::Relaxed)))
     }
 
-    fn pick(&self) -> Arc<Mutex<ChildProcess>> {
+    fn pick(&self) -> Arc<Instance> {
         let idx = self.next_idx.fetch_add(1, Ordering::Relaxed) % self.procs.len();
         self.procs[idx].clone()
     }
 
     fn busy(&self) -> bool {
-        self.procs.iter().any(|p| p.try_lock().is_err())
+        self.procs.iter().any(|p| p.busy())
     }
 
     async fn kill_now(&self) {
@@ -440,7 +499,7 @@ impl ChildManager {
             .max(1);
 
         let pool_size = config.pool.max(1);
-        let mut procs: Vec<Arc<Mutex<ChildProcess>>> = Vec::new();
+        let mut procs: Vec<Arc<Instance>> = Vec::new();
         let mut handles = Vec::new();
         let mut first_tools = Vec::new();
 
@@ -450,12 +509,12 @@ impl ChildManager {
                     if i == 0 {
                         first_tools = tools;
                     }
-                    procs.push(Arc::new(Mutex::new(proc)));
+                    procs.push(Arc::new(proc));
                     handles.push(handle);
                 }
                 Err(e) => {
                     for p in &procs {
-                        p.lock().await.kill().await;
+                        p.kill().await;
                     }
                     return Err(e);
                 }
@@ -479,8 +538,8 @@ impl ChildManager {
         Ok(first_tools)
     }
 
-    /// Un échange sur un processus du pool, sous une seule échéance qui couvre aussi
-    /// l'attente du verrou (un processus occupé par un appel précédent).
+    /// Un échange sur une instance du pool, sous une seule échéance qui couvre aussi
+    /// l'attente du verrou (un processus local occupé par un appel précédent).
     async fn exchange(
         &self,
         pool: &ServerPool,
@@ -488,13 +547,14 @@ impl ChildManager {
         params: serde_json::Value,
     ) -> Result<serde_json::Value, CallError> {
         pool.touch();
-        let proc_arc = pool.pick();
+        let instance = pool.pick();
+        let _in_flight = InFlight::enter(&instance.in_flight);
         let secs = pool.request_timeout_secs;
         let sent = AtomicBool::new(false);
-        let outcome = tokio::time::timeout(Duration::from_secs(secs), async {
-            let mut proc = proc_arc.lock().await;
-            send_request_inner(&mut proc, method, params, &sent).await
-        })
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(secs),
+            instance.request(method, params, &sent),
+        )
         .await;
         pool.touch();
         match outcome {
@@ -666,7 +726,7 @@ impl ChildManager {
         results
     }
 
-    /// Arrête les serveurs inactifs. Un processus occupé (appel plus long que le délai
+    /// Arrête les serveurs inactifs. Un serveur occupé (appel plus long que le délai
     /// d'inactivité) n'est jamais considéré comme inactif.
     pub async fn reap_idle(&self) {
         let timeout = Duration::from_millis(self.idle_timeout_ms);
@@ -681,36 +741,46 @@ impl ChildManager {
         }
     }
 
-    /// Contrôle de santé sans verrou global : un processus occupé par un appel est vivant,
-    /// il n'est pas pingé (et ne bloque plus les autres serveurs).
+    /// Contrôle de santé sans verrou global : une instance occupée par un appel est vivante,
+    /// elle n'est pas pingée (et ne bloque plus les autres serveurs).
     pub async fn health_check(&self) -> Vec<(String, String)> {
         let mut dead_servers: Vec<(String, String)> = Vec::new();
 
         for (name, pool) in self.snapshot().await {
             let mut reason: Option<String> = None;
 
-            for proc_arc in &pool.procs {
-                let Ok(mut proc) = proc_arc.try_lock() else {
+            for instance in &pool.procs {
+                if instance.busy() {
                     continue;
-                };
-                match proc.exited() {
-                    Ok(Some(status)) => {
-                        reason = Some(format!("Process exited: {}", status));
-                        break;
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        reason = Some(format!("Process check failed: {}", e));
-                        break;
-                    }
                 }
-
+                // Le ping n'est pas compté comme un appel : il ne doit pas faire passer le
+                // serveur pour occupé auprès de l'arrêt sur inactivité.
                 let sent = AtomicBool::new(false);
-                let ping_result = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    send_request_inner(&mut proc, "ping", serde_json::json!({}), &sent),
-                )
-                .await;
+                let ping = Duration::from_secs(5);
+                let ping_result = match &instance.link {
+                    Link::Stdio(proc) => {
+                        let Ok(mut proc) = proc.try_lock() else {
+                            continue;
+                        };
+                        match proc.exited() {
+                            Ok(Some(status)) => {
+                                reason = Some(format!("Process exited: {}", status));
+                                break;
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                reason = Some(format!("Process check failed: {}", e));
+                                break;
+                            }
+                        }
+                        let request = stdio_request(&mut proc, "ping", serde_json::json!({}), &sent);
+                        tokio::time::timeout(ping, request).await
+                    }
+                    Link::Http(_) => {
+                        let request = instance.request("ping", serde_json::json!({}), &sent);
+                        tokio::time::timeout(ping, request).await
+                    }
+                };
 
                 match ping_result {
                     Ok(Ok(_)) => {}
@@ -754,7 +824,7 @@ async fn start_instance(
     index: usize,
     pool_size: usize,
     request_timeout_secs: u64,
-) -> Result<(ChildProcess, KillHandle, Vec<ToolDef>), String> {
+) -> Result<(Instance, KillHandle, Vec<ToolDef>), String> {
     let start = Instant::now();
     if pool_size > 1 {
         eprintln!(
@@ -799,22 +869,20 @@ async fn start_instance(
             return Err("No stdio".into());
         };
         (
-            Link::Stdio {
+            Link::Stdio(Mutex::new(StdioProcess {
                 child,
                 stdin,
                 stdout_lines: BufReader::new(stdout).lines(),
-            },
+                next_id: 1,
+                server_name: name.to_string(),
+            })),
             KillHandle::Pid(pid),
         )
     };
 
-    let mut proc = ChildProcess {
-        link,
-        next_id: 1,
-        server_name: name.to_string(),
-    };
+    let proc = Instance::new(link);
 
-    match initialize(&mut proc, name, index, request_timeout_secs).await {
+    match initialize(&proc, name, index, request_timeout_secs).await {
         Ok(tools) => {
             if index == 0 {
                 eprintln!(
@@ -834,7 +902,7 @@ async fn start_instance(
 }
 
 async fn initialize(
-    proc: &mut ChildProcess,
+    proc: &Instance,
     name: &str,
     index: usize,
     request_timeout_secs: u64,
@@ -864,7 +932,7 @@ async fn initialize(
         }
     }
 
-    send_notification(proc, "notifications/initialized", serde_json::json!({})).await?;
+    proc.notify("notifications/initialized", serde_json::json!({})).await?;
     // tools/list est paginé (nextCursor) : on lit toutes les pages.
     let mut tools: Vec<ToolDef> = Vec::new();
     let mut cursor: Option<String> = None;
@@ -903,7 +971,7 @@ async fn initialize(
 }
 
 async fn send_request(
-    proc: &mut ChildProcess,
+    proc: &Instance,
     method: &str,
     params: serde_json::Value,
     timeout_secs: u64,
@@ -911,7 +979,7 @@ async fn send_request(
     let sent = AtomicBool::new(false);
     match tokio::time::timeout(
         Duration::from_secs(timeout_secs.max(1)),
-        send_request_inner(proc, method, params, &sent),
+        proc.request(method, params, &sent),
     )
     .await
     {
@@ -945,8 +1013,8 @@ async fn answer_server_request(
     let _ = stdin.flush().await;
 }
 
-async fn send_request_inner(
-    proc: &mut ChildProcess,
+async fn stdio_request(
+    proc: &mut StdioProcess,
     method: &str,
     params: serde_json::Value,
     sent: &AtomicBool,
@@ -954,14 +1022,7 @@ async fn send_request_inner(
     let id = proc.next_id;
     proc.next_id += 1;
     let server_name = proc.server_name.clone();
-    let (stdin, stdout_lines) = match &mut proc.link {
-        Link::Http(remote) => {
-            let remote = remote.clone();
-            sent.store(true, Ordering::SeqCst);
-            return remote.request(method, params).await.map_err(CallError::Server);
-        }
-        Link::Stdio { stdin, stdout_lines, .. } => (stdin, stdout_lines),
-    };
+    let StdioProcess { stdin, stdout_lines, .. } = proc;
 
     let request = serde_json::json!({
         "jsonrpc": "2.0",
@@ -1037,18 +1098,12 @@ async fn send_request_inner(
     }
 }
 
-async fn send_notification(
-    proc: &mut ChildProcess,
+async fn stdio_notify(
+    proc: &mut StdioProcess,
     method: &str,
     params: serde_json::Value,
 ) -> Result<(), String> {
-    let stdin = match &mut proc.link {
-        Link::Http(remote) => {
-            let remote = remote.clone();
-            return remote.notify(method, params).await;
-        }
-        Link::Stdio { stdin, .. } => stdin,
-    };
+    let stdin = &mut proc.stdin;
     let notification = serde_json::json!({
         "jsonrpc": "2.0",
         "method": method,
@@ -1143,6 +1198,155 @@ done
         let pid: i32 = pid.parse().unwrap();
         // SAFETY: signal 0 ne fait que tester l'existence du processus.
         unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Faux serveur MCP distant (Streamable HTTP, réponses JSON) sur un port local libre.
+    /// L'outil `slow` répond après `delay` ; `peak` retient le plus grand nombre d'appels
+    /// `slow` traités en même temps.
+    async fn fake_http_server(delay: Duration) -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let peak = Arc::new(AtomicUsize::new(0));
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak_seen = peak.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(fake_http_connection(stream, delay, running.clone(), peak_seen.clone()));
+            }
+        });
+        (url, peak)
+    }
+
+    async fn fake_http_connection(
+        mut stream: tokio::net::TcpStream,
+        delay: Duration,
+        running: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    ) {
+        use tokio::io::AsyncReadExt;
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            let header_end = loop {
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+                let mut chunk = [0u8; 4096];
+                match stream.read(&mut chunk).await {
+                    Ok(n) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+                    _ => return,
+                }
+            };
+            let head = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+            let length: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .map(|v| v.trim().parse().unwrap())
+                .unwrap_or(0);
+            while buf.len() < header_end + length {
+                let mut chunk = [0u8; 4096];
+                match stream.read(&mut chunk).await {
+                    Ok(n) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+                    _ => return,
+                }
+            }
+            let body: Vec<u8> = buf.drain(..header_end + length).skip(header_end).collect();
+            let request: serde_json::Value =
+                serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+            let id = request.get("id").cloned();
+            let result = match request.get("method").and_then(|m| m.as_str()) {
+                Some("initialize") => serde_json::json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "serverInfo": { "name": "fake-http", "version": "1" }
+                }),
+                Some("tools/list") => serde_json::json!({
+                    "tools": [{ "name": "slow", "description": "s", "inputSchema": { "type": "object" } }]
+                }),
+                Some("tools/call") => {
+                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(delay).await;
+                    running.fetch_sub(1, Ordering::SeqCst);
+                    serde_json::json!({ "content": [{ "type": "text", "text": "slow" }] })
+                }
+                _ => serde_json::json!({}),
+            };
+            let reply = match id {
+                Some(id) => {
+                    let payload =
+                        serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string();
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        payload.len(),
+                        payload
+                    )
+                }
+                None => "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n".to_string(),
+            };
+            if stream.write_all(reply.as_bytes()).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    fn remote_config(url: &str, timeout: u64) -> ServerConfig {
+        ServerConfig {
+            command: String::new(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            pool: 1,
+            request_timeout_secs: Some(timeout),
+            sandbox: None,
+            inherit_env: Vec::new(),
+            url: Some(url.to_string()),
+            headers: HashMap::new(),
+            oauth: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn appels_distants_simultanes_en_parallele() {
+        let delay = Duration::from_millis(600);
+        let (url, peak) = fake_http_server(delay).await;
+        let mut configs = HashMap::new();
+        configs.insert("fake-remote".to_string(), remote_config(&url, 10));
+        let manager = ChildManager::new(configs, 300_000, 10);
+        manager.start_server("fake-remote").await.unwrap();
+
+        let began = Instant::now();
+        let (first, second) = tokio::join!(
+            manager.call_tool("fake-remote", "slow", serde_json::json!({})),
+            manager.call_tool("fake-remote", "slow", serde_json::json!({})),
+        );
+        let elapsed = began.elapsed();
+        assert_eq!(first.unwrap()["content"][0]["text"], "slow");
+        assert_eq!(second.unwrap()["content"][0]["text"], "slow");
+        assert_eq!(peak.load(Ordering::SeqCst), 2, "les deux appels doivent se chevaucher");
+        assert!(elapsed >= delay, "trop court : {:?}", elapsed);
+        assert!(elapsed < delay * 2 - Duration::from_millis(200), "appels en file : {:?}", elapsed);
+        manager.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn appel_distant_trop_long_issue_inconnue_sans_gener_les_suivants() {
+        let (url, _peak) = fake_http_server(Duration::from_millis(1600)).await;
+        let mut configs = HashMap::new();
+        configs.insert("fake-remote-lent".to_string(), remote_config(&url, 1));
+        let manager = ChildManager::new(configs, 300_000, 1);
+        manager.start_server("fake-remote-lent").await.unwrap();
+
+        let began = Instant::now();
+        let err = manager
+            .call_tool("fake-remote-lent", "slow", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(is_unknown_outcome(&err), "{}", err);
+        assert!(began.elapsed() < Duration::from_millis(1500), "delai non applique : {:?}", began.elapsed());
+        assert!(manager.is_running("fake-remote-lent").await);
+        // L'appel abandonné ne compte plus : le serveur redevient arrêtable sur inactivité.
+        let pool = manager.pool("fake-remote-lent").await.unwrap();
+        assert!(!pool.busy());
+        manager.stop_all().await;
     }
 
     #[tokio::test]
