@@ -226,6 +226,21 @@ impl PermissionsConfig {
         })
     }
 
+    /// Vrai si aucun outil du serveur ne peut être appelé : la première règle qui vise le
+    /// serveur sans être un refus laisse passer au moins un outil ; un refus sur tous les
+    /// outils (`*`) atteint avant ferme tout ; sinon c'est `default` qui tranche.
+    pub fn denies_server(&self, server: &str) -> bool {
+        for rule in self.rules.iter().filter(|rule| glob_match(&rule.server, server)) {
+            if rule.action != Action::Deny {
+                return false;
+            }
+            if !rule.tool.is_empty() && rule.tool.chars().all(|c| c == '*') {
+                return true;
+            }
+        }
+        self.default == Action::Deny
+    }
+
     pub fn decide(&self, server: &str, tool: &str) -> Decision {
         self.decide_with(server, tool, false)
     }
@@ -453,6 +468,29 @@ pub fn run_cli(args: &[String], cfg: &PermissionsConfig) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn serveur_entierement_interdit() {
+        let cfg = PermissionsConfig::from_json(&json!({
+            "rules": [
+                { "server": "ferme", "tool": "*", "action": "deny" },
+                { "server": "partiel", "tool": "delete_*", "action": "deny" },
+                { "server": "lecture", "tool": "read_*", "action": "allow" },
+                { "server": "lecture", "tool": "*", "action": "deny" }
+            ]
+        }))
+        .unwrap();
+        assert!(cfg.denies_server("ferme"));
+        assert!(cfg.denies_server("FERME"));
+        assert!(!cfg.denies_server("partiel"));
+        assert!(!cfg.denies_server("lecture"));
+        assert!(!cfg.denies_server("autre"));
+
+        let tout_refuse = PermissionsConfig { default: Action::Deny, ..cfg.clone() };
+        assert!(tout_refuse.denies_server("autre"));
+        assert!(tout_refuse.denies_server("partiel"));
+        assert!(!tout_refuse.denies_server("lecture"));
+    }
 
     #[test]
     fn glob() {

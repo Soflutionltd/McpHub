@@ -115,6 +115,10 @@ fn usage_stats_path() -> std::path::PathBuf {
 }
 
 fn load_usage_stats() -> HashMap<String, u64> {
+    // Les tests ne lisent jamais les statistiques réelles de l'utilisateur.
+    if cfg!(test) {
+        return HashMap::new();
+    }
     let path = usage_stats_path();
     std::fs::read_to_string(&path)
         .ok()
@@ -718,6 +722,16 @@ impl ProxyServer {
         let preload_delay_ms = config.preload_delay_ms;
         drop(config);
 
+        // 5. Préchauffage en tâche de fond : ni le démarrage ni l'écoute HTTP ne l'attendent.
+        let preload_names = self.preload_targets().await;
+        if !preload_names.is_empty() {
+            tokio::spawn(preload_servers(
+                self.child_manager.clone(),
+                preload_names,
+                preload_delay_ms,
+            ));
+        }
+
         if let Some(reason) = catalog_refresh_reason {
             spawn_catalog_refresh(
                 reason,
@@ -729,6 +743,60 @@ impl ProxyServer {
                 preload_delay_ms,
                 self.catalog_refresh_in_progress.clone(),
             );
+        }
+    }
+
+    /// Serveurs à préchauffer d'après `settings.preload`. Un nom inconnu (ou désactivé, donc
+    /// absent de la config) et un serveur interdit par les permissions sont écartés et journalisés.
+    async fn preload_targets(&self) -> Vec<String> {
+        let (preload, auto_count, permissions, mut configured) = {
+            let config = self.config.lock().await;
+            (
+                config.preload.clone(),
+                config.preload_auto_count,
+                config.permissions.clone(),
+                config.servers.keys().cloned().collect::<Vec<String>>(),
+            )
+        };
+        configured.sort();
+
+        let allowed = |name: &String| {
+            let denied = permissions.denies_server(name);
+            if denied {
+                eprintln!(
+                    "[McpHub][INFO] Prechauffage : {} interdit par les permissions, ignore",
+                    name
+                );
+            }
+            !denied
+        };
+
+        match preload {
+            crate::config::Preload::None => Vec::new(),
+            crate::config::Preload::All => configured.into_iter().filter(allowed).collect(),
+            crate::config::Preload::Auto => {
+                // Les interdits sont écartés avant le classement : ils ne prennent pas de place.
+                let eligible: Vec<String> = configured
+                    .into_iter()
+                    .filter(|name| !permissions.denies_server(name))
+                    .collect();
+                let metrics = self.metrics.lock().await;
+                most_called_servers(&metrics.tool_calls, &eligible, auto_count)
+            }
+            crate::config::Preload::Some(names) => {
+                let mut resolved = Vec::new();
+                for name in names {
+                    match self.child_manager.resolve_name(&name).await {
+                        Some(key) if !resolved.contains(&key) => resolved.push(key),
+                        Some(_) => {}
+                        None => eprintln!(
+                            "[McpHub][WARN] Prechauffage : serveur inconnu ou desactive, ignore : {}",
+                            name
+                        ),
+                    }
+                }
+                resolved.into_iter().filter(allowed).collect()
+            }
         }
     }
 
@@ -2540,6 +2608,65 @@ fn strip_schema(schema: &serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// Les `count` serveurs configurés les plus appelés. Les clés d'usage sont "serveur__outil" ;
+/// un nom de serveur pouvant contenir "__", la clé est rattachée au plus long nom configuré
+/// qui la préfixe. Un serveur jamais appelé n'est pas retenu.
+fn most_called_servers(
+    tool_calls: &HashMap<String, u64>,
+    configured: &[String],
+    count: usize,
+) -> Vec<String> {
+    let mut totals: HashMap<&str, u64> = HashMap::new();
+    for (key, calls) in tool_calls {
+        let owner = configured
+            .iter()
+            .filter(|name| {
+                key.strip_prefix(name.as_str())
+                    .is_some_and(|rest| rest.starts_with("__"))
+            })
+            .max_by_key(|name| name.len());
+        if let Some(name) = owner {
+            *totals.entry(name.as_str()).or_insert(0) += calls;
+        }
+    }
+    let mut ranked: Vec<(&str, u64)> = totals.into_iter().filter(|(_, calls)| *calls > 0).collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    ranked
+        .into_iter()
+        .take(count)
+        .map(|(name, _)| name.to_string())
+        .collect()
+}
+
+/// Lance les serveurs à préchauffer, en parallèle et décalés de `delay_ms`. Un échec est
+/// journalisé et n'empêche rien. `start_server` compte comme une activité normale, une seule
+/// fois : un serveur préchauffé puis jamais appelé est arrêté par le délai d'inactivité.
+async fn preload_servers(manager: Arc<ChildManager>, names: Vec<String>, delay_ms: u64) {
+    eprintln!(
+        "[McpHub][INFO] Prechauffage de {} serveur(s) : {}",
+        names.len(),
+        names.join(", ")
+    );
+    let starts: Vec<_> = names
+        .into_iter()
+        .enumerate()
+        .map(|(position, name)| {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms * position as u64)).await;
+                if let Err(error) = manager.start_server(&name).await {
+                    eprintln!("[McpHub][WARN] Prechauffage de {} en echec : {}", name, error);
+                }
+            })
+        })
+        .collect();
+    for start in starts {
+        if let Err(error) = start.await {
+            eprintln!("[McpHub][WARN] Prechauffage interrompu : {}", error);
+        }
+    }
+}
+
 fn spawn_catalog_refresh(
     reason: String,
     manager: Arc<ChildManager>,
@@ -2835,6 +2962,154 @@ mod tests {
             ProxyServer::negotiate_protocol_version(&json!({})),
             crate::protocol::LATEST_PROTOCOL_VERSION
         );
+    }
+
+    /// Faux serveur MCP minimal (initialize, tools/list) pour les tests de préchauffage.
+    #[cfg(unix)]
+    const FAKE_PRELOAD_SERVER: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fake","version":"1"}}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"read_x","description":"r","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+  esac
+done
+"#;
+
+    #[cfg(unix)]
+    fn preload_hub(
+        tag: &str,
+        names: &[&str],
+        preload: crate::config::Preload,
+        idle_timeout_ms: u64,
+    ) -> ProxyServer {
+        let dir = std::env::temp_dir().join(format!("mcphub-preload-{}-{}", tag, std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dossier temporaire");
+        let script = dir.join("server.sh");
+        std::fs::write(&script, FAKE_PRELOAD_SERVER).expect("script du faux serveur");
+        let server = |command: &str| crate::config::ServerConfig {
+            command: command.into(),
+            args: vec![script.display().to_string()],
+            env: HashMap::new(),
+            pool: 1,
+            request_timeout_secs: Some(5),
+            sandbox: None,
+            inherit_env: Vec::new(),
+            url: None,
+            headers: HashMap::new(),
+            oauth: false,
+        };
+        let mut servers: HashMap<String, crate::config::ServerConfig> = names
+            .iter()
+            .map(|name| (name.to_string(), server("/bin/sh")))
+            .collect();
+        servers.insert("casse".into(), server("/chemin/inexistant/mcphub-test"));
+        ProxyServer::new(ProxyConfig {
+            servers,
+            preload,
+            idle_timeout_ms,
+            permissions: crate::permissions::PermissionsConfig::from_json(&json!({
+                "rules": [{ "server": "ferme", "tool": "*", "action": "deny" }]
+            }))
+            .expect("permissions valides"),
+            audit: crate::audit::AuditConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prechauffage_lance_les_serveurs_listes() {
+        let hub = preload_hub(
+            "liste",
+            &["alpha", "beta", "ferme"],
+            crate::config::Preload::Some(vec![
+                "Alpha".into(),
+                "casse".into(),
+                "ferme".into(),
+                "inconnu".into(),
+                "alpha".into(),
+            ]),
+            300_000,
+        );
+        let targets = hub.preload_targets().await;
+        assert_eq!(targets, vec!["alpha".to_string(), "casse".to_string()]);
+
+        // L'échec de "casse" est journalisé et n'empêche pas "alpha".
+        preload_servers(hub.child_manager.clone(), targets, 0).await;
+        assert!(hub.child_manager.is_running("alpha").await);
+        assert!(!hub.child_manager.is_running("casse").await);
+        assert!(!hub.child_manager.is_running("beta").await, "non liste");
+        assert!(!hub.child_manager.is_running("ferme").await, "interdit par les permissions");
+        hub.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prechauffage_auto_prend_les_plus_appeles() {
+        let hub = preload_hub(
+            "auto",
+            &["alpha", "beta", "gamma", "ferme"],
+            crate::config::Preload::Auto,
+            300_000,
+        );
+        hub.config.lock().await.preload_auto_count = 2;
+        hub.metrics.lock().await.tool_calls = HashMap::from([
+            ("alpha__a".to_string(), 1),
+            ("beta__x".to_string(), 5),
+            ("beta__y".to_string(), 2),
+            ("gamma__z".to_string(), 3),
+            ("ferme__q".to_string(), 100),
+            ("absent__t".to_string(), 50),
+        ]);
+        let targets = hub.preload_targets().await;
+        assert_eq!(targets, vec!["beta".to_string(), "gamma".to_string()]);
+
+        preload_servers(hub.child_manager.clone(), targets, 0).await;
+        assert!(hub.child_manager.is_running("beta").await);
+        assert!(hub.child_manager.is_running("gamma").await);
+        assert!(!hub.child_manager.is_running("alpha").await);
+        assert!(!hub.child_manager.is_running("ferme").await);
+        hub.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prechauffage_ne_garde_pas_un_serveur_eveille() {
+        let hub = preload_hub("inactif", &["alpha"], crate::config::Preload::All, 50);
+        hub.config.lock().await.servers.remove("casse");
+        hub.child_manager
+            .update_configs(hub.config.lock().await.servers.clone())
+            .await;
+        let targets = hub.preload_targets().await;
+        assert_eq!(targets, vec!["alpha".to_string()]);
+        preload_servers(hub.child_manager.clone(), targets, 0).await;
+        assert!(hub.child_manager.is_running("alpha").await);
+
+        // Jamais appelé ensuite : le délai d'inactivité l'arrête comme n'importe quel serveur.
+        tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+        hub.child_manager.reap_idle().await;
+        assert!(!hub.child_manager.is_running("alpha").await);
+    }
+
+    #[test]
+    fn serveurs_les_plus_appeles() {
+        let configured = vec!["a".to_string(), "a__b".to_string(), "c".to_string()];
+        let calls = HashMap::from([
+            ("a__b__outil".to_string(), 4),
+            ("a__outil".to_string(), 3),
+            ("c__outil".to_string(), 3),
+            ("c__jamais".to_string(), 0),
+            ("inconnu__outil".to_string(), 9),
+        ]);
+        assert_eq!(most_called_servers(&calls, &configured, 5), vec!["a__b", "a", "c"]);
+        assert_eq!(most_called_servers(&calls, &configured, 1), vec!["a__b"]);
+        assert!(most_called_servers(&HashMap::new(), &configured, 5).is_empty());
     }
 
     #[tokio::test]

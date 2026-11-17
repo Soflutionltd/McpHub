@@ -36,6 +36,8 @@ pub enum Preload {
     All,
     None,
     Some(Vec<String>),
+    /// Les serveurs les plus appelés d'après les statistiques d'usage (`preload_auto_count`).
+    Auto,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +45,8 @@ pub struct ProxyConfig {
     pub servers: HashMap<String, ServerConfig>,
     pub mode: Mode,
     pub preload: Preload,
+    /// Nombre de serveurs préchauffés par `preload: "auto"`.
+    pub preload_auto_count: usize,
     pub media_profile: MediaProfile,
     pub idle_timeout_ms: u64,
     pub preload_delay_ms: u64,
@@ -65,7 +69,10 @@ impl Default for ProxyConfig {
         Self {
             servers: HashMap::new(),
             mode: Mode::Discover,
-            preload: Preload::All,
+            // Rien n'est préchauffé sans réglage explicite : `settings.preload` n'était lu nulle
+            // part, l'activer par défaut lancerait tous les serveurs à chaque démarrage.
+            preload: Preload::None,
+            preload_auto_count: 5,
             media_profile: MediaProfile::Safe,
             idle_timeout_ms: 5 * 60 * 1000,
             preload_delay_ms: 200,
@@ -459,6 +466,7 @@ fn config_from_json(json: &Value, source_path: Option<&Path>) -> Result<ProxyCon
             config.preload = match preload {
                 Value::String(value) if value.eq_ignore_ascii_case("none") => Preload::None,
                 Value::String(value) if value.eq_ignore_ascii_case("all") => Preload::All,
+                Value::String(value) if value.eq_ignore_ascii_case("auto") => Preload::Auto,
                 Value::Array(values) => {
                     let names: Vec<String> = values
                         .iter()
@@ -472,6 +480,9 @@ fn config_from_json(json: &Value, source_path: Option<&Path>) -> Result<ProxyCon
                 }
                 _ => config.preload.clone(),
             };
+        }
+        if let Some(count) = settings.get("preloadAutoCount").and_then(|v| v.as_u64()) {
+            config.preload_auto_count = count as usize;
         }
         if let Some(timeout) = settings.get("idleTimeout").and_then(|v| v.as_u64()) {
             config.idle_timeout_ms = timeout * 1000;
@@ -622,6 +633,7 @@ fn apply_env_overrides(mut config: ProxyConfig) -> ProxyConfig {
     if let Ok(preload) = std::env::var("MCP_ON_DEMAND_PRELOAD") {
         config.preload = match preload.as_str() {
             "none" => Preload::None,
+            "auto" => Preload::Auto,
             _ => Preload::All,
         };
     }
@@ -689,6 +701,26 @@ mod tests {
         assert_eq!(github.args.len(), 2);
         assert_eq!(github.env.get("GITHUB_TOKEN").unwrap(), "123");
         assert_eq!(github.request_timeout_secs, Some(240));
+    }
+
+    #[test]
+    fn preload_formats_acceptes() {
+        let parse = |settings: Value| {
+            config_from_json(&json!({ "mcpServers": {}, "settings": settings }), None)
+                .expect("config valide")
+        };
+        assert_eq!(parse(json!({})).preload, Preload::None);
+        assert_eq!(parse(json!({ "preload": "all" })).preload, Preload::All);
+        assert_eq!(parse(json!({ "preload": "NONE" })).preload, Preload::None);
+        assert_eq!(parse(json!({ "preload": [] })).preload, Preload::None);
+        assert_eq!(
+            parse(json!({ "preload": ["a", "b"] })).preload,
+            Preload::Some(vec!["a".into(), "b".into()])
+        );
+        let auto = parse(json!({ "preload": "auto" }));
+        assert_eq!(auto.preload, Preload::Auto);
+        assert_eq!(auto.preload_auto_count, 5);
+        assert_eq!(parse(json!({ "preload": "auto", "preloadAutoCount": 3 })).preload_auto_count, 3);
     }
 
     #[test]
