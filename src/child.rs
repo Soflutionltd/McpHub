@@ -1,17 +1,19 @@
 /// Child process manager: spawn MCP servers, communicate over stdio, manage lifecycle.
 ///
-/// Verrous : la table globale des pools n'est jamais tenue pendant une attente (appel, ping,
-/// verrou d'un processus). Chaque processus local a son propre verrou, tenu le temps d'un
-/// échange. Un serveur distant n'en a pas : ses requêtes HTTP partent en parallèle.
+/// Verrous : la table globale des pools n'est jamais tenue pendant une attente (appel, ping).
+/// Aucun verrou n'est tenu pendant l'attente d'une réponse : un serveur distant reçoit ses
+/// requêtes HTTP en parallèle, un processus local multiplexe les siennes par identifiant
+/// JSON-RPC (une tâche lectrice par processus, écritures sur stdin sérialisées par un verrou
+/// tenu le temps d'une ligne).
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
 
 pub use crate::config::ServerConfig;
 use crate::protocol::ToolDef;
@@ -55,33 +57,305 @@ impl CallError {
     }
 }
 
-struct StdioProcess {
-    child: Child,
-    stdin: tokio::process::ChildStdin,
-    stdout_lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
-    next_id: u64,
+type Reply = Result<serde_json::Value, CallError>;
+
+/// Où en est l'envoi d'une requête. L'appelant qui renonce (délai dépassé) et la tâche qui
+/// écrit se départagent par un seul échange atomique : soit la requête est abandonnée avant
+/// le premier octet et ne sera jamais écrite, soit elle est considérée comme transmise.
+#[derive(Clone)]
+struct SendState(Arc<AtomicU8>);
+
+impl SendState {
+    const QUEUED: u8 = 0;
+    const WRITING: u8 = 1;
+    const SENT: u8 = 2;
+    const ABANDONED: u8 = 3;
+
+    fn new() -> Self {
+        Self(Arc::new(AtomicU8::new(Self::QUEUED)))
+    }
+
+    /// Côté écriture : faux si l'appelant a déjà renoncé, rien ne doit alors être écrit.
+    fn begin_write(&self) -> bool {
+        self.0
+            .compare_exchange(Self::QUEUED, Self::WRITING, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    fn mark_sent(&self) {
+        self.0.store(Self::SENT, Ordering::SeqCst);
+    }
+
+    /// Côté appelant : vrai si la requête est prouvée non envoyée (et ne le sera jamais).
+    /// Une écriture commencée compte comme transmise : l'issue est alors inconnue.
+    fn abandon(&self) -> bool {
+        match self.0.compare_exchange(
+            Self::QUEUED,
+            Self::ABANDONED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => true,
+            Err(actual) => actual == Self::ABANDONED,
+        }
+    }
+}
+
+/// Renonce à l'envoi si le futur de l'appel est abandonné avant l'écriture.
+struct AbandonOnDrop<'a>(&'a SendState);
+
+impl Drop for AbandonOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.abandon();
+    }
+}
+
+#[derive(Default)]
+struct Waiting {
+    replies: HashMap<u64, oneshot::Sender<Reply>>,
+    /// Raison de l'arrêt de la lecture (processus mort, stdout fermé) : plus rien n'arrivera.
+    closed: Option<String>,
+}
+
+/// Partie d'un processus local partagée entre les appelants, la tâche lectrice et les
+/// tâches d'écriture.
+struct StdioShared {
     server_name: String,
+    stdin: Mutex<tokio::process::ChildStdin>,
+    waiting: std::sync::Mutex<Waiting>,
+    next_id: AtomicU64,
+}
+
+impl StdioShared {
+    fn waiting(&self) -> std::sync::MutexGuard<'_, Waiting> {
+        // Aucune section critique ne peut paniquer en laissant la table incohérente.
+        self.waiting.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn register(&self, id: u64, reply: oneshot::Sender<Reply>) -> Result<(), CallError> {
+        let mut waiting = self.waiting();
+        if let Some(reason) = &waiting.closed {
+            return Err(CallError::Dead(reason.clone()));
+        }
+        waiting.replies.insert(id, reply);
+        Ok(())
+    }
+
+    fn forget(&self, id: u64) {
+        self.waiting().replies.remove(&id);
+    }
+
+    /// Fin de la lecture : tous les appels en attente sont libérés. Ceux déjà écrits y
+    /// lisent une issue inconnue ; ceux pas encore écrits échoueront à l'écriture (non
+    /// transmis) sans regarder cette réponse.
+    fn close(&self, reason: String) {
+        let pending = {
+            let mut waiting = self.waiting();
+            waiting.closed = Some(reason.clone());
+            std::mem::take(&mut waiting.replies)
+        };
+        for (_, reply) in pending {
+            let _ = reply.send(Err(CallError::Lost(reason.clone())));
+        }
+    }
+
+    /// Route une ligne de stdout : réponse vers l'appel qui l'attend, requête du serveur,
+    /// notification. Une réponse sans appel en attente (délai déjà dépassé) est ignorée.
+    fn dispatch(self: &Arc<Self>, line: &str) {
+        if line.is_empty() {
+            return;
+        }
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) else {
+            return;
+        };
+
+        if let Some(server_method) = parsed.get("method").and_then(|v| v.as_str()) {
+            match parsed.get("id") {
+                // Réponse écrite hors de la tâche lectrice : stdin plein ne doit jamais
+                // empêcher de lire stdout.
+                Some(request_id) => {
+                    tokio::spawn(answer_server_request(
+                        self.clone(),
+                        request_id.clone(),
+                        server_method.to_string(),
+                    ));
+                }
+                None if server_method == "notifications/message" => {
+                    if let Some(params) = parsed.get("params") {
+                        if let (Some(level), Some(data)) = (
+                            params.get("level").and_then(|v| v.as_str()),
+                            params.get("data").and_then(|v| v.as_str()),
+                        ) {
+                            eprintln!(
+                                "[McpHub][{}][{}] {}",
+                                self.server_name,
+                                level.to_uppercase(),
+                                redact_text(data)
+                            );
+                        }
+                    }
+                }
+                None => {}
+            }
+            return;
+        }
+
+        let Some(id) = parsed.get("id").and_then(|v| v.as_u64()) else {
+            return;
+        };
+        let Some(reply) = self.waiting().replies.remove(&id) else {
+            return;
+        };
+        let outcome = match parsed.get("error") {
+            Some(error) => Err(CallError::Server(format!("MCP error: {}", error))),
+            None => Ok(parsed.get("result").cloned().unwrap_or(serde_json::Value::Null)),
+        };
+        // L'appelant a pu renoncer entre-temps : sa réponse tardive est simplement perdue.
+        let _ = reply.send(outcome);
+    }
+}
+
+/// Retire l'appel de la table quand il se termine ou que son futur est abandonné.
+struct Registered<'a> {
+    shared: &'a StdioShared,
+    id: u64,
+}
+
+impl Drop for Registered<'_> {
+    fn drop(&mut self) {
+        self.shared.forget(self.id);
+    }
+}
+
+/// Tâche lectrice : une par processus, jusqu'à la fermeture de stdout.
+async fn read_replies(
+    shared: Arc<StdioShared>,
+    mut stdout_lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+) {
+    let reason = loop {
+        match stdout_lines.next_line().await {
+            Ok(Some(line)) => shared.dispatch(line.trim()),
+            Ok(None) => break "Server closed connection".to_string(),
+            Err(e) => break format!("Read error: {}", e),
+        }
+    };
+    shared.close(reason);
+}
+
+/// Écrit une requête entière sur stdin. Lancée dans sa propre tâche : un appelant qui
+/// renonce en cours d'écriture ne laisse pas une ligne tronquée devant la requête suivante.
+async fn write_request(
+    shared: Arc<StdioShared>,
+    line: Vec<u8>,
+    state: SendState,
+) -> Result<(), CallError> {
+    let mut stdin = shared.stdin.lock().await;
+    if !state.begin_write() {
+        return Err(CallError::Busy("request abandoned before sending".into()));
+    }
+    // Le saut de ligne final est écrit en dernier : un échec d'écriture signifie qu'aucune
+    // requête complète n'a été reçue.
+    stdin
+        .write_all(&line)
+        .await
+        .map_err(|e| CallError::Dead(format!("Write error: {}", e)))?;
+    state.mark_sent();
+    stdin
+        .flush()
+        .await
+        .map_err(|e| CallError::Lost(format!("Flush error: {}", e)))
+}
+
+struct StdioProcess {
+    shared: Arc<StdioShared>,
+    child: Mutex<Child>,
 }
 
 impl StdioProcess {
-    async fn kill(&mut self) {
-        if let Some(pid) = self.child.id() {
-            kill_group(pid);
-        }
-        let _ = self.child.kill().await;
+    fn start(
+        server_name: &str,
+        child: Child,
+        stdin: tokio::process::ChildStdin,
+        stdout: tokio::process::ChildStdout,
+    ) -> Self {
+        let shared = Arc::new(StdioShared {
+            server_name: server_name.to_string(),
+            stdin: Mutex::new(stdin),
+            waiting: std::sync::Mutex::new(Waiting::default()),
+            next_id: AtomicU64::new(1),
+        });
+        tokio::spawn(read_replies(shared.clone(), BufReader::new(stdout).lines()));
+        Self { shared, child: Mutex::new(child) }
     }
 
-    fn exited(&mut self) -> Result<Option<String>, String> {
-        match self.child.try_wait() {
+    async fn kill(&self) {
+        let mut child = self.child.lock().await;
+        if let Some(pid) = child.id() {
+            kill_group(pid);
+        }
+        let _ = child.kill().await;
+    }
+
+    async fn exited(&self) -> Result<Option<String>, String> {
+        match self.child.lock().await.try_wait() {
             Ok(Some(status)) => Ok(Some(status.to_string())),
             Ok(None) => Ok(None),
             Err(e) => Err(e.to_string()),
         }
     }
+
+    /// Un échange : l'appel s'inscrit dans la table avant d'écrire (la réponse ne peut pas
+    /// arriver avant), puis attend sa réponse sans tenir aucun verrou.
+    async fn request(&self, method: &str, params: serde_json::Value, state: &SendState) -> Reply {
+        let shared = &self.shared;
+        let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        let mut line = serde_json::to_vec(&request).map_err(|e| CallError::Server(e.to_string()))?;
+        line.push(b'\n');
+
+        let (reply, answered) = oneshot::channel();
+        shared.register(id, reply)?;
+        let _registered = Registered { shared, id };
+        let _abandon = AbandonOnDrop(state);
+
+        match tokio::spawn(write_request(shared.clone(), line, state.clone())).await {
+            Ok(written) => written?,
+            Err(e) if state.abandon() => {
+                return Err(CallError::Dead(format!("Write task stopped: {}", e)))
+            }
+            Err(e) => return Err(CallError::Lost(format!("Write task stopped: {}", e))),
+        }
+
+        answered
+            .await
+            .unwrap_or_else(|_| Err(CallError::Lost("Server closed connection".into())))
+    }
+
+    async fn notify(&self, method: &str, params: serde_json::Value) -> Result<(), String> {
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        });
+        let mut line = serde_json::to_vec(&notification).map_err(|e| e.to_string())?;
+        line.push(b'\n');
+        tokio::spawn(write_request(self.shared.clone(), line, SendState::new()))
+            .await
+            .map_err(|e| format!("Write task stopped: {}", e))?
+            .map_err(|e| match e {
+                CallError::Dead(e) | CallError::Busy(e) | CallError::Lost(e)
+                | CallError::NoReply(e) | CallError::Server(e) => e,
+            })
+    }
 }
 
 enum Link {
-    Stdio(Mutex<StdioProcess>),
+    Stdio(StdioProcess),
     Http(Arc<crate::remote::RemoteClient>),
 }
 
@@ -118,43 +392,31 @@ impl Instance {
 
     async fn kill(&self) {
         match &self.link {
-            Link::Stdio(proc) => proc.lock().await.kill().await,
+            Link::Stdio(proc) => proc.kill().await,
             Link::Http(remote) => remote.close().await,
         }
     }
 
-    /// Un échange JSON-RPC. Le verrou d'un processus local est tenu pendant tout l'échange
-    /// (une seule lecture de stdout à la fois) ; un serveur distant n'attend aucun verrou.
-    async fn request(
-        &self,
-        method: &str,
-        params: serde_json::Value,
-        sent: &AtomicBool,
-    ) -> Result<serde_json::Value, CallError> {
+    /// Un échange JSON-RPC, sans verrou tenu pendant l'attente de la réponse.
+    async fn request(&self, method: &str, params: serde_json::Value, state: &SendState) -> Reply {
         match &self.link {
             Link::Http(remote) => {
-                sent.store(true, Ordering::SeqCst);
+                state.mark_sent();
                 remote.request(method, params).await.map_err(CallError::Server)
             }
-            Link::Stdio(proc) => {
-                let mut proc = proc.lock().await;
-                stdio_request(&mut proc, method, params, sent).await
-            }
+            Link::Stdio(proc) => proc.request(method, params, state).await,
         }
     }
 
     async fn notify(&self, method: &str, params: serde_json::Value) -> Result<(), String> {
         match &self.link {
             Link::Http(remote) => remote.notify(method, params).await,
-            Link::Stdio(proc) => {
-                let mut proc = proc.lock().await;
-                stdio_notify(&mut proc, method, params).await
-            }
+            Link::Stdio(proc) => proc.notify(method, params).await,
         }
     }
 }
 
-/// De quoi arrêter un processus sans prendre son verrou (tenu pendant un appel en cours).
+/// De quoi arrêter un processus sans attendre quoi que ce soit de lui.
 enum KillHandle {
     Pid(u32),
     Remote(Arc<crate::remote::RemoteClient>),
@@ -202,9 +464,19 @@ impl ServerPool {
         Duration::from_millis(now_ms().saturating_sub(self.last_used_ms.load(Ordering::Relaxed)))
     }
 
+    /// L'instance la moins chargée (`pool` > 1), à tour de rôle en cas d'égalité. Chaque
+    /// instance accepte plusieurs appels en vol : `pool` répartit la charge, il ne la borne pas.
     fn pick(&self) -> Arc<Instance> {
-        let idx = self.next_idx.fetch_add(1, Ordering::Relaxed) % self.procs.len();
-        self.procs[idx].clone()
+        let count = self.procs.len();
+        let first = self.next_idx.fetch_add(1, Ordering::Relaxed) % count;
+        let mut best = &self.procs[first];
+        for offset in 1..count {
+            let candidate = &self.procs[(first + offset) % count];
+            if candidate.in_flight.load(Ordering::SeqCst) < best.in_flight.load(Ordering::SeqCst) {
+                best = candidate;
+            }
+        }
+        best.clone()
     }
 
     fn busy(&self) -> bool {
@@ -539,7 +811,7 @@ impl ChildManager {
     }
 
     /// Un échange sur une instance du pool, sous une seule échéance qui couvre aussi
-    /// l'attente du verrou (un processus local occupé par un appel précédent).
+    /// l'attente de l'écriture (stdin d'un processus local qui ne lit plus).
     async fn exchange(
         &self,
         pool: &ServerPool,
@@ -550,21 +822,21 @@ impl ChildManager {
         let instance = pool.pick();
         let _in_flight = InFlight::enter(&instance.in_flight);
         let secs = pool.request_timeout_secs;
-        let sent = AtomicBool::new(false);
+        let state = SendState::new();
         let outcome = tokio::time::timeout(
             Duration::from_secs(secs),
-            instance.request(method, params, &sent),
+            instance.request(method, params, &state),
         )
         .await;
         pool.touch();
         match outcome {
             Ok(result) => result,
-            Err(_) if sent.load(Ordering::SeqCst) => Err(CallError::NoReply(format!(
-                "Timeout: server did not respond within {}s",
+            Err(_) if state.abandon() => Err(CallError::Busy(format!(
+                "Timeout: server busy for {}s, request not sent",
                 secs
             ))),
-            Err(_) => Err(CallError::Busy(format!(
-                "Timeout: server busy for {}s, request not sent",
+            Err(_) => Err(CallError::NoReply(format!(
+                "Timeout: server did not respond within {}s",
                 secs
             ))),
         }
@@ -753,34 +1025,28 @@ impl ChildManager {
                 if instance.busy() {
                     continue;
                 }
+                if let Link::Stdio(proc) = &instance.link {
+                    match proc.exited().await {
+                        Ok(Some(status)) => {
+                            reason = Some(format!("Process exited: {}", status));
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            reason = Some(format!("Process check failed: {}", e));
+                            break;
+                        }
+                    }
+                }
+
                 // Le ping n'est pas compté comme un appel : il ne doit pas faire passer le
                 // serveur pour occupé auprès de l'arrêt sur inactivité.
-                let sent = AtomicBool::new(false);
-                let ping = Duration::from_secs(5);
-                let ping_result = match &instance.link {
-                    Link::Stdio(proc) => {
-                        let Ok(mut proc) = proc.try_lock() else {
-                            continue;
-                        };
-                        match proc.exited() {
-                            Ok(Some(status)) => {
-                                reason = Some(format!("Process exited: {}", status));
-                                break;
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                reason = Some(format!("Process check failed: {}", e));
-                                break;
-                            }
-                        }
-                        let request = stdio_request(&mut proc, "ping", serde_json::json!({}), &sent);
-                        tokio::time::timeout(ping, request).await
-                    }
-                    Link::Http(_) => {
-                        let request = instance.request("ping", serde_json::json!({}), &sent);
-                        tokio::time::timeout(ping, request).await
-                    }
-                };
+                let state = SendState::new();
+                let ping_result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    instance.request("ping", serde_json::json!({}), &state),
+                )
+                .await;
 
                 match ping_result {
                     Ok(Ok(_)) => {}
@@ -788,6 +1054,8 @@ impl ChildManager {
                         reason = Some(format!("Ping error: {}", e.into_message()));
                         break;
                     }
+                    // Un appel arrivé pendant le ping occupe le serveur : il est vivant.
+                    Err(_) if instance.busy() => {}
                     Err(_) => {
                         reason = Some("Ping timeout (5s)".to_string());
                         break;
@@ -869,13 +1137,7 @@ async fn start_instance(
             return Err("No stdio".into());
         };
         (
-            Link::Stdio(Mutex::new(StdioProcess {
-                child,
-                stdin,
-                stdout_lines: BufReader::new(stdout).lines(),
-                next_id: 1,
-                server_name: name.to_string(),
-            })),
+            Link::Stdio(StdioProcess::start(name, child, stdin, stdout)),
             KillHandle::Pid(pid),
         )
     };
@@ -976,10 +1238,10 @@ async fn send_request(
     params: serde_json::Value,
     timeout_secs: u64,
 ) -> Result<serde_json::Value, String> {
-    let sent = AtomicBool::new(false);
+    let state = SendState::new();
     match tokio::time::timeout(
         Duration::from_secs(timeout_secs.max(1)),
-        proc.request(method, params, &sent),
+        proc.request(method, params, &state),
     )
     .await
     {
@@ -993,11 +1255,7 @@ async fn send_request(
 
 /// Réponse à une requête que le serveur adresse à McpHub (sampling, roots, elicitation) :
 /// sans réponse, le serveur attendrait jusqu'à son propre délai.
-async fn answer_server_request(
-    stdin: &mut tokio::process::ChildStdin,
-    id: &serde_json::Value,
-    method: &str,
-) {
+async fn answer_server_request(shared: Arc<StdioShared>, id: serde_json::Value, method: String) {
     let reply = if method == "ping" {
         serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} })
     } else {
@@ -1007,122 +1265,10 @@ async fn answer_server_request(
             "error": { "code": -32601, "message": format!("McpHub ne prend pas en charge {}", method) }
         })
     };
-    let mut msg = reply.to_string();
-    msg.push('\n');
-    let _ = stdin.write_all(msg.as_bytes()).await;
-    let _ = stdin.flush().await;
-}
-
-async fn stdio_request(
-    proc: &mut StdioProcess,
-    method: &str,
-    params: serde_json::Value,
-    sent: &AtomicBool,
-) -> Result<serde_json::Value, CallError> {
-    let id = proc.next_id;
-    proc.next_id += 1;
-    let server_name = proc.server_name.clone();
-    let StdioProcess { stdin, stdout_lines, .. } = proc;
-
-    let request = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": method,
-        "params": params,
-    });
-
-    let mut msg = serde_json::to_string(&request).map_err(|e| CallError::Server(e.to_string()))?;
-    msg.push('\n');
-
-    // Le saut de ligne final est écrit en dernier : un échec d'écriture signifie qu'aucune
-    // requête complète n'a été reçue.
-    stdin
-        .write_all(msg.as_bytes())
-        .await
-        .map_err(|e| CallError::Dead(format!("Write error: {}", e)))?;
-    sent.store(true, Ordering::SeqCst);
-    stdin
-        .flush()
-        .await
-        .map_err(|e| CallError::Lost(format!("Flush error: {}", e)))?;
-
-    loop {
-        let line = stdout_lines
-            .next_line()
-            .await
-            .map_err(|e| CallError::Lost(format!("Read error: {}", e)))?
-            .ok_or_else(|| CallError::Lost("Server closed connection".into()))?;
-
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        let parsed: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        if let Some(server_method) = parsed.get("method").and_then(|v| v.as_str()) {
-            match parsed.get("id") {
-                Some(request_id) => answer_server_request(stdin, request_id, server_method).await,
-                None if server_method == "notifications/message" => {
-                    if let Some(params) = parsed.get("params") {
-                        if let (Some(level), Some(data)) = (
-                            params.get("level").and_then(|v| v.as_str()),
-                            params.get("data").and_then(|v| v.as_str()),
-                        ) {
-                            eprintln!(
-                                "[McpHub][{}][{}] {}",
-                                server_name,
-                                level.to_uppercase(),
-                                redact_text(data)
-                            );
-                        }
-                    }
-                }
-                None => {}
-            }
-            continue;
-        }
-
-        if parsed.get("id").and_then(|v| v.as_u64()) == Some(id) {
-            if let Some(error) = parsed.get("error") {
-                return Err(CallError::Server(format!("MCP error: {}", error)));
-            }
-            return Ok(parsed
-                .get("result")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null));
-        }
-    }
-}
-
-async fn stdio_notify(
-    proc: &mut StdioProcess,
-    method: &str,
-    params: serde_json::Value,
-) -> Result<(), String> {
-    let stdin = &mut proc.stdin;
-    let notification = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": method,
-        "params": params,
-    });
-
-    let mut msg = serde_json::to_string(&notification).map_err(|e| e.to_string())?;
-    msg.push('\n');
-
-    stdin
-        .write_all(msg.as_bytes())
-        .await
-        .map_err(|e| format!("Write error: {}", e))?;
-    stdin
-        .flush()
-        .await
-        .map_err(|e| format!("Flush error: {}", e))?;
-
-    Ok(())
+    let mut line = reply.to_string().into_bytes();
+    line.push(b'\n');
+    // Au mieux, comme avant : un serveur qui ne lit plus n'aura pas sa réponse.
+    let _ = write_request(shared, line, SendState::new()).await;
 }
 
 #[cfg(all(test, unix))]
@@ -1131,7 +1277,10 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     /// Faux serveur MCP en sh : chaque démarrage ajoute son pid à `pids`, l'outil `mutate`
-    /// écrit dans `mutations` puis ferme sans répondre, `slow` répond après 2 s.
+    /// écrit dans `mutations` puis ferme sans répondre, `slow` répond après 2 s en bloquant
+    /// la lecture. `wait` (1 s) et `late` (3 s) répondent en tâche de fond, la lecture
+    /// continue ; `hang` note l'appel dans `received` et ne répond jamais ; `stall` fait de
+    /// même puis cesse de lire stdin. Une réponse -32601 reçue de McpHub va dans `answers`.
     const FAKE_SERVER: &str = r#"#!/bin/sh
 echo $$ >> "$FAKE_DIR/pids"
 while IFS= read -r line; do
@@ -1148,7 +1297,19 @@ while IFS= read -r line; do
     *'"name":"slow"'*)
       sleep 2
       printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"slow"}]}}\n' "$id" ;;
+    *'"name":"wait"'*)
+      ( sleep 1; printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"wait"}]}}\n' "$id" ) & ;;
+    *'"name":"late"'*)
+      ( sleep 3; printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"late"}]}}\n' "$id" ) & ;;
+    *'"name":"hang"'*)
+      echo "hang $id" >> "$FAKE_DIR/received" ;;
+    *'"name":"stall"'*)
+      echo "stall $id" >> "$FAKE_DIR/received"
+      sleep 30 ;;
+    *'-32601'*)
+      echo "$line" >> "$FAKE_DIR/answers" ;;
     *'"name":"read_x"'*)
+      echo "read_x $id" >> "$FAKE_DIR/received"
       printf '{"jsonrpc":"2.0","id":99999,"method":"roots/list"}\n'
       printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"x"}]}}\n' "$id" ;;
     *'"method":"ping"'*)
@@ -1411,6 +1572,183 @@ done
 
         assert_eq!(slow.await.unwrap().unwrap()["content"][0]["text"], "slow");
         assert_eq!(second_slow.await.unwrap().unwrap()["content"][0]["text"], "x");
+        manager.stop_all().await;
+    }
+
+    /// Attend qu'un fichier du faux serveur contienne `count` lignes (5 s au plus).
+    async fn wait_lines(path: &Path, count: usize) -> Vec<String> {
+        for _ in 0..100 {
+            let found = lines(path);
+            if found.len() >= count {
+                return found;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("{} : {} ligne(s) attendue(s), trouve {:?}", path.display(), count, lines(path));
+    }
+
+    fn kill_fake(dir: &Path) {
+        let pids = lines(&dir.join("pids"));
+        kill_group(pids.last().expect("un processus lance").parse().unwrap());
+    }
+
+    fn started(dir: &Path, tag: &str, timeout: u64) -> Arc<ChildManager> {
+        let mut configs = HashMap::new();
+        configs.insert(tag.to_string(), fake_config(dir, &[], timeout));
+        Arc::new(ChildManager::new(configs, 300_000, timeout))
+    }
+
+    fn spawn_call(
+        manager: &Arc<ChildManager>,
+        server: &'static str,
+        tool: &'static str,
+        arguments: serde_json::Value,
+    ) -> tokio::task::JoinHandle<Result<serde_json::Value, String>> {
+        let manager = manager.clone();
+        tokio::spawn(async move { manager.call_tool(server, tool, arguments).await })
+    }
+
+    #[tokio::test]
+    async fn appels_stdio_simultanes_se_chevauchent() {
+        let dir = fake_dir("mux");
+        let manager = started(&dir, "fake-mux", 10);
+        manager.start_server("fake-mux").await.unwrap();
+
+        let began = Instant::now();
+        let (first, second, third) = tokio::join!(
+            manager.call_tool("fake-mux", "wait", serde_json::json!({})),
+            manager.call_tool("fake-mux", "wait", serde_json::json!({})),
+            manager.call_tool("fake-mux", "read_x", serde_json::json!({})),
+        );
+        let elapsed = began.elapsed();
+        assert_eq!(first.unwrap()["content"][0]["text"], "wait");
+        assert_eq!(second.unwrap()["content"][0]["text"], "wait");
+        assert_eq!(third.unwrap()["content"][0]["text"], "x");
+        assert!(elapsed >= Duration::from_millis(1000), "trop court : {:?}", elapsed);
+        assert!(elapsed < Duration::from_millis(1700), "appels en file : {:?}", elapsed);
+        assert_eq!(lines(&dir.join("pids")).len(), 1, "un seul processus");
+
+        // La requête roots/list émise par le serveur pendant read_x reçoit toujours -32601.
+        let answers = wait_lines(&dir.join("answers"), 1).await;
+        assert!(answers[0].contains("\"id\":99999"), "{}", answers[0]);
+        manager.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn mort_de_l_enfant_deux_appels_en_vol_issue_inconnue() {
+        let dir = fake_dir("mort");
+        let manager = started(&dir, "fake-mort", 10);
+        manager.start_server("fake-mort").await.unwrap();
+
+        let first = spawn_call(&manager, "fake-mort", "hang", serde_json::json!({}));
+        let second = spawn_call(&manager, "fake-mort", "hang", serde_json::json!({}));
+        wait_lines(&dir.join("received"), 2).await;
+        let began = Instant::now();
+        kill_fake(&dir);
+
+        for call in [first, second] {
+            let err = call.await.unwrap().unwrap_err();
+            assert!(is_unknown_outcome(&err), "{}", err);
+        }
+        assert!(began.elapsed() < Duration::from_secs(2), "bloque {:?}", began.elapsed());
+        // Transmis : aucun des deux n'est rejoué, ni sur l'ancien processus ni sur un nouveau.
+        assert_eq!(lines(&dir.join("pids")).len(), 1);
+        assert_eq!(lines(&dir.join("received")).len(), 2);
+        assert!(!manager.is_running("fake-mort").await);
+
+        let ok = manager
+            .call_tool("fake-mort", "read_x", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(ok["content"][0]["text"], "x");
+        let received = lines(&dir.join("received"));
+        assert_eq!(received.iter().filter(|l| l.starts_with("hang")).count(), 2);
+        manager.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn mort_de_l_enfant_appel_non_ecrit_relance_appel_ecrit_non() {
+        let dir = fake_dir("mort-file");
+        let manager = started(&dir, "fake-file", 20);
+        manager.start_server("fake-file").await.unwrap();
+
+        // `stall` est transmis, puis le serveur ne lit plus : le gros appel reste bloqué en
+        // cours d'écriture (aucune ligne complète reçue), le petit attend son tour derrière.
+        let sent = spawn_call(&manager, "fake-file", "stall", serde_json::json!({}));
+        wait_lines(&dir.join("received"), 1).await;
+        let pad = "x".repeat(200_000);
+        let writing = spawn_call(&manager, "fake-file", "read_x", serde_json::json!({ "pad": pad }));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let queued = spawn_call(&manager, "fake-file", "read_x", serde_json::json!({}));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        kill_fake(&dir);
+
+        let err = sent.await.unwrap().unwrap_err();
+        assert!(is_unknown_outcome(&err), "{}", err);
+        // Prouvés non envoyés : relancés une fois sur le processus redémarré.
+        assert_eq!(writing.await.unwrap().unwrap()["content"][0]["text"], "x");
+        assert_eq!(queued.await.unwrap().unwrap()["content"][0]["text"], "x");
+        assert_eq!(lines(&dir.join("pids")).len(), 2, "un seul redemarrage");
+        let received = lines(&dir.join("received"));
+        assert_eq!(received.iter().filter(|l| l.starts_with("stall")).count(), 1, "{:?}", received);
+        assert_eq!(received.iter().filter(|l| l.starts_with("read_x")).count(), 2, "{:?}", received);
+        manager.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn delai_depasse_n_affecte_pas_l_autre_appel() {
+        let dir = fake_dir("delai");
+        let manager = started(&dir, "fake-delai", 2);
+        manager.start_server("fake-delai").await.unwrap();
+
+        let began = Instant::now();
+        let (late, wait) = tokio::join!(
+            manager.call_tool("fake-delai", "late", serde_json::json!({})),
+            manager.call_tool("fake-delai", "wait", serde_json::json!({})),
+        );
+        let err = late.unwrap_err();
+        assert!(is_unknown_outcome(&err), "{}", err);
+        assert_eq!(wait.unwrap()["content"][0]["text"], "wait");
+        assert!(began.elapsed() < Duration::from_millis(2800), "{:?}", began.elapsed());
+        assert!(manager.is_running("fake-delai").await, "un delai depasse ne tue pas le serveur");
+
+        // La réponse tardive de `late` arrive vers 3 s : elle est ignorée, le processus sert
+        // toujours et l'appel suivant reçoit bien sa propre réponse.
+        tokio::time::sleep(Duration::from_millis(3300).saturating_sub(began.elapsed())).await;
+        let ok = manager
+            .call_tool("fake-delai", "read_x", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(ok["content"][0]["text"], "x");
+        assert_eq!(lines(&dir.join("pids")).len(), 1);
+        let pool = manager.pool("fake-delai").await.unwrap();
+        assert!(!pool.busy());
+        manager.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn delai_depasse_avant_ecriture_rien_n_est_execute() {
+        let dir = fake_dir("file");
+        let manager = started(&dir, "fake-attente", 2);
+        manager.start_server("fake-attente").await.unwrap();
+
+        let sent = spawn_call(&manager, "fake-attente", "stall", serde_json::json!({}));
+        wait_lines(&dir.join("received"), 1).await;
+        let pad = "x".repeat(200_000);
+        let writing = spawn_call(&manager, "fake-attente", "hang", serde_json::json!({ "pad": pad }));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let queued = spawn_call(&manager, "fake-attente", "hang", serde_json::json!({}));
+
+        let err = sent.await.unwrap().unwrap_err();
+        assert!(is_unknown_outcome(&err), "{}", err);
+        // Écriture commencée : le serveur peut encore lire la ligne plus tard, issue inconnue.
+        let err = writing.await.unwrap().unwrap_err();
+        assert!(is_unknown_outcome(&err), "{}", err);
+        // Jamais écrit, et ne le sera jamais : sans risque à relancer.
+        let err = queued.await.unwrap().unwrap_err();
+        assert!(is_not_sent(&err), "{}", err);
+        assert_eq!(lines(&dir.join("pids")).len(), 1, "aucun redemarrage, aucun rejeu");
+        assert_eq!(lines(&dir.join("received")).len(), 1);
         manager.stop_all().await;
     }
 
