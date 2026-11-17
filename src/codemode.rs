@@ -301,7 +301,7 @@ impl RunPolicy {
             return Ok(());
         };
         for (key, expected) in pinned {
-            if args.get(key).is_some_and(|given| given != expected) {
+            if !pinned_value_respected(args, &normalize_arg_key(key), expected) {
                 return Err(format!("{} mismatch for server \"{}\"", key, server));
             }
         }
@@ -327,6 +327,24 @@ impl RunPolicy {
             })
             .unwrap_or_default();
         Value::Array(kept)
+    }
+}
+
+/// `project_id`, `projectId` et `Project-ID` désignent le même argument.
+fn normalize_arg_key(key: &str) -> String {
+    key.chars().filter(|c| c.is_ascii_alphanumeric()).map(|c| c.to_ascii_lowercase()).collect()
+}
+
+/// Faux dès qu'un argument du même nom, à n'importe quelle profondeur et quelle que soit
+/// son écriture, porte une autre valeur que celle du projet. Une clé absente passe.
+fn pinned_value_respected(value: &Value, normalized_key: &str, expected: &Value) -> bool {
+    match value {
+        Value::Object(map) => map.iter().all(|(key, child)| {
+            (normalize_arg_key(key) != normalized_key || child == expected)
+                && pinned_value_respected(child, normalized_key, expected)
+        }),
+        Value::Array(items) => items.iter().all(|item| pinned_value_respected(item, normalized_key, expected)),
+        _ => true,
     }
 }
 
@@ -440,6 +458,12 @@ mod tests {
         assert!(p.check_call("supabase", &json!(null)).is_ok());
         // Les autres serveurs ne sont pas concernes.
         assert!(p.check_call("github", &json!({"project_id": "autre"})).is_ok());
+        // Une autre ecriture de la cle, ou une cle imbriquee, ne contourne pas la regle.
+        assert!(p.check_call("supabase", &json!({"projectId": "autre"})).is_err());
+        assert!(p.check_call("supabase", &json!({"Project-ID": "autre"})).is_err());
+        assert!(p.check_call("supabase", &json!({"options": {"project_id": "autre"}})).is_err());
+        assert!(p.check_call("supabase", &json!({"batch": [{"projectId": "xyz"}, {"projectId": "autre"}]})).is_err());
+        assert!(p.check_call("supabase", &json!({"projectId": "xyz", "options": {"project_id": "xyz"}})).is_ok());
     }
 
     #[test]

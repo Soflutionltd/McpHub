@@ -1408,7 +1408,12 @@ registerHubTool(
         ...(timeout_secs ? { timeout_secs } : {}),
         ...(policy ? { policy } : {})
       });
-      if (policy && !result.isError && parseJsonContainer(extractText(result))?.policy !== 'enforced') {
+      // Le texte d'un très gros résultat est coupé par le moteur et ne se parse plus :
+      // la mention se lit alors dans le texte lui-même.
+      const runText = extractText(result);
+      const policyConfirmed =
+        parseJsonContainer(runText)?.policy === 'enforced' || /"policy":\s*"enforced"/.test(runText);
+      if (policy && !result.isError && !policyConfirmed) {
         return textResult(
           'mcphub_run ran but the daemon did not confirm that the project rules were enforced: result withheld. Update McpHub.',
           true
