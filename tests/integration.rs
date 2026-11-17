@@ -1,12 +1,13 @@
-#[tokio::test]
-async fn test_sse_connection_and_keepalive() {
-    // Note: We don't start the actual McpHub daemon in this simple test since it requires
-    // binding to a port and managing child processes. In a real integration test,
-    // we would spawn the `McpHub serve` binary, wait for it to be ready,
-    // and then connect to it.
+use std::process::Command;
 
-    // A placeholder test that asserts true to fulfill the integration test requirement
-    // without risking port conflicts or hanging tests in the CI pipeline.
-    // Full E2E testing of SSE requires a running test server instance.
-    assert!(true);
+/// Lance le vrai binaire : il démarre, répond à `version` et annonce la version du crate.
+#[test]
+fn binary_reports_crate_version() {
+    let output = Command::new(env!("CARGO_BIN_EXE_McpHub"))
+        .arg("version")
+        .output()
+        .expect("le binaire McpHub doit se lancer");
+    assert!(output.status.success(), "code de sortie : {:?}", output.status);
+    let stdout = String::from_utf8(output.stdout).expect("sortie en UTF-8");
+    assert_eq!(stdout.trim(), format!("McpHub v{}", env!("CARGO_PKG_VERSION")));
 }
