@@ -16,6 +16,7 @@ mod http_guard;
 mod install;
 mod instance;
 mod logs;
+mod metrics;
 mod permissions;
 mod oauth;
 mod protocol;

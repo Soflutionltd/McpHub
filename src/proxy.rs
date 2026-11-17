@@ -94,6 +94,9 @@ pub struct GlobalMetrics {
     /// Per-tool call counts (key = "server__tool"). Used to boost BM25 ranking
     /// so frequently-used tools surface first. Persisted to ~/.McpHub/usage-stats.json.
     pub tool_calls: HashMap<String, u64>,
+    /// Par outil ("serveur__outil") : appels réels, erreurs, hits de cache, p50 et p95 sur
+    /// les 200 dernières durées. En mémoire seulement (remis à zéro au redémarrage).
+    pub tools: HashMap<String, crate::metrics::ToolMetrics>,
 }
 
 impl GlobalMetrics {
@@ -106,6 +109,7 @@ impl GlobalMetrics {
             execute_routing: ExecuteRoutingMetrics::default(),
             servers: HashMap::new(),
             tool_calls: load_usage_stats(),
+            tools: HashMap::new(),
         }
     }
 }
@@ -120,16 +124,6 @@ fn load_usage_stats() -> HashMap<String, u64> {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
-}
-
-fn save_usage_stats(stats: &HashMap<String, u64>) {
-    let path = usage_stats_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(json) = serde_json::to_string(stats) {
-        let _ = std::fs::write(&path, json);
-    }
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
@@ -194,6 +188,8 @@ pub struct ProxyServer {
     pub metrics: Arc<Mutex<GlobalMetrics>>,
     catalog_refresh_in_progress: Arc<AtomicBool>,
     response_cache: Arc<ResponseCache>,
+    /// Écriture différée de usage-stats.json (au plus une toutes les 2 secondes).
+    usage_writer: Arc<crate::metrics::UsageWriter>,
     confirmations: Arc<ConfirmStore>,
     audit: Arc<AuditLogger>,
     /// Requêtes en cours : le redémarrage après une mise à jour attend qu'il n'y en ait plus.
@@ -244,6 +240,10 @@ impl ProxyServer {
             metrics: Arc::new(Mutex::new(GlobalMetrics::new())),
             catalog_refresh_in_progress: Arc::new(AtomicBool::new(false)),
             response_cache: Arc::new(response_cache),
+            usage_writer: Arc::new(crate::metrics::UsageWriter::new(
+                usage_stats_path(),
+                crate::metrics::USAGE_WRITE_INTERVAL,
+            )),
             confirmations: Arc::new(ConfirmStore::new()),
             audit: Arc::new(AuditLogger::new(crate::audit::default_path())),
             in_flight: Arc::new(AtomicUsize::new(0)),
@@ -735,6 +735,8 @@ impl ProxyServer {
     }
 
     pub async fn shutdown(&self) {
+        // Les compteurs d'usage en attente d'écriture différée ne sont pas perdus à l'arrêt.
+        self.usage_writer.flush();
         self.child_manager.stop_all().await;
     }
 
@@ -1969,6 +1971,14 @@ impl ProxyServer {
                         );
                     }
                 }
+                // Compté à part : un hit ne passe pas par le serveur et ne fausse pas p50 / p95.
+                self.metrics
+                    .lock()
+                    .await
+                    .tools
+                    .entry(format!("{}__{}", server, tool))
+                    .or_default()
+                    .record_cache_hit();
                 self.record_execute_route(execute_strategy).await;
                 self.record_audit(AuditEntry {
                     status: "cache_hit",
@@ -2005,14 +2015,21 @@ impl ProxyServer {
             if let Err(ref e) = res {
                 sm.error_count += 1;
                 sm.last_error = Some(e.clone());
-            } else {
-                *m.tool_calls.entry(usage_key).or_insert(0) += 1;
             }
-            m.tool_calls.clone()
+            m.tools
+                .entry(usage_key.clone())
+                .or_default()
+                .record_call(elapsed, res.is_err());
+            if res.is_ok() {
+                *m.tool_calls.entry(usage_key).or_insert(0) += 1;
+                Some(m.tool_calls.clone())
+            } else {
+                None
+            }
         };
 
-        if res.is_ok() {
-            tokio::task::spawn_blocking(move || save_usage_stats(&usage_snapshot));
+        if let Some(snapshot) = usage_snapshot {
+            self.usage_writer.schedule(snapshot);
         }
 
         self.record_execute_route(execute_strategy).await;

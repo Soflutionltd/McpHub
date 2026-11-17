@@ -220,6 +220,9 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
     
     <h3 style="margin-bottom:12px;font-size:15px">Server Metrics</h3>
     <div class="grid" id="metrics-grid"></div>
+
+    <h3 style="margin:20px 0 12px;font-size:15px">Tool Metrics</h3>
+    <div id="tool-metrics" style="font-size:12px"></div>
   </div>
 
   <!-- Logs View -->
@@ -667,6 +670,15 @@ async function fetchMetrics(){
     const s = uptime%60;
     document.getElementById('metric-uptime').textContent = h>0?`${h}h ${min}m`:(min>0?`${min}m ${s}s`:`${s}s`);
     
+    const ms=v=>v===null||v===undefined?'-':`${v}ms`;
+    const toolRows=Object.entries(m.tools||{}).sort((a,b)=>(b[1].calls+b[1].cache_hits)-(a[1].calls+a[1].cache_hits));
+    document.getElementById('tool-metrics').innerHTML=toolRows.length===0
+      ?'<div style="color:var(--text-dim)">No calls recorded yet.</div>'
+      :`<table style="width:100%;border-collapse:collapse;text-align:left">
+        <thead><tr style="color:var(--text-dim)"><th scope="col">Tool</th><th scope="col">Calls</th><th scope="col">Errors</th><th scope="col">Cache hits</th><th scope="col">p50</th><th scope="col">p95</th></tr></thead>
+        <tbody>${toolRows.map(([name,t])=>`<tr><td>${esc(name)}</td><td>${t.calls}</td><td>${t.errors}</td><td>${t.cache_hits}</td><td>${ms(t.p50_ms)}</td><td>${ms(t.p95_ms)}</td></tr>`).join('')}</tbody>
+      </table>`;
+
     const grid=document.getElementById('metrics-grid');
     if(Object.keys(m.servers).length===0) {
       grid.innerHTML='<div style="color:var(--text-dim);font-size:12px">No calls recorded yet.</div>';
