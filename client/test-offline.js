@@ -41,6 +41,23 @@ function fakeHub() {
           _meta: { mcphub: { status: 'confirmation_required', confirmation_token: 'tok-1' } }
         };
       }
+      if (args.tool === 'list_rows') {
+        const rows = [
+          { id: 1, name: 'alpha', deleted_at: null, note: '' },
+          { id: 2, name: 'beta', deleted_at: null, note: 'kept' },
+          { id: 3, name: 'gamma', deleted_at: null, note: '' }
+        ];
+        return { content: [{ type: 'text', text: JSON.stringify({ rows, cursor: null, tags: [] }, null, 2) }] };
+      }
+      if (args.tool === 'big_text') {
+        return { content: [{ type: 'text', text: `${'a'.repeat(1500)}${'b'.repeat(1500)}` }] };
+      }
+      if (args.tool === 'fixed_text') {
+        return { content: [{ type: 'text', text: String(args.arguments.text) }] };
+      }
+      if (args.tool === 'big_id') {
+        return { content: [{ type: 'text', text: '{"id": 12345678901234567890, "note": null}' }] };
+      }
       return { content: [{ type: 'text', text: `done ${args.tool}` }] };
     }
   );
@@ -150,6 +167,96 @@ try {
   });
   assert.equal(text(confirmed), 'done delete_row');
   assert.equal(received.at(-1).confirmation_token, 'tok-1');
+
+  // A JSON result loses its null and empty-string fields and its indentation; empty arrays stay.
+  const call = (tool, extra = {}) => ({
+    name: 'mcphub_call',
+    arguments: { server: 'db', tool, arguments: {}, ...extra }
+  });
+  const pruned = await client.callTool(call('list_rows'));
+  assert.equal(
+    text(pruned),
+    '{"rows":[{"id":1,"name":"alpha"},{"id":2,"name":"beta","note":"kept"},{"id":3,"name":"gamma"}],"tags":[]}'
+  );
+  assert.equal(pruned.content.length, 1);
+
+  // fields and max_rows shape the rows; the cut is announced apart from the JSON.
+  const shaped = await client.callTool(call('list_rows', { fields: ['id'], max_rows: 2 }));
+  assert.equal(text(shaped), '{"rows":[{"id":1},{"id":2}],"tags":[]}');
+  assert.equal(shaped.content[1].text, '[McpHub] rows: kept 2 of 3 rows (max_rows).');
+
+  // raw returns the child text untouched.
+  const untouched = await client.callTool(call('list_rows', { raw: true }));
+  assert.match(text(untouched), /"deleted_at": null/);
+
+  // A number that would lose precision keeps the result unrewritten.
+  assert.equal(text(await client.callTool(call('big_id'))), '{"id": 12345678901234567890, "note": null}');
+
+  // An out-of-range exponent would come back as null: the result is left as it is.
+  const fixed = (value, extra = {}) =>
+    client.callTool({
+      name: 'mcphub_call',
+      arguments: { server: 'db', tool: 'fixed_text', arguments: { text: value }, ...extra }
+    });
+  assert.equal(text(await fixed('{"a":1e400,"b":null}')), '{"a":1e400,"b":null}');
+
+  // A __proto__ key is data like any other.
+  assert.equal(text(await fixed('{"__proto__":{"x":1},"b":2,"c":null}')), '{"__proto__":{"x":1},"b":2}');
+
+  // fields on a result without rows is said, not silently ignored.
+  const noRows = await fixed('{"id":1,"name":"alpha"}', { fields: ['id'] });
+  assert.equal(text(noRows), '{"id":1,"name":"alpha"}');
+  assert.match(noRows.content[1].text, /fields and max_rows ignored/);
+
+  // A cut never splits a character, and a one-char read on an emoji still moves forward.
+  const emoji = await fixed(`${'a'.repeat(999)}😀${'b'.repeat(10)}`, { max_chars: 1000 });
+  assert.equal(text(emoji), 'a'.repeat(999));
+  const emojiHandle = /"handle":"(r\d+)","offset":999/.exec(emoji.content[1].text)?.[1];
+  assert.ok(emojiHandle, emoji.content[1].text);
+  const readLocal = (args) =>
+    client.callTool({ name: 'mcphub_call', arguments: { server: 'mcphub', tool: 'read_result', arguments: args } });
+  const oneChar = await readLocal({ handle: emojiHandle, offset: 999, length: 1 });
+  assert.equal(text(oneChar), '😀');
+  assert.match(oneChar.content[1].text, /Next offset: 1001\./);
+  const inside = await readLocal({ handle: emojiHandle, offset: 1000 });
+  assert.equal(inside.isError, true);
+  assert.match(text(inside), /inside a character/);
+
+  // A long text is cut and the rest is read by handle, to the last character.
+  const cut = await client.callTool(call('big_text', { max_chars: 1000 }));
+  assert.equal(text(cut), 'a'.repeat(1000));
+  const handle = /"handle":"(r\d+)","offset":1000/.exec(cut.content[1].text)?.[1];
+  assert.ok(handle, cut.content[1].text);
+  const readResult = (args) =>
+    client.callTool({ name: 'mcphub_call', arguments: { server: 'mcphub', tool: 'read_result', arguments: args } });
+  const middle = await readResult({ handle, offset: 1000, length: 1000 });
+  assert.equal(text(middle), `${'a'.repeat(500)}${'b'.repeat(500)}`);
+  assert.match(middle.content[1].text, /Next offset: 2000\./);
+  const tail = await readResult({ handle, offset: 2000 });
+  assert.equal(text(tail), 'b'.repeat(1000));
+  assert.match(tail.content[1].text, /End of result\./);
+  assert.equal((await readResult({ handle: 'r999' })).isError, true);
+  assert.equal(received.filter((item) => item.tool === 'read_result').length, 0, 'read_result stays local');
+
+  // In a batch a JSON result is embedded as JSON, not as an escaped string.
+  const shapedBatch = await client.callTool({
+    name: 'mcphub_batch',
+    arguments: {
+      calls: [
+        { id: 'rows', server: 'db', tool: 'list_rows', arguments: {}, max_rows: 1 },
+        { id: 'text', server: 'db', tool: 'read_row', arguments: {} }
+      ]
+    }
+  });
+  const shapedResults = JSON.parse(text(shapedBatch)).results;
+  assert.deepEqual(shapedResults[0], {
+    id: 'rows',
+    ok: true,
+    status: 'ok',
+    result: { rows: [{ id: 1, name: 'alpha' }], tags: [] },
+    notes: ['rows: kept 1 of 3 rows (max_rows).']
+  });
+  assert.equal(shapedResults[1].result, 'done read_row');
 
   // The stdio fallback (its own copy of the OAuth tokens) is left as soon as the daemon is back.
   daemonUp = false;

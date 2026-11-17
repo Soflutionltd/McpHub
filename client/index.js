@@ -52,6 +52,15 @@ const daemonProbeTimeoutMs = 1_500;
 const daemonRetryIntervalMs = Number(process.env.MCPHUB_DAEMON_RETRY_MS ?? 60_000);
 const usageFlushDelayMs = 2_000;
 const unknownSuggestionCount = 5;
+// Au-delà, le texte d'un résultat est coupé et le reste se lit par poignée.
+const defaultResultMaxChars = Number(process.env.MCPHUB_RESULT_MAX_CHARS ?? 60_000);
+if (!Number.isInteger(defaultResultMaxChars) || defaultResultMaxChars < 1_000) {
+  throw new Error(
+    `MCPHUB_RESULT_MAX_CHARS="${process.env.MCPHUB_RESULT_MAX_CHARS}" is invalid: use an integer of at least 1000.`
+  );
+}
+const storedResultLimit = 16;
+const hubLocalServer = 'mcphub';
 
 const cursorCatalogDescriptionLimit = 200;
 // Nom du serveur dans la config MCP du client : Claude Code préfixe chaque
@@ -195,6 +204,234 @@ function extractText(result) {
 
 function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
+}
+
+// ---------------------------------------------------------------------------
+// Résultats allégés : le texte des outils enfants est le premier poste de
+// tokens. Sur un résultat JSON réussi, on retire les champs null ou vides, on
+// applique fields et max_rows, puis on coupe au-delà de max_chars en gardant
+// le texte complet lisible par morceaux (server "mcphub", tool "read_result").
+// raw: true renvoie le résultat de l'enfant tel quel.
+// ---------------------------------------------------------------------------
+
+const shapingFields = {
+  fields: z
+    .array(z.string())
+    .min(1)
+    .optional()
+    .describe('Keep only these keys in each row of a JSON result.'),
+  max_rows: z
+    .number()
+    .int()
+    .min(1)
+    .optional()
+    .describe('Keep only the first rows of each JSON array of the result.'),
+  max_chars: z
+    .number()
+    .int()
+    .min(1_000)
+    .optional()
+    .describe('Cut the result text beyond this size; the rest stays readable by handle.'),
+  raw: z
+    .boolean()
+    .optional()
+    .describe('Return the child result untouched (no pruning, no cut).')
+};
+
+function pickShaping({ fields, max_rows, max_chars, raw }) {
+  return { fields, max_rows, max_chars, raw };
+}
+
+/** @type {Map<string, { text: string, server: string }>} poignée → texte complet, les plus anciens sortent en premier */
+const storedResults = new Map();
+let storedResultSequence = 0;
+
+function storeFullResult(text, server) {
+  storedResultSequence += 1;
+  const handle = `r${storedResultSequence}`;
+  storedResults.set(handle, { text, server });
+  while (storedResults.size > storedResultLimit) {
+    storedResults.delete(storedResults.keys().next().value);
+  }
+  return handle;
+}
+
+function isHighSurrogate(code) {
+  return code >= 0xd800 && code <= 0xdbff;
+}
+
+function isLowSurrogate(code) {
+  return code >= 0xdc00 && code <= 0xdfff;
+}
+
+// Coupe sans séparer une paire de substitution UTF-16 : la paire de fin est
+// laissée au morceau suivant, sauf si le morceau en serait vide.
+function sliceText(text, start, length) {
+  let end = Math.min(text.length, start + length);
+  if (end < text.length && isHighSurrogate(text.charCodeAt(end - 1))) {
+    end += end - 1 === start ? 1 : -1;
+  }
+  return text.slice(start, end);
+}
+
+function pruneEmpty(value) {
+  if (Array.isArray(value)) return value.map(pruneEmpty);
+  if (value === null || typeof value !== 'object') return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([, child]) => child !== null && child !== '')
+      .map(([key, child]) => [key, pruneEmpty(child)])
+  );
+}
+
+function isRow(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+// Les « lignes » d'un résultat : le tableau racine, ou chaque tableau d'objets
+// porté par une clé de l'objet racine ({ projects: [...] }, { data: [...] }).
+function shapeRows(value, { fields, max_rows }, notes) {
+  const shapeArray = (rows, label) => {
+    let shaped = rows;
+    if (max_rows && shaped.length > max_rows) {
+      notes.push(`${label}: kept ${max_rows} of ${shaped.length} rows (max_rows).`);
+      shaped = shaped.slice(0, max_rows);
+    }
+    if (fields) {
+      shaped = shaped.map((row) =>
+        isRow(row)
+          ? Object.fromEntries(fields.filter((key) => key in row).map((key) => [key, row[key]]))
+          : row
+      );
+    }
+    return shaped;
+  };
+
+  if (Array.isArray(value)) return shapeArray(value, 'result');
+  const hasRows = (child) => Array.isArray(child) && child.some(isRow);
+  if (!isRow(value) || !Object.values(value).some(hasRows)) {
+    notes.push('fields and max_rows ignored: no array of rows at the root of this result.');
+    return value;
+  }
+  return Object.fromEntries(
+    Object.entries(value).map(([key, child]) => [key, hasRows(child) ? shapeArray(child, key) : child])
+  );
+}
+
+// Un nombre de 16 chiffres ou plus (identifiant X, TikTok, Stripe) perd sa
+// précision dans un aller-retour JSON.parse / JSON.stringify, et un exposant
+// hors plage (1e400) y devient null : le résultat qui en contient un n'est pas
+// réécrit.
+function hasUnsafeNumber(text) {
+  let inString = false;
+  let digits = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (inString) {
+      if (code === 0x5c) index += 1;
+      else if (code === 0x22) inString = false;
+      continue;
+    }
+    if (code === 0x22) {
+      inString = true;
+      digits = 0;
+    } else if (code >= 0x30 && code <= 0x39) {
+      digits += 1;
+      if (digits >= 16) return true;
+    } else if ((code === 0x65 || code === 0x45) && digits > 0) {
+      return true;
+    } else if (code !== 0x2e) {
+      digits = 0;
+    }
+  }
+  return false;
+}
+
+function parseJsonContainer(text) {
+  const first = text.trimStart()[0];
+  if (first !== '{' && first !== '[') return undefined;
+  if (hasUnsafeNumber(text)) return undefined;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+
+function shapeText(text, shaping, notes, server) {
+  let shaped = text;
+  let json = parseJsonContainer(text);
+  if (json !== undefined) {
+    json = pruneEmpty(json);
+    if (shaping.fields || shaping.max_rows) json = shapeRows(json, shaping, notes);
+    shaped = JSON.stringify(json);
+  }
+  const limit = shaping.max_chars ?? defaultResultMaxChars;
+  if (shaped.length <= limit) return { text: shaped, json };
+
+  const handle = storeFullResult(shaped, server);
+  const head = sliceText(shaped, 0, limit);
+  notes.push(
+    `Result cut at ${head.length} of ${shaped.length} chars. Read the rest with mcphub_call server "mcphub", tool "read_result", arguments {"handle":"${handle}","offset":${head.length}}.`
+  );
+  return { text: head, json: undefined };
+}
+
+// Renvoie le résultat allégé et, pour mcphub_batch, la valeur à insérer telle
+// quelle (objet JSON plutôt que chaîne échappée) avec les notes à part.
+function shapeChildResult(result, shaping, server) {
+  if (shaping.raw || result.isError || callStatus(result) !== 'ok') {
+    return { result, value: extractText(result), notes: [] };
+  }
+  const notes = [];
+  const shapedTexts = [];
+  const content = (result.content ?? []).map((item) => {
+    if (item.type !== 'text') return item;
+    const shapedText = shapeText(item.text, shaping, notes, server);
+    shapedTexts.push(shapedText);
+    return { ...item, text: shapedText.text };
+  });
+  const value =
+    shapedTexts.length === 1 && shapedTexts[0].json !== undefined
+      ? shapedTexts[0].json
+      : shapedTexts.map((shapedText) => shapedText.text).join('\n');
+  if (notes.length) content.push({ type: 'text', text: `[McpHub] ${notes.join(' ')}` });
+  return { result: { ...result, content }, value, notes };
+}
+
+function readStoredResult({ handle, offset = 0, length }, workingDirectory) {
+  const stored = typeof handle === 'string' ? storedResults.get(handle) : undefined;
+  // Un serveur rattaché à un projet ne se relit pas depuis un autre dossier.
+  const full = stored && ownerAllows(stored.server, workingDirectory) ? stored.text : undefined;
+  if (full === undefined) {
+    return textResult(
+      `Unknown result handle "${handle}": handles live in this McpHub client process and only the last ${storedResultLimit} cut results are kept. Call the tool again.`,
+      true
+    );
+  }
+  if (!Number.isInteger(offset) || offset < 0 || offset > full.length) {
+    return textResult(`offset must be an integer between 0 and ${full.length}.`, true);
+  }
+  if (length !== undefined && (!Number.isInteger(length) || length < 1)) {
+    return textResult('length must be a positive integer.', true);
+  }
+  if (offset > 0 && isLowSurrogate(full.charCodeAt(offset)) && isHighSurrogate(full.charCodeAt(offset - 1))) {
+    return textResult(`offset ${offset} is inside a character: use ${offset - 1} or ${offset + 1}.`, true);
+  }
+  const chunk = sliceText(full, offset, length ?? defaultResultMaxChars);
+  const next = offset + chunk.length;
+  return {
+    content: [
+      { type: 'text', text: chunk },
+      {
+        type: 'text',
+        text:
+          next < full.length
+            ? `[McpHub] chars ${offset} to ${next} of ${full.length}. Next offset: ${next}.`
+            : `[McpHub] chars ${offset} to ${next} of ${full.length}. End of result.`
+      }
+    ]
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -948,6 +1185,7 @@ registerHubTool(
         .string()
         .optional()
         .describe('Token returned by a CONFIRMATION REQUISE answer, only after the user explicitly agreed.'),
+      ...shapingFields,
       ...projectFields
     }
   },
@@ -958,9 +1196,11 @@ registerHubTool(
     bypass_cache,
     confirmation_token,
     project,
-    working_dir
+    working_dir,
+    ...shaping
   }) => {
     try {
+      if (childServer === hubLocalServer && tool === 'read_result') return readStoredResult(args, working_dir);
       const [projectName, projectConfig] = resolveProject(project, working_dir);
       const securedArgs = enforceProjectPolicy({
         projectName,
@@ -972,7 +1212,7 @@ registerHubTool(
       });
       usage.calls += 1;
       markUsageDirty();
-      return await callChildWithSuggestions({
+      const result = await callChildWithSuggestions({
         server: childServer,
         tool,
         args: securedArgs,
@@ -980,6 +1220,7 @@ registerHubTool(
         confirmation_token,
         visible: serverVisibility(projectConfig, working_dir)
       });
+      return shapeChildResult(result, pickShaping(shaping), childServer).result;
     } catch (error) {
       return errorToResult(error);
     }
@@ -999,7 +1240,8 @@ registerHubTool(
             server: z.string(),
             tool: z.string(),
             arguments: z.record(z.string(), z.unknown()).optional(),
-            bypass_cache: z.boolean().optional()
+            bypass_cache: z.boolean().optional(),
+            ...shapingFields
           })
         )
         .min(1)
@@ -1032,11 +1274,13 @@ registerHubTool(
             visible: serverVisibility(projectConfig, working_dir)
           });
           const status = callStatus(result);
+          const shaped = shapeChildResult(result, pickShaping(call), call.server);
           return {
             id: call.id,
             ok: status === 'ok',
             status,
-            result: extractText(result),
+            result: shaped.value,
+            ...(shaped.notes.length ? { notes: shaped.notes } : {}),
             ...(result.structuredContent ? { structuredContent: result.structuredContent } : {}),
             ...(status === 'confirmation_required'
               ? {
