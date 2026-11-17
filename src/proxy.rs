@@ -229,6 +229,8 @@ enum PolicyGate {
 impl ProxyServer {
     pub fn new(config: ProxyConfig) -> Self {
         crate::toolguard::configure(config.guard.clone());
+        let response_cache = ResponseCache::new();
+        response_cache.set_ttl_secs(config.response_cache.ttl_secs);
         let child_manager = Arc::new(ChildManager::new(
             config.servers.clone(),
             config.idle_timeout_ms,
@@ -241,7 +243,7 @@ impl ProxyServer {
             search_engine: Arc::new(Mutex::new(SearchEngine::new())),
             metrics: Arc::new(Mutex::new(GlobalMetrics::new())),
             catalog_refresh_in_progress: Arc::new(AtomicBool::new(false)),
-            response_cache: Arc::new(ResponseCache::new()),
+            response_cache: Arc::new(response_cache),
             confirmations: Arc::new(ConfirmStore::new()),
             audit: Arc::new(AuditLogger::new(crate::audit::default_path())),
             in_flight: Arc::new(AtomicUsize::new(0)),
@@ -1816,12 +1818,17 @@ impl ProxyServer {
             .get("bypass_cache")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let indexed_server_name = {
+        let (indexed_server_name, cache_settings) = {
             let config = self.config.lock().await;
             let configured_server_names: Vec<String> = config.servers.keys().cloned().collect();
-            resolve_server_name(&server, &configured_server_names).unwrap_or_else(|| server.clone())
+            (
+                resolve_server_name(&server, &configured_server_names).unwrap_or_else(|| server.clone()),
+                config.response_cache.clone(),
+            )
         };
-        let (tool, execute_strategy, tool_schema, tool_untrusted) = {
+        // La durée suit la config en cours (rechargée à chaud).
+        self.response_cache.set_ttl_secs(cache_settings.ttl_secs);
+        let (tool, execute_strategy, tool_schema, tool_untrusted, read_only_hint) = {
             let engine = self.search_engine.lock().await;
             if engine.has_server(&indexed_server_name) {
                 if let Some(indexed_tool) = engine.find_tool(&indexed_server_name, &tool) {
@@ -1832,6 +1839,7 @@ impl ProxyServer {
                         ExecuteRouteStrategy::ExactCatalogMatch,
                         Some(schema),
                         untrusted,
+                        indexed_tool.tool_def.read_only_hint(),
                     )
                 } else if let Some(indexed_tool) =
                     engine.find_tool_case_insensitive(&indexed_server_name, &tool)
@@ -1843,6 +1851,7 @@ impl ProxyServer {
                         ExecuteRouteStrategy::CaseInsensitiveCatalogMatch,
                         Some(schema),
                         untrusted,
+                        indexed_tool.tool_def.read_only_hint(),
                     )
                 } else {
                     if let Some(reason) = crate::toolguard::block_reason(
@@ -1890,6 +1899,7 @@ impl ProxyServer {
                     ExecuteRouteStrategy::UncataloguedBypass,
                     None,
                     assume_untrusted,
+                    None,
                 )
             }
         };
@@ -1932,8 +1942,11 @@ impl ProxyServer {
         };
 
         // Cache hit short-circuit: only for idempotent tools, only when caller didn't bypass.
-        let cacheable = !bypass_cache && ResponseCache::is_cacheable(&tool);
-        let mutating = !ResponseCache::is_cacheable(&tool);
+        // Lecture : par le nom, par l'annotation readOnlyHint ou par settings.responseCache.tools.
+        let read_only = cache_settings.is_cacheable(&server, &tool, read_only_hint);
+        let cacheable = !bypass_cache && read_only;
+        // Règle inchangée : tout appel non cacheable vide le cache de son serveur.
+        let mutating = !read_only;
         let epoch = self.child_manager.epoch();
         if cacheable {
             if let Some(hit) = self.response_cache.get(&server, &tool, &arguments, epoch) {
