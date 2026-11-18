@@ -19,7 +19,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
 .stats{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:24px}
 .stat{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px;text-align:center}
 .stat-val{font-size:28px;font-weight:700;color:var(--accent)}.stat-val small{font-size:14px;color:var(--text-dim);font-weight:400}
-.stat-label{font-size:11px;color:var(--text-dim);margin-top:4px;text-transform:uppercase;letter-spacing:.5px}
+.stat-label{font-size:12px;color:var(--text-dim);margin-top:4px;text-transform:uppercase;letter-spacing:.5px}
 .toolbar{display:flex;gap:10px;margin-bottom:18px;align-items:center}
 .search{flex:1;position:relative}
 .search input{width:100%;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:10px 36px 10px 14px;color:var(--text);font-size:13px;outline:none;transition:border-color .2s}
@@ -44,8 +44,8 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
 .toggle input:checked+.toggle-track{background:var(--ok)}
 .toggle-knob{position:absolute;top:2px;left:2px;width:16px;height:16px;background:#fff;border-radius:50%;transition:transform .2s}
 .toggle input:checked~.toggle-knob{transform:translateX(16px)}
-.card-meta{font-size:11px;color:var(--text-dim);display:flex;gap:12px}
-.card-cat{display:inline-block;font-size:10px;padding:2px 8px;border-radius:6px;background:var(--accent-dim);color:var(--accent);margin-top:8px;font-weight:500}
+.card-meta{font-size:12px;color:var(--text-dim);display:flex;gap:12px}
+.card-cat{display:inline-block;font-size:12px;padding:2px 8px;border-radius:6px;background:var(--accent-dim);color:var(--accent);margin-top:8px;font-weight:500}
 </style>
 <style>
 /* Modal */
@@ -69,8 +69,8 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
 .json-highlight .jn{color:var(--accent)} /* numbers */
 .json-highlight .jt{color:#fca5a5;font-weight:600;background:rgba(252,165,165,.08);border-radius:3px;padding:0 2px} /* tokens/secrets */
 .json-highlight .jp{color:var(--text-dim)} /* punctuation */
-.json-error{font-size:11px;color:var(--danger);padding:8px 12px;background:rgba(239,68,68,.06);border:1px solid rgba(239,68,68,.15);border-radius:8px;margin-top:8px}
-.json-hint{font-size:11px;color:var(--text-dim);margin-bottom:10px;line-height:1.5}
+.json-error{font-size:12px;color:var(--danger);padding:8px 12px;background:rgba(239,68,68,.06);border:1px solid rgba(239,68,68,.15);border-radius:8px;margin-top:8px}
+.json-hint{font-size:12px;color:var(--text-dim);margin-bottom:10px;line-height:1.5}
 
 /* Icon picker */
 .icon-picker{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:14px}
@@ -91,11 +91,11 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
 
 /* Gen log */
 .gen-log{margin-top:14px;background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px;max-height:200px;overflow-y:auto}
-.gl{font-size:11px;padding:3px 0;font-family:monospace}.gl-ok{color:var(--ok)}.gl-err{color:var(--danger)}.gl-info{color:var(--blue)}
+.gl{font-size:12px;padding:3px 0;font-family:monospace}.gl-ok{color:var(--ok)}.gl-err{color:var(--danger)}.gl-info{color:var(--blue)}
 
 /* Settings */
 .setting-row{display:flex;align-items:center;gap:16px;padding:14px 0;border-bottom:1px solid var(--border)}
-.setting-label{flex:1}.setting-name{font-weight:600;font-size:13px}.setting-desc{font-size:11px;color:var(--text-dim);margin-top:2px}
+.setting-label{flex:1}.setting-name{font-weight:600;font-size:13px}.setting-desc{font-size:12px;color:var(--text-dim);margin-top:2px}
 .setting-input select,.setting-input input{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text);font-size:13px;outline:none}
 .setting-input select:focus,.setting-input input:focus{border-color:var(--accent)}
 
@@ -109,33 +109,33 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
 .spinner{display:inline-block;width:14px;height:14px;border:2px solid rgba(0,0,0,.2);border-top-color:#000;border-radius:50%;animation:spin .6s linear infinite;margin-right:6px;vertical-align:middle}
 @keyframes spin{to{transform:rotate(360deg)}}
 .hidden{display:none!important}
-.pill{font-size:10px;padding:1px 7px;border-radius:6px;font-weight:600;margin-left:6px}
+.pill{font-size:12px;padding:1px 7px;border-radius:6px;font-weight:600;margin-left:6px}
 .pill-red{background:rgba(239,68,68,.1);color:var(--danger)}
 </style>
 <style>
 /* Library */
 .lib-head{display:flex;align-items:center;gap:10px;margin-bottom:6px}
-.lib-sync{font-size:11px;color:var(--text-dim);margin:0 0 14px 2px;min-height:14px}
+.lib-sync{font-size:12px;color:var(--text-dim);margin:0 0 14px 2px;min-height:14px}
 .lib-card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px;display:flex;flex-direction:column;gap:8px;cursor:pointer;transition:all .15s}
 .lib-card:hover{border-color:rgba(251,191,36,.25);transform:translateY(-1px)}
 .lib-top{display:flex;gap:10px;align-items:flex-start}
 .lib-icon{width:36px;height:36px;border-radius:9px;background:var(--accent-dim);display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0;overflow:hidden}
 .lib-icon img{width:100%;height:100%;object-fit:cover}
 .lib-title{font-weight:600;font-size:13px;line-height:1.3;word-break:break-word}
-.lib-name{font-size:10px;color:var(--text-dim);font-family:'SF Mono',Monaco,monospace;word-break:break-all}
+.lib-name{font-size:12px;color:var(--text-dim);font-family:'SF Mono',Monaco,monospace;word-break:break-all}
 .lib-desc{font-size:12px;color:var(--text-dim);line-height:1.45;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;min-height:34px}
 .lib-foot{display:flex;align-items:center;gap:6px;margin-top:auto;flex-wrap:wrap}
-.trust{font-size:10px;font-weight:700;padding:2px 8px;border-radius:6px}
+.trust{font-size:12px;font-weight:700;padding:2px 8px;border-radius:6px}
 .trust-high{background:rgba(34,197,94,.12);color:var(--ok)}
 .trust-medium{background:rgba(251,191,36,.12);color:var(--accent)}
 .trust-low{background:rgba(239,68,68,.12);color:var(--danger)}
-.kind{font-size:10px;padding:2px 7px;border-radius:6px;background:var(--surface);border:1px solid var(--border);color:var(--text-dim)}
-.lib-installed{font-size:10px;font-weight:700;color:var(--ok);margin-left:auto}
+.kind{font-size:12px;padding:2px 7px;border-radius:6px;background:var(--surface);border:1px solid var(--border);color:var(--text-dim)}
+.lib-installed{font-size:12px;font-weight:700;color:var(--ok);margin-left:auto}
 .lib-more{display:flex;justify-content:center;margin:18px 0}
 .sig{display:flex;gap:10px;font-size:12px;padding:4px 0;border-bottom:1px solid var(--border)}
 .sig-pts{width:34px;text-align:right;font-weight:700;font-family:monospace}
 .sig-pos{color:var(--ok)}.sig-neg{color:var(--danger)}.sig-zero{color:var(--text-dim)}
-.lib-section{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-dim);margin:16px 0 8px}
+.lib-section{font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-dim);margin:16px 0 8px}
 .lib-warn{font-size:12px;color:var(--danger);padding:3px 0}
 .lib-cap{font-size:12px;color:var(--text-dim);padding:3px 0}
 .lib-opt{display:flex;gap:8px;align-items:flex-start;padding:8px 10px;border:1px solid var(--border);border-radius:10px;margin-bottom:6px;font-size:12px;cursor:pointer}
@@ -143,7 +143,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
 .lib-opt input{margin-top:2px}
 .lib-field{margin-bottom:10px}
 .lib-field label{display:block;font-size:12px;font-weight:600;margin-bottom:4px}
-.lib-field .hint{font-size:11px;color:var(--text-dim);margin-bottom:4px}
+.lib-field .hint{font-size:12px;color:var(--text-dim);margin-bottom:4px}
 .lib-field input{width:100%;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:8px 10px;color:var(--text);font-size:13px;outline:none}
 .lib-field input:focus{border-color:var(--accent)}
 .lib-field.missing input{border-color:var(--danger)}
@@ -204,15 +204,15 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
       <h3 style="margin-bottom:16px;font-size:15px">Global Metrics</h3>
       <div style="display:flex;gap:32px">
         <div>
-          <div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;margin-bottom:4px">Total Requests</div>
+          <div style="font-size:12px;color:var(--text-dim);text-transform:uppercase;margin-bottom:4px">Total Requests</div>
           <div style="font-size:24px;font-weight:700;color:var(--accent)" id="metric-total-req">0</div>
         </div>
         <div>
-          <div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;margin-bottom:4px">Active Sessions</div>
+          <div style="font-size:12px;color:var(--text-dim);text-transform:uppercase;margin-bottom:4px">Active Sessions</div>
           <div style="font-size:24px;font-weight:700;color:var(--ok)" id="metric-sessions">0</div>
         </div>
         <div>
-          <div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;margin-bottom:4px">Uptime</div>
+          <div style="font-size:12px;color:var(--text-dim);text-transform:uppercase;margin-bottom:4px">Uptime</div>
           <div style="font-size:24px;font-weight:700;color:var(--blue)" id="metric-uptime">0s</div>
         </div>
       </div>
@@ -231,7 +231,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
       <button class="btn btn-ghost" onclick="clearLogs()">🚫 Clear View</button>
       <button class="btn btn-primary" id="btn-toggle-logs" onclick="toggleLogs()">▶️ Connect Stream</button>
       <div style="flex:1"></div>
-      <div style="font-size:11px;color:var(--text-dim)">Streaming from ~/.McpHub/mcphub.log</div>
+      <div style="font-size:12px;color:var(--text-dim)">Streaming from ~/.McpHub/mcphub.log</div>
     </div>
     <div id="live-logs" style="background:#0d0d14;border:1px solid var(--border);border-radius:10px;padding:12px;height:400px;overflow-y:auto;font-family:monospace;font-size:12px;line-height:1.5">
       <div style="color:var(--text-dim)">Click 'Connect Stream' to start tailing logs...</div>
@@ -310,10 +310,10 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
         Add, remove, enable/disable servers. Rebuild cache in one click.
       </p>
       <div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:16px">
-        <div style="font-size:11px;color:var(--text-dim);margin-bottom:6px">★ BOOKMARK THIS URL</div>
+        <div style="font-size:12px;color:var(--text-dim);margin-bottom:6px">★ BOOKMARK THIS URL</div>
         <div style="font-size:16px;font-weight:700;color:var(--accent);font-family:monospace">http://127.0.0.1:24680</div>
       </div>
-      <p style="color:var(--text-dim);font-size:11px;margin-bottom:18px">
+      <p style="color:var(--text-dim);font-size:12px;margin-bottom:18px">
         Run <code style="background:var(--card);padding:2px 6px;border-radius:4px">McpHub dashboard</code> anytime to reopen.
       </p>
       <button class="btn btn-primary" onclick="dismissWelcome()" style="width:100%;padding:12px">Got it, let's go!</button>
@@ -450,12 +450,12 @@ function renderGrid(){
         </label>
       </div>
       <div class="card-meta">${s.disabled
-        ?`<span style="color:var(--text-dim);font-size:11px">Disabled</span>`
+        ?`<span style="color:var(--text-dim);font-size:12px">Disabled</span>`
         :s.status==='cached'
         ?`<span>${esc(s.tools)} tools</span>`
-        :`<span style="color:var(--danger);font-size:11px">${esc(shortErr||'Not cached')}</span>`
+        :`<span style="color:var(--danger);font-size:12px">${esc(shortErr||'Not cached')}</span>`
       }</div>
-      ${s.status!=='cached'&&!s.disabled?'<div style="font-size:10px;color:var(--accent);margin-top:4px;cursor:pointer">🔧 Click to diagnose</div>':''}
+      ${s.status!=='cached'&&!s.disabled?'<div style="font-size:12px;color:var(--accent);margin-top:4px;cursor:pointer">🔧 Click to diagnose</div>':''}
       <div class="card-cat">${cat(s.name)}</div>
     </div>`}).join('');
 }
@@ -563,12 +563,12 @@ async function repairServer(){
     }else{
       const step=String(data.step||'error');
       let html=`<div class="info-box info-fail"><div class="info-title">✗ ${esc(step.replace(/_/g,' ').toUpperCase())}</div><div class="info-desc">${esc(data.error||'Unknown error')}</div>`;
-      if(data.detail)html+=`<pre style="margin-top:8px;font-size:10px;color:var(--text-dim);white-space:pre-wrap;font-family:monospace;background:var(--bg);padding:8px;border-radius:6px;max-height:120px;overflow-y:auto">${esc(data.detail)}</pre>`;
-      if(data.suggestion)html+=`<div style="margin-top:6px;font-size:11px;color:var(--accent)">💡 ${esc(data.suggestion)}</div>`;
+      if(data.detail)html+=`<pre style="margin-top:8px;font-size:12px;color:var(--text-dim);white-space:pre-wrap;font-family:monospace;background:var(--bg);padding:8px;border-radius:6px;max-height:120px;overflow-y:auto">${esc(data.detail)}</pre>`;
+      if(data.suggestion)html+=`<div style="margin-top:6px;font-size:12px;color:var(--accent)">💡 ${esc(data.suggestion)}</div>`;
       pendingFix=null;
       if(data.auto_fixable&&data.fix_command){
         pendingFix={name:editingServerName,command:data.fix_command};
-        html+=`<button class="btn btn-primary" style="margin-top:10px;font-size:11px" onclick="pendingFix&&autoFixCommand(pendingFix.name,pendingFix.command)">⚡ Auto-fix: Update command path</button>`;
+        html+=`<button class="btn btn-primary" style="margin-top:10px;font-size:12px" onclick="pendingFix&&autoFixCommand(pendingFix.name,pendingFix.command)">⚡ Auto-fix: Update command path</button>`;
       }
       html+='</div>';
       rs.innerHTML=html;
@@ -690,9 +690,9 @@ async function fetchMetrics(){
       const avgLat=s.call_count>0?Math.round(s.total_latency_ms/s.call_count):0;
       return `<div class="card" style="cursor:default">
         <div style="font-weight:600;font-size:14px;color:var(--accent);margin-bottom:8px">${icon(name)} ${esc(name)}</div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:11px">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px">
           <div><div style="color:var(--text-dim)">Calls</div><div style="font-size:14px;font-weight:600">${s.call_count}</div></div>
-          <div><div style="color:var(--text-dim)">Errors</div><div style="font-size:14px;font-weight:600;color:${s.error_count>0?'var(--danger)':'var(--ok)'}">${s.error_count} <span style="font-size:10px;font-weight:400;opacity:0.8">(${errRate}%)</span></div></div>
+          <div><div style="color:var(--text-dim)">Errors</div><div style="font-size:14px;font-weight:600;color:${s.error_count>0?'var(--danger)':'var(--ok)'}">${s.error_count} <span style="font-size:12px;font-weight:400;opacity:0.8">(${errRate}%)</span></div></div>
           <div style="grid-column:1/3;margin-top:4px"><div style="color:var(--text-dim)">Avg Latency</div><div style="font-size:14px;font-weight:600">${avgLat}ms</div></div>
         </div>
       </div>`;
@@ -844,7 +844,7 @@ async function libInstall(){
       document.querySelectorAll('#lib-inputs input[data-key]').forEach(el=>{if(values[el.dataset.key])el.value=values[el.dataset.key]});
       err.textContent=res.message||'Some values are required';err.classList.remove('hidden');return;
     }
-    const oauth=res.oauth?`<button class="btn btn-primary" style="margin-top:10px;font-size:11px" data-server="${esc(res.name)}" onclick="libOauth(this.dataset.server)">Sign in (OAuth)</button>`:'';
+    const oauth=res.oauth?`<button class="btn btn-primary" style="margin-top:10px;font-size:12px" data-server="${esc(res.name)}" onclick="libOauth(this.dataset.server)">Sign in (OAuth)</button>`:'';
     document.getElementById('lib-m-result').innerHTML=`<div class="info-box info-ok"><div class="info-title">✓ Added as ${esc(res.name)}</div><div class="info-desc">${res.kind==='remote'?'Remote server, no local code.':res.sandbox==='shield'?'Runs in the McpHub sandbox (shield): no access to your keys, browsers or editor configs.':res.kind==='oci'?'Runs in its Docker container.':'Runs with your global sandbox settings.'} Tools are pinned on first contact, every call is audited.${(res.secretsStored||[]).length?' Secrets stored: '+res.secretsStored.map(esc).join(', ')+'.':''}</div>${oauth}</div>`;
     btn.classList.add('hidden');notify(res.name+' added');libMissing=[];
     d.installed=res.name;const it=libItems.find(x=>x.name===d.name);if(it)it.installed=res.name;libRender();
