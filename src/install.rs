@@ -53,7 +53,7 @@ pub fn install() {
     <key>StandardOutPath</key>
     <string>/dev/null</string>
     <key>ProcessType</key>
-    <string>Background</string>
+    <string>Standard</string>
 </dict>
 </plist>"#,
             label = label,
