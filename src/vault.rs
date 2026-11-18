@@ -305,28 +305,47 @@ pub fn delete(name: &str) -> Result<bool, String> {
     Ok(removed)
 }
 
+/// Nombre de lectures du Trousseau lancées en même temps au démarrage.
+const VAULT_PARALLEL_READS: usize = 8;
+
 /// Charge dans l'environnement du process les secrets du coffre dont la variable
 /// n'est pas déjà définie. Retourne (chargés, introuvables).
 pub fn load_into_env() -> (usize, Vec<String>) {
     if !is_available() {
         return (0, Vec::new());
     }
+    // Les connexions OAuth (JSON) ne sont pas des variables d'environnement.
+    let names_to_read: Vec<String> = list_names()
+        .into_iter()
+        .filter(|name| !name.starts_with(crate::oauth::VAULT_PREFIX))
+        .filter(|name| std::env::var(name).is_err())
+        .collect();
+    // Chaque lecture lance `/usr/bin/security` (~300 ms, bien plus sur un Mac chargé) :
+    // lues une par une, elles retardaient l'ouverture du port de plusieurs secondes.
+    let read_values: Vec<(String, Option<String>)> = names_to_read
+        .chunks(VAULT_PARALLEL_READS)
+        .flat_map(|batch| {
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = batch
+                    .iter()
+                    .map(|name| scope.spawn(move || (name.clone(), get(name).ok().flatten())))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().expect("lecture du Trousseau interrompue"))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect();
     let mut loaded = 0;
     let mut missing = Vec::new();
-    for name in list_names() {
-        // Les connexions OAuth (JSON) ne sont pas des variables d'environnement.
-        if name.starts_with(crate::oauth::VAULT_PREFIX) {
-            continue;
-        }
-        if std::env::var(&name).is_ok() {
-            continue;
-        }
-        match get(&name) {
-            Ok(Some(value)) => {
+    for (name, value) in read_values {
+        match value {
+            Some(value) => {
                 std::env::set_var(&name, value);
                 loaded += 1;
             }
-            _ => missing.push(name),
+            None => missing.push(name),
         }
     }
     (loaded, missing)
