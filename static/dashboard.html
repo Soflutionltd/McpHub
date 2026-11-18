@@ -311,7 +311,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
       </p>
       <div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:16px">
         <div style="font-size:12px;color:var(--text-dim);margin-bottom:6px">★ BOOKMARK THIS URL</div>
-        <div style="font-size:16px;font-weight:700;color:var(--accent);font-family:monospace">http://127.0.0.1:24680</div>
+        <div style="font-size:16px;font-weight:700;color:var(--accent);font-family:monospace" id="welcome-url">http://127.0.0.1:24680</div>
       </div>
       <p style="color:var(--text-dim);font-size:12px;margin-bottom:18px">
         Run <code style="background:var(--card);padding:2px 6px;border-radius:4px">McpHub dashboard</code> anytime to reopen.
@@ -647,6 +647,7 @@ function dismissWelcome(){
 }
 function checkWelcome(){
   if(!document.cookie.includes('mcp_welcomed=1')){
+    document.getElementById('welcome-url').textContent=location.origin;
     document.getElementById('welcome-modal').classList.remove('hidden');
   }
 }
