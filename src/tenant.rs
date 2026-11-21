@@ -121,10 +121,10 @@ impl Tenants {
 
     /// Tenant dont un dossier contient `dir` (`/Clients/Acme2` n'est pas dans `/Clients/Acme`).
     pub fn for_dir(&self, dir: &Path) -> Option<&TenantDef> {
-        let dir = normalize(dir);
+        let dir = dir_key(dir);
         self.tenants
             .iter()
-            .flat_map(|t| t.workspaces.iter().map(move |w| (t, w)))
+            .flat_map(|t| t.workspaces.iter().map(move |w| (t, dir_key(w))))
             .filter(|(_, w)| dir.starts_with(w))
             // Le dossier le plus précis l'emporte.
             .max_by_key(|(_, w)| w.components().count())
@@ -145,6 +145,32 @@ fn normalize(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+/// Forme de comparaison d'un dossier : liens symboliques résolus (sur le plus long ancêtre
+/// existant, le dossier pouvant ne pas exister encore) et, sur macOS (APFS insensible à la
+/// casse), en minuscules. Un lien ou une autre casse ne fait pas sortir du dossier d'un tenant.
+fn dir_key(path: &Path) -> PathBuf {
+    let path = normalize(path);
+    let mut existing = path.clone();
+    let mut rest: Vec<std::ffi::OsString> = Vec::new();
+    let resolved = loop {
+        if let Ok(real) = std::fs::canonicalize(&existing) {
+            break rest.iter().rev().fold(real, |acc, c| acc.join(c));
+        }
+        match (existing.file_name().map(|f| f.to_os_string()), existing.parent()) {
+            (Some(name), Some(parent)) => {
+                rest.push(name);
+                existing = parent.to_path_buf();
+            }
+            _ => break path.clone(),
+        }
+    };
+    if cfg!(target_os = "macos") {
+        PathBuf::from(resolved.to_string_lossy().to_lowercase())
+    } else {
+        resolved
+    }
 }
 
 /// Nom de secret d'une référence `vault:<tenant>/<NOM>` : le tenant doit être le sien.
@@ -279,7 +305,8 @@ pub fn parse_projects(json: &Value) -> Result<Tenants, String> {
         for b in &tenants[i + 1..] {
             for wa in &a.workspaces {
                 for wb in &b.workspaces {
-                    if wa.starts_with(wb) || wb.starts_with(wa) {
+                    let (ka, kb) = (dir_key(wa), dir_key(wb));
+                    if ka.starts_with(&kb) || kb.starts_with(&ka) {
                         return Err(format!(
                             "les dossiers des tenants {} et {} se chevauchent ({} / {})",
                             a.id,
@@ -1111,6 +1138,26 @@ mod tests {
         assert_eq!(ctx(Some("/w/Clients/Acme"), Some("/w/Clients/Acme/x")).unwrap().tenant_id(), Some("acme"));
         // Un working_dir de tenant depuis un client lancé ailleurs reste le tenant.
         assert_eq!(ctx(Some("/w/Clients/Acme"), Some("/w/App/Sofapp")).unwrap().tenant_id(), Some("acme"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lien_symbolique_et_casse_restent_dans_le_tenant() {
+        let root = std::env::temp_dir().join(format!("tenant-lien-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let real = root.join("Clients").join("Acme");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = root.join("raccourci");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let json = json!({"projects": {"acme": {"workspaces": [real], "tenant": "acme"}}});
+        let t = parse_projects(&json).unwrap();
+        assert_eq!(t.for_dir(&link.join("site")).map(|d| d.id.as_str()), Some("acme"));
+        if cfg!(target_os = "macos") {
+            let other_case = PathBuf::from(real.to_string_lossy().to_uppercase());
+            assert_eq!(t.for_dir(&other_case).map(|d| d.id.as_str()), Some("acme"));
+        }
+        assert!(t.for_dir(&root.join("Clients").join("Acme2")).is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
