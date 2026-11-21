@@ -107,7 +107,7 @@ impl Fixture {
             .expect("McpHub stdio");
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
-        let mut hub = Hub { child, stdin, stdout, next_id: 1 };
+        let mut hub = Hub { child, stdin: Some(stdin), stdout, next_id: 1 };
         hub.request("initialize", json!({ "protocolVersion": "2025-06-18", "capabilities": {} }));
         hub
     }
@@ -121,7 +121,7 @@ impl Drop for Fixture {
 
 struct Hub {
     child: Child,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
 }
@@ -131,8 +131,9 @@ impl Hub {
         let id = self.next_id;
         self.next_id += 1;
         let line = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        writeln!(self.stdin, "{}", line).unwrap();
-        self.stdin.flush().unwrap();
+        let stdin = self.stdin.as_mut().expect("entree standard ouverte");
+        writeln!(stdin, "{}", line).unwrap();
+        stdin.flush().unwrap();
         loop {
             let mut buf = String::new();
             assert!(self.stdout.read_line(&mut buf).unwrap() > 0, "McpHub s'est arrete");
@@ -165,6 +166,19 @@ impl Hub {
             return Err(text);
         }
         Ok(text)
+    }
+}
+
+impl Hub {
+    /// Arrêt propre : fin de l'entrée standard, puis attente de la sortie du processus.
+    fn finish(mut self) {
+        drop(self.stdin.take());
+        for _ in 0..100 {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 }
 
@@ -217,15 +231,61 @@ fn un_tenant_n_utilise_jamais_les_jetons_mcphub_et_inversement() {
     // Un client lancé dans le dossier du tenant ne vise pas un autre dossier.
     let err = hub.call("svc", Some(&sofapp), Some(&fx.acme)).unwrap_err();
     assert!(err.contains("tenant acme"), "{}", err);
-    drop(hub);
+    hub.finish();
 
-    // Journal d'audit : le tenant de chaque appel, jamais la valeur d'un secret.
-    let audit = std::fs::read_to_string(fx.hub.join("audit.jsonl")).unwrap();
+    // Journal d'audit : le tenant de chaque appel, jamais la valeur d'un secret. Écrit en
+    // tâche de fond : on lui laisse quelques instants.
+    let expected = |entries: &[Value]| {
+        entries.iter().any(|e| e["tenant"] == "acme" && e["status"] == "ok" && e["server"] == "svc")
+            && entries.iter().any(|e| e["tenant"] == "acme" && e["decision"] == "deny" && e["server"] == "other")
+            && entries.iter().any(|e| e.get("tenant").is_none() && e["status"] == "ok")
+    };
+    let mut audit = String::new();
+    for _ in 0..50 {
+        audit = std::fs::read_to_string(fx.hub.join("audit.jsonl")).unwrap_or_default();
+        let entries: Vec<Value> = audit.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+        if expected(&entries) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     let entries: Vec<Value> = audit.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
-    assert!(entries.iter().any(|e| e["tenant"] == "acme" && e["status"] == "ok" && e["server"] == "svc"));
-    assert!(entries.iter().any(|e| e["tenant"] == "acme" && e["decision"] == "deny" && e["server"] == "other"));
-    assert!(entries.iter().any(|e| e.get("tenant").is_none() && e["status"] == "ok"));
+    assert!(expected(&entries), "{}", audit);
     assert!(!audit.contains("acme-secret") && !audit.contains("hub-secret"));
+}
+
+#[test]
+fn une_confirmation_ne_vaut_que_pour_son_perimetre() {
+    let fx = Fixture::new("confirmation");
+    let path = fx.hub.join("config.json");
+    let mut config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    config["settings"]["permissions"] = json!({
+        "confirmVia": "token",
+        "rules": [{ "server": "svc", "tool": "get_identity", "action": "confirm" }]
+    });
+    std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+    let mut hub = fx.start();
+    let call = |hub: &mut Hub, wd: Option<&Path>, token: Option<&str>| {
+        let mut args = json!({ "server": "svc", "tool": "get_identity", "arguments": {} });
+        if let Some(w) = wd {
+            args["_mcphub_context"] = json!({ "working_dir": w });
+        }
+        if let Some(t) = token {
+            args["confirmation_token"] = json!(t);
+        }
+        hub.request("tools/call", json!({ "name": "mcphub_call", "arguments": args }))
+    };
+    // Jeton délivré pour le compte McpHub.
+    let asked = call(&mut hub, None, None);
+    let token = asked["result"]["_meta"]["mcphub"]["confirmation_token"].as_str().unwrap().to_string();
+    // Présenté depuis le dossier du tenant : refusé, l'appel ne part pas.
+    let reused = call(&mut hub, Some(&fx.acme), Some(&token));
+    let text = reused.to_string();
+    assert!(!text.contains("token=acme-secret"), "{}", text);
+    assert!(text.contains("Jeton de confirmation invalide"), "{}", text);
+    // La demande faite depuis le tenant nomme son instance : l'utilisateur sait quel compte.
+    let tenant_ask = call(&mut hub, Some(&fx.acme), None).to_string();
+    assert!(tenant_ask.contains("svc@acme"), "{}", tenant_ask);
 }
 
 #[test]

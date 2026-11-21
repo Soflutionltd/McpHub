@@ -661,7 +661,16 @@ impl ChildManager {
         }
     }
 
-    pub async fn has_config(&self, name: &str) -> bool {
+    /// Retire une instance de tenant (config et processus).
+    pub async fn remove_instance(&self, name: &str) {
+        if !crate::tenant::is_instance_name(name) {
+            return;
+        }
+        self.configs.lock().await.remove(name);
+        self.stop_server(name).await;
+    }
+
+        pub async fn has_config(&self, name: &str) -> bool {
         self.configs.lock().await.contains_key(name)
     }
 

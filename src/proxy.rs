@@ -215,6 +215,9 @@ impl Drop for InFlight {
 struct GateTarget<'a> {
     mode: &'static str,
     server: &'a str,
+    /// Processus visé : `serveur@tenant` pour un tenant. Porte la confirmation humaine, qui
+    /// ne vaut donc jamais pour l'autre périmètre.
+    instance: &'a str,
     tool: &'a str,
     arguments: &'a serde_json::Value,
 }
@@ -285,9 +288,19 @@ impl ProxyServer {
         }
         let base = server.to_string();
         // Lectures du Trousseau : bloquantes, hors du fil asynchrone.
-        let config = tokio::task::spawn_blocking(move || crate::tenant::derive_from_vault(&def, &base))
+        let derived = tokio::task::spawn_blocking(move || crate::tenant::derive_from_vault(&def, &base))
             .await
-            .map_err(|e| format!("instance {} : {}", instance, e))??;
+            .map_err(|e| format!("instance {} : {}", instance, e))
+            .and_then(|r| r);
+        let config = match derived {
+            Ok(config) => config,
+            Err(e) => {
+                // Secret retiré ou config devenue invalide : l'instance lancée avec les anciens
+                // secrets ne doit pas continuer à servir.
+                self.child_manager.remove_instance(instance).await;
+                return Err(e);
+            }
+        };
         self.child_manager.set_instance_config(instance, config).await;
         self.tenants.mark_derived(instance);
         Ok(())
@@ -410,7 +423,7 @@ impl ProxyServer {
             .map(|t| t.declared_destructive())
             .unwrap_or(false);
         let decision = permissions.decide_with(server, tool, declared_destructive);
-        let target = GateTarget { mode, server, tool, arguments };
+        let target = GateTarget { mode, server, instance: route.key(), tool, arguments };
         self.permission_gate(id, target, confirmation_token, &permissions, decision)
             .await
     }
@@ -432,7 +445,7 @@ impl ProxyServer {
                 source: "mcphub:install".into(),
                 reason: Some("installe et lance un nouveau serveur MCP sur cette machine".into()),
             });
-        let target = GateTarget { mode: "library", server: "mcphub", tool, arguments };
+        let target = GateTarget { mode: "library", server: "mcphub", instance: "mcphub", tool, arguments };
         self.permission_gate(id, target, confirmation_token, &permissions, decision)
             .await
     }
@@ -445,7 +458,7 @@ impl ProxyServer {
         permissions: &crate::permissions::PermissionsConfig,
         decision: crate::permissions::Decision,
     ) -> PolicyGate {
-        let GateTarget { mode, server, tool, arguments } = target;
+        let GateTarget { mode, server, instance, tool, arguments } = target;
         if DIALOG_OPEN.load(std::sync::atomic::Ordering::SeqCst) && controls_computer(server) {
             return PolicyGate::Respond(JsonRpcResponse::error(
                 id.clone(),
@@ -497,7 +510,7 @@ impl ProxyServer {
                 ))
             }
             Action::Confirm => {
-                let fp = crate::permissions::fingerprint(server, tool, arguments);
+                let fp = crate::permissions::fingerprint(instance, tool, arguments);
                 // Confirmation humaine d'abord : fenêtre macOS que l'agent ne peut pas valider.
                 if permissions.confirm_via_dialog && confirmation_token.is_none() {
                     let policy_src = decision.source.clone();
@@ -560,7 +573,7 @@ impl ProxyServer {
                     }
                     let preview = crate::audit::safe_arguments(arguments);
                     let message =
-                        crate::confirm_dialog::build_message(server, tool, &reason, &preview, &origin);
+                        crate::confirm_dialog::build_message(instance, tool, &reason, &preview, &origin);
                     DIALOG_OPEN.store(true, std::sync::atomic::Ordering::SeqCst);
                     let answer = crate::confirm_dialog::ask(message, permissions.dialog_timeout_secs).await;
                     DIALOG_OPEN.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -655,7 +668,7 @@ impl ProxyServer {
                              Le jeton est valable {} secondes et une seule fois. Ne confirme jamais a sa place.",
                             decision.source,
                             reason,
-                            server,
+                            instance,
                             tool,
                             preview,
                             if mode == "passthrough" {
@@ -1643,6 +1656,19 @@ impl ProxyServer {
         id: Option<serde_json::Value>,
         args: serde_json::Value,
     ) -> JsonRpcResponse {
+        // Le récapitulatif du run porte le tenant de l'appelant, comme ses appels internes.
+        let tenant = self
+            .call_context(&CallOrigin::from_args(&args))
+            .ok()
+            .and_then(|ctx| ctx.tenant_id().map(String::from));
+        CALL_TENANT.scope(tenant, Box::pin(self.handle_run_in(id, args))).await
+    }
+
+    async fn handle_run_in(
+        &self,
+        id: Option<serde_json::Value>,
+        args: serde_json::Value,
+    ) -> JsonRpcResponse {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         let cfg = self.config.lock().await.code_mode.clone();
         if !cfg.enabled {
@@ -2047,6 +2073,17 @@ impl ProxyServer {
             .cloned()
             .unwrap_or(serde_json::json!({}));
         if server.eq_ignore_ascii_case("mcphub") {
+            // Outils internes (bibliothèque, installation dans la config McpHub) : pas depuis le
+            // dossier d'un tenant, sauf "mcphub" dans ses sharedServers.
+            if let Context::Tenant(t) = &ctx {
+                if !t.shared_servers.contains("mcphub") {
+                    let reason = format!(
+                        "outils internes McpHub refuses dans le dossier du tenant {} (ajouter \"mcphub\" a ses sharedServers pour les permettre)",
+                        t.id
+                    );
+                    return self.refuse_for_tenant(id, Some(&ctx), &server, &tool, reason).await;
+                }
+            }
             let token = args.get("confirmation_token").and_then(|v| v.as_str());
             return self.handle_hub_tool(id, &tool, arguments, token).await;
         }
