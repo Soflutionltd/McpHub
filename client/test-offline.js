@@ -17,6 +17,8 @@ const received = [];
 const runs = [];
 // A daemon that predates script policies does not declare `policy` on mcphub_run.
 let declareRunPolicy = true;
+// A daemon that predates tenants does not declare `_mcphub_context` on mcphub_call.
+let declareTenantContext = true;
 
 function fakeHub() {
   const hub = new McpServer({ name: 'fake-hub', version: '1.0.0' });
@@ -28,7 +30,8 @@ function fakeHub() {
         tool: z.string(),
         arguments: z.record(z.string(), z.unknown()).optional(),
         bypass_cache: z.boolean().optional(),
-        confirmation_token: z.string().optional()
+        confirmation_token: z.string().optional(),
+        ...(declareTenantContext ? { _mcphub_context: z.record(z.string(), z.unknown()).optional() } : {})
       }
     },
     async (args) => {
@@ -137,6 +140,15 @@ await writeFile(
         workspaces: [join(home, 'open')],
         aliases: { supabaseProjectId: 'ref-open' },
         allowedServers: ['*']
+      },
+      beta: {
+        workspaces: [join(home, 'beta')],
+        aliases: {},
+        tenant: 'beta',
+        // allowedServers "*" never widens a tenant's perimeter.
+        allowedServers: ['*'],
+        credentials: { supabase: { SUPABASE_ACCESS_TOKEN: 'vault:beta/SUPABASE_ACCESS_TOKEN' } },
+        sharedServers: ['context7']
       }
     }
   })
@@ -339,6 +351,30 @@ try {
   });
   assert.equal(shapedResults[1].result, 'done read_row');
 
+  // Tenant: the caller's folders reach the daemon, which decides; the client only
+  // lets the tenant's own servers and the shared ones through.
+  const beta = join(home, 'beta');
+  const tenantCall = await client.callTool({
+    name: 'mcphub_call',
+    arguments: { server: 'supabase', tool: 'list_tables', arguments: {}, working_dir: join(beta, 'site') }
+  });
+  assert.equal(text(tenantCall), 'done list_tables');
+  const sent = received.findLast((call) => call.tool === 'list_tables');
+  assert.equal(sent._mcphub_context.working_dir, join(beta, 'site'));
+  assert.ok(sent._mcphub_context.cwd, 'the client folder goes along');
+  const outside = await client.callTool({
+    name: 'mcphub_call',
+    arguments: { server: 'github', tool: 'list_issues', arguments: {}, working_dir: beta }
+  });
+  assert.equal(outside.isError, true);
+  assert.match(text(outside), /not allowed for project "beta"/);
+  assert.equal(received.filter((call) => call.tool === 'list_issues').length, 0);
+  const shared = await client.callTool({
+    name: 'mcphub_call',
+    arguments: { server: 'context7', tool: 'resolve', arguments: {}, working_dir: beta }
+  });
+  assert.equal(text(shared), 'done resolve');
+
   // The stdio fallback (its own copy of the OAuth tokens) is left as soon as the daemon is back.
   daemonUp = false;
   const fallbackClient = new Client({ name: 'mcphub-offline-fallback', version: '1.0.0' });
@@ -384,6 +420,7 @@ try {
   });
 
   declareRunPolicy = false;
+  declareTenantContext = false;
   const claudeCode = new Client({ name: 'claude-code', version: '2.0.0' });
   await claudeCode.connect(
     new StdioClientTransport({
@@ -438,6 +475,22 @@ try {
     assert.match(text(refused), /too old to enforce/);
     assert.equal(runs.length, runsBefore);
     assert.equal(versus.hubCatalogBytes, Buffer.byteLength(hubNames.join('')));
+
+    // A daemon too old to isolate tenants never gets a call from a tenant folder.
+    const tablesBefore = received.filter((call) => call.tool === 'list_tables').length;
+    const tooOld = await claudeCode.callTool({
+      name: 'mcphub_call',
+      arguments: { server: 'supabase', tool: 'list_tables', arguments: {}, working_dir: beta }
+    });
+    assert.equal(tooOld.isError, true);
+    assert.match(text(tooOld), /too old to isolate tenant accounts/);
+    assert.equal(received.filter((call) => call.tool === 'list_tables').length, tablesBefore);
+    // Outside tenant folders, the same daemon keeps working.
+    const plain = await claudeCode.callTool({
+      name: 'mcphub_call',
+      arguments: { server: 'db', tool: 'read_row', arguments: { id: 9 }, working_dir: acme }
+    });
+    assert.equal(text(plain), 'done read_row');
   } finally {
     await claudeCode.close();
   }

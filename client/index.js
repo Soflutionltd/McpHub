@@ -669,7 +669,7 @@ function resolveProject(projectName, workingDirectory) {
 // allowedServers: ["*"] laisse passer tous les serveurs : le projet ne garde que
 // ses identifiants épinglés, et un serveur ajouté plus tard n'est pas bloqué.
 function allowsEveryServer(projectConfig) {
-  return (projectConfig.allowedServers ?? []).includes('*');
+  return !projectConfig.tenant && (projectConfig.allowedServers ?? []).includes('*');
 }
 
 function projectAllows(projectConfig, server) {
@@ -677,10 +677,16 @@ function projectAllows(projectConfig, server) {
 }
 
 function allowedServersOf(projectConfig) {
-  return new Set([
-    ...(projectConfig.allowedServers ?? []),
-    ...(projectConfig.ownedServers ?? [])
-  ]);
+  // Tenant : ses serveurs et les serveurs partagés, rien d'autre (le démon applique
+  // la même règle et reste l'autorité).
+  if (projectConfig.tenant) {
+    return new Set([
+      ...Object.keys(projectConfig.credentials ?? {}),
+      ...(projectConfig.sharedServers ?? []),
+      ...(projectConfig.ownedServers ?? [])
+    ]);
+  }
+  return new Set([...(projectConfig.allowedServers ?? []), ...(projectConfig.ownedServers ?? [])]);
 }
 
 // Un serveur rattaché à un client ne répond que si working_dir est dans le
@@ -795,6 +801,45 @@ async function daemonEnforcesRunPolicy() {
   return connection.enforcesRunPolicy;
 }
 
+// Dossiers de l'appelant, transmis au démon avec chaque appel : c'est lui qui en
+// déduit le tenant (comptes d'un client) et refuse tout ce qui sort de son périmètre.
+function hubContext(workingDirectory) {
+  return {
+    _mcphub_context: {
+      ...(workingDirectory ? { working_dir: normalize(workingDirectory) } : {}),
+      cwd: process.cwd()
+    }
+  };
+}
+
+// Tenant du dossier de l'appel (même règle que le démon : working_dir, sinon le
+// dossier courant du client).
+function tenantOf(workingDirectory) {
+  const [, config] = resolveProject(undefined, workingDirectory || process.cwd());
+  return config?.tenant;
+}
+
+// Un démon antérieur aux tenants ignorerait le dossier et utiliserait les comptes
+// McpHub : depuis le dossier d'un tenant, on refuse plutôt que de fuiter.
+async function daemonEnforcesTenants() {
+  const connection = await connectHub();
+  if (connection.enforcesTenants === undefined) {
+    const { tools } = await connection.client.listTools();
+    const call = tools.find((tool) => tool.name === 'mcphub_call');
+    connection.enforcesTenants = Boolean(call?.inputSchema?.properties?._mcphub_context);
+  }
+  return connection.enforcesTenants;
+}
+
+async function assertTenantSupport(workingDirectory) {
+  const tenant = tenantOf(workingDirectory);
+  if (tenant && !(await daemonEnforcesTenants())) {
+    throw new Error(
+      `This folder belongs to tenant "${tenant}" but the running McpHub daemon is too old to isolate tenant accounts. Update McpHub before calling any server from here.`
+    );
+  }
+}
+
 // Le recall MemoryPilot n'est déclenché que par mcphub_bootstrap : il ne doit
 // jamais retarder un appel Supabase ou Cloudflare qui n'en a pas besoin.
 // Le processus vit aussi longtemps que la fenêtre Cursor, donc sur plusieurs
@@ -805,6 +850,7 @@ function recallContext(projectName, workspace, hints) {
   if (pending) return pending;
 
   const recall = callHubTool('mcphub_call', {
+    ...hubContext(workspace),
     server: 'MemoryPilot',
     tool: 'recall',
     arguments: {
@@ -860,6 +906,7 @@ async function recentHookInjection(workspace) {
 function recallEpisodes(projectName, workspace, hints) {
   if (!hints?.trim()) return Promise.resolve({ episodes: [] });
   return callHubTool('mcphub_call', {
+    ...hubContext(workspace),
     server: 'MemoryPilot',
     tool: 'recall',
     arguments: {
@@ -929,10 +976,20 @@ function callStatus(result) {
   );
 }
 
-async function callChildWithSuggestions({ server, tool, args, bypass_cache, confirmation_token, visible }) {
+async function callChildWithSuggestions({
+  server,
+  tool,
+  args,
+  bypass_cache,
+  confirmation_token,
+  visible,
+  workingDirectory
+}) {
   let result;
   try {
+    await assertTenantSupport(workingDirectory);
     result = await callHubTool('mcphub_call', {
+      ...hubContext(workingDirectory),
       server,
       tool,
       arguments: args,
@@ -1204,7 +1261,15 @@ registerHubTool(
       ...(projectConfig
         ? {
             aliases: projectConfig.aliases,
-            allowedServers: projectConfig.allowedServers,
+            ...(projectConfig.tenant
+              ? {
+                  tenant: projectConfig.tenant,
+                  tenantServers: Object.keys(projectConfig.credentials ?? {}),
+                  sharedServers: projectConfig.sharedServers ?? [],
+                  tenantNote:
+                    'Client accounts: only tenantServers (with the client tokens) and sharedServers answer from this folder. Always pass working_dir.'
+                }
+              : { allowedServers: projectConfig.allowedServers }),
             ...(projectConfig.ownedServers?.length ? { ownedServers: projectConfig.ownedServers } : {})
           }
         : { policy: 'none: no McpHub project mapping for this folder, every server is reachable' }),
@@ -1248,7 +1313,8 @@ registerHubTool(
     usage.searches += 1;
     markUsageDirty();
     try {
-      const result = await callHubTool('mcphub_search', args, { replaySafe: true });
+      await assertTenantSupport(working_dir);
+      const result = await callHubTool('mcphub_search', { ...args, ...hubContext(working_dir) }, { replaySafe: true });
       return filterSearchResult(result, projectName, projectConfig, working_dir);
     } catch (error) {
       return textResult(errorMessage(error), true);
@@ -1303,7 +1369,8 @@ registerHubTool(
         args: securedArgs,
         bypass_cache,
         confirmation_token,
-        visible: serverVisibility(projectConfig, working_dir)
+        visible: serverVisibility(projectConfig, working_dir),
+        workingDirectory: working_dir
       });
       return shapeChildResult(result, pickShaping(shaping), childServer).result;
     } catch (error) {
@@ -1356,7 +1423,8 @@ registerHubTool(
             tool: call.tool,
             args: securedArgs,
             bypass_cache: call.bypass_cache,
-            visible: serverVisibility(projectConfig, working_dir)
+            visible: serverVisibility(projectConfig, working_dir),
+            workingDirectory: working_dir
           });
           const status = callStatus(result);
           const shaped = shapeChildResult(result, pickShaping(call), call.server);
@@ -1416,7 +1484,9 @@ registerHubTool(
       }
       usage.runs = (usage.runs ?? 0) + 1;
       markUsageDirty();
+      await assertTenantSupport(working_dir);
       const result = await callHubTool('mcphub_run', {
+        ...hubContext(working_dir),
         code,
         ...(timeout_secs ? { timeout_secs } : {}),
         ...(policy ? { policy } : {})
