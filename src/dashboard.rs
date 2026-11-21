@@ -676,42 +676,6 @@ async fn tenant_oauth_login(server: &str, tenant: &str) -> Vec<u8> {
     }
 }
 
-/// Tenants déclarés et état de leurs instances (noms de secrets seulement, jamais les valeurs).
-async fn handle_get_tenants(proxy: Option<Arc<ProxyServer>>) -> Vec<u8> {
-    let tenants = match crate::tenant::load_from(&crate::tenant::projects_path()) {
-        Ok(t) => t,
-        Err(e) => return json_err(500, &e),
-    };
-    let mut out = Vec::new();
-    for t in &tenants.tenants {
-        let stored: std::collections::BTreeSet<String> =
-            crate::vault::list_names_in(&crate::vault::Scope::Tenant(t.id.clone())).into_iter().collect();
-        let mut servers = Vec::new();
-        for (server, vars) in &t.credentials {
-            let instance = crate::tenant::instance_name(server, &t.id);
-            let running = match &proxy {
-                Some(p) => p.instance_running(&instance).await,
-                None => false,
-            };
-            servers.push(json!({
-                "server": server,
-                "instance": instance,
-                "running": running,
-                "secrets": vars.values().map(|n| json!({ "name": n, "present": stored.contains(n) })).collect::<Vec<_>>(),
-                "oauth_connected": stored.contains(&crate::oauth::vault_name(server)),
-            }));
-        }
-        out.push(json!({
-            "id": t.id,
-            "project": t.project,
-            "workspaces": t.workspaces,
-            "servers": servers,
-            "shared_servers": t.shared_servers,
-        }));
-    }
-    json_ok(json!({ "tenants": out }))
-}
-
 async fn handle_get_metrics(
     proxy: Option<Arc<ProxyServer>>,
     sse: Option<Arc<SseManager>>,
@@ -1128,6 +1092,446 @@ async fn handle_repair_server(name: &str) -> Vec<u8> {
     }
 }
 
+// ─── Écran Client accounts (tenants) ─────────────────────────
+//
+// Aucune route ne renvoie de valeur de secret : l'écran ne voit que des noms et « présent ».
+// Les écritures passent par les mêmes fonctions que la CLI (validation, sauvegarde de
+// projects.json) ; le retrait d'un client exige la fenêtre macOS native.
+
+/// Taille maximale du corps d'une écriture de secret.
+const SECRET_BODY_MAX: usize = 16 * 1024;
+
+/// Serveur distant dont McpHub gère la connexion OAuth (même règle que la config).
+fn is_oauth_server(raw: &Value) -> bool {
+    if raw.get("url").and_then(|v| v.as_str()).is_none() {
+        return false;
+    }
+    match raw.get("auth").and_then(|v| v.as_str()) {
+        Some(a) => a.eq_ignore_ascii_case("oauth"),
+        None => !raw
+            .get("headers")
+            .and_then(|h| h.as_object())
+            .is_some_and(|h| h.keys().any(|k| k.eq_ignore_ascii_case("authorization"))),
+    }
+}
+
+/// Partie bloquante de l'écran (fichiers et Trousseau) : noms et états, jamais de valeur.
+fn tenants_snapshot() -> Result<Value, String> {
+    use crate::tenant::{cf_orchestrator_path, cf_orchestrator_projects, instance_name};
+    use std::collections::{BTreeMap, BTreeSet};
+    let path = crate::tenant::projects_path();
+    let version = crate::tenant::projects_version(&path);
+    let tenants = crate::tenant::load_from(&path)?;
+    let (configured, config_error) = match crate::tenant::configured_servers() {
+        Ok(c) => (c, None),
+        Err(e) => (BTreeMap::new(), Some(e)),
+    };
+    let available: Vec<Value> = configured
+        .iter()
+        .map(|(name, raw)| {
+            let (required, optional) = crate::tenant::server_variables(raw);
+            json!({ "name": name, "oauth": is_oauth_server(raw), "required": required, "optional": optional })
+        })
+        .collect();
+    let cf_path = cf_orchestrator_path();
+    let mut out = Vec::new();
+    for t in &tenants.tenants {
+        let scope = crate::vault::Scope::Tenant(t.id.clone());
+        let stored: BTreeSet<String> = crate::vault::list_names_in(&scope).into_iter().collect();
+        let servers: Vec<Value> = t
+            .credentials
+            .iter()
+            .map(|(server, vars)| {
+                let instance = instance_name(server, &t.id);
+                let raw = configured.get(server);
+                let connected = stored.contains(&crate::oauth::vault_name(server));
+                let expires_at = if connected {
+                    crate::oauth::load(&instance).and_then(|s| s.tokens).and_then(|tk| tk.expires_at)
+                } else {
+                    None
+                };
+                json!({
+                    "server": server,
+                    "instance": instance,
+                    "in_config": raw.is_some(),
+                    "secrets": vars
+                        .iter()
+                        .map(|(var, name)| json!({ "var": var, "name": name, "present": stored.contains(name) }))
+                        .collect::<Vec<_>>(),
+                    "oauth": {
+                        "capable": raw.is_some_and(is_oauth_server),
+                        "connected": connected,
+                        "expires_at": expires_at,
+                    },
+                })
+            })
+            .collect();
+        let cf = match &cf_path {
+            None => json!({ "projects": [], "error": "dossier personnel introuvable" }),
+            Some(p) => match cf_orchestrator_projects(p, &t.id) {
+                Ok(projects) => json!({ "projects": projects }),
+                Err(e) => json!({ "projects": [], "error": e }),
+            },
+        };
+        out.push(json!({
+            "id": t.id,
+            "project": t.project,
+            "workspaces": t.workspaces,
+            "servers": servers,
+            "shared_servers": t.shared_servers,
+            "cf": cf,
+        }));
+    }
+    Ok(json!({
+        "version": version,
+        "projects_path": path,
+        "tenants": out,
+        "available": available,
+        "config_error": config_error,
+    }))
+}
+
+/// Tenants déclarés, état de leurs instances et métriques (noms de secrets seulement).
+async fn handle_get_tenants(proxy: Option<Arc<ProxyServer>>) -> Vec<u8> {
+    let mut snapshot = match tokio::task::spawn_blocking(tenants_snapshot).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return json_err(500, &e),
+        Err(e) => return json_err(500, &e.to_string()),
+    };
+    if let Some(p) = &proxy {
+        let metrics = p.metrics.lock().await.servers.clone();
+        let Some(tenants) = snapshot.get_mut("tenants").and_then(|t| t.as_array_mut()) else {
+            return json_ok(snapshot);
+        };
+        for tenant in tenants.iter_mut() {
+            let Some(servers) = tenant.get_mut("servers").and_then(|s| s.as_array_mut()) else {
+                continue;
+            };
+            for server in servers.iter_mut() {
+                let instance = server.get("instance").and_then(|i| i.as_str()).unwrap_or_default().to_string();
+                server["running"] = json!(p.instance_running(&instance).await);
+                server["metrics"] = match metrics.get(&instance) {
+                    Some(m) => json!({ "calls": m.call_count, "errors": m.error_count, "last_error": m.last_error }),
+                    None => Value::Null,
+                };
+            }
+        }
+    }
+    json_ok(snapshot)
+}
+
+/// Action du tableau de bord sur un tenant, notée au journal d'audit (noms seulement).
+async fn audit_tenant_action(
+    proxy: &Option<Arc<ProxyServer>>,
+    tenant: &str,
+    action: String,
+    result: &Result<(), String>,
+) {
+    let entry = crate::audit::AuditEntry {
+        server: "mcphub".into(),
+        tool: action,
+        mode: "dashboard",
+        decision: "allow",
+        policy: "dashboard".into(),
+        status: if result.is_ok() { "ok" } else { "error" },
+        error: result.as_ref().err().cloned(),
+        tenant: Some(tenant.to_string()),
+        ..Default::default()
+    };
+    match proxy {
+        Some(p) => p.record_dashboard_audit(entry).await,
+        None => {
+            let settings = read_config()
+                .ok()
+                .and_then(|c| c.get("settings").and_then(|s| s.get("audit")).cloned())
+                .unwrap_or_else(|| json!({}));
+            let cfg = crate::audit::AuditConfig::from_json(&settings);
+            crate::audit::AuditLogger::new(crate::audit::default_path()).record(&cfg, entry);
+        }
+    }
+}
+
+/// Erreur d'écriture de projects.json : 409 si le fichier a changé depuis l'affichage.
+fn projects_write_error(e: &str) -> Vec<u8> {
+    if e == crate::tenant::STALE_PROJECTS {
+        json_err(409, e)
+    } else {
+        json_err(400, e)
+    }
+}
+
+fn required_str<'a>(data: &'a Value, key: &str) -> Result<&'a str, Vec<u8>> {
+    data.get(key)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| json_err(400, &format!("{} requis", key)))
+}
+
+async fn reset_tenant(proxy: &Option<Arc<ProxyServer>>, id: &str) {
+    if let Some(p) = proxy {
+        p.reset_tenant(id).await;
+    }
+}
+
+/// `POST /api/tenants` : {id, dir, project?, version}.
+async fn handle_add_tenant(proxy: Option<Arc<ProxyServer>>, body: &str) -> Vec<u8> {
+    let data: Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return json_err(400, "JSON invalide"),
+    };
+    let (id, dir, version) = match (required_str(&data, "id"), required_str(&data, "dir"), required_str(&data, "version")) {
+        (Ok(i), Ok(d), Ok(v)) => (i.to_string(), PathBuf::from(d.trim()), v.to_string()),
+        (Err(r), _, _) | (_, Err(r), _) | (_, _, Err(r)) => return r,
+    };
+    if !crate::tenant::is_valid_id(&id) {
+        return json_err(400, "id invalide (1 a 32 minuscules, chiffres, tirets)");
+    }
+    let project = data
+        .get("project")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .unwrap_or(&id)
+        .to_string();
+    let path = crate::tenant::projects_path();
+    let (task_id, task_project) = (id.clone(), project.clone());
+    let added = tokio::task::spawn_blocking(move || {
+        crate::tenant::add_from_dashboard(&path, &version, &task_id, &dir, &task_project)
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()));
+    let outcome = added.as_ref().map(|_| ()).map_err(Clone::clone);
+    audit_tenant_action(&proxy, &id, "tenant.add".into(), &outcome).await;
+    match added {
+        Ok(backup) => json_ok(json!({ "ok": true, "project": project, "backup": backup })),
+        Err(e) => projects_write_error(&e),
+    }
+}
+
+/// `DELETE /api/tenants/<id>` : fenêtre macOS native obligatoire (ni la page ni un agent ne
+/// peuvent la valider), puis effacement du coffre, du HOME isolé et de l'entrée.
+async fn handle_remove_tenant(proxy: Option<Arc<ProxyServer>>, id: &str, version: Option<String>) -> Vec<u8> {
+    let Some(version) = version else {
+        return json_err(400, "version requise");
+    };
+    // Avant la fenêtre : on ne demande pas de confirmer un état que l'écran n'affiche plus.
+    if version != crate::tenant::projects_version(&crate::tenant::projects_path()) {
+        return json_err(409, crate::tenant::STALE_PROJECTS);
+    }
+    let def = match crate::tenant::load_from(&crate::tenant::projects_path()) {
+        Ok(t) => match t.get(id) {
+            Some(d) => d.clone(),
+            None => return json_err(404, &format!("tenant {} inconnu", id)),
+        },
+        Err(e) => return json_err(500, &e),
+    };
+    let folders: Vec<String> = def.workspaces.iter().map(|w| format!("  {}", w.display())).collect();
+    let message = format!(
+        "Retirer le compte client \"{}\" de McpHub ?\n\nIRREVERSIBLE : tous ses secrets et jetons OAuth seront effaces du Trousseau, ainsi que son dossier isole. Le projet {} reste dans projects.json, sans tenant.\n\nDossiers :\n{}",
+        id,
+        def.project,
+        folders.join("\n")
+    );
+    let refusal = match crate::proxy::ask_human(message, 120).await {
+        crate::confirm_dialog::DialogAnswer::Allow => None,
+        crate::confirm_dialog::DialogAnswer::Deny => Some("retrait refuse dans la fenetre de confirmation"),
+        crate::confirm_dialog::DialogAnswer::Timeout => Some("pas de reponse dans la fenetre de confirmation : rien n'a ete efface"),
+        crate::confirm_dialog::DialogAnswer::Unavailable => {
+            Some("fenetre de confirmation macOS indisponible : utiliser McpHub tenant rm dans un Terminal")
+        }
+    };
+    if let Some(reason) = refusal {
+        audit_tenant_action(&proxy, id, "tenant.remove".into(), &Err(reason.to_string())).await;
+        return json_err(403, reason);
+    }
+    reset_tenant(&proxy, id).await;
+    let path = crate::tenant::projects_path();
+    let task_id = id.to_string();
+    let purged = tokio::task::spawn_blocking(move || crate::tenant::purge_tenant(&path, &task_id, Some(&version)))
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
+    let outcome = purged.as_ref().map(|_| ()).map_err(Clone::clone);
+    audit_tenant_action(&proxy, id, "tenant.remove".into(), &outcome).await;
+    match purged {
+        Ok(report) => json_ok(json!({ "ok": true, "report": report })),
+        Err(e) if e == crate::tenant::STALE_PROJECTS => json_err(409, &e),
+        Err(e) => json_err(500, &e),
+    }
+}
+
+/// `PUT /api/tenants/<id>/servers` : {servers: {serveur: [VARIABLES]}, shared: [serveurs], version}.
+async fn handle_set_tenant_servers(proxy: Option<Arc<ProxyServer>>, id: &str, body: &str) -> Vec<u8> {
+    let data: Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return json_err(400, "JSON invalide"),
+    };
+    let version = match required_str(&data, "version") {
+        Ok(v) => v.to_string(),
+        Err(r) => return r,
+    };
+    let mut servers: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    let Some(raw_servers) = data.get("servers").and_then(|s| s.as_object()) else {
+        return json_err(400, "servers requis (objet serveur -> liste de variables)");
+    };
+    for (server, vars) in raw_servers {
+        let Some(vars) = vars.as_array() else {
+            return json_err(400, &format!("servers.{} : liste attendue", server));
+        };
+        let mut names = Vec::new();
+        for v in vars {
+            match v.as_str() {
+                Some(name) => names.push(name.to_string()),
+                None => return json_err(400, &format!("servers.{} : noms de variables attendus", server)),
+            }
+        }
+        servers.insert(server.clone(), names);
+    }
+    let shared: Vec<String> = match data.get("shared").and_then(|s| s.as_array()) {
+        Some(items) => match items.iter().map(|v| v.as_str().map(String::from)).collect::<Option<Vec<_>>>() {
+            Some(list) => list,
+            None => return json_err(400, "shared : noms de serveurs attendus"),
+        },
+        None => return json_err(400, "shared requis (liste)"),
+    };
+    let path = crate::tenant::projects_path();
+    let task_id = id.to_string();
+    let written = tokio::task::spawn_blocking(move || {
+        let known = crate::tenant::configured_servers()?.into_keys().collect();
+        crate::tenant::edit_projects(&path, &version, &format!("serveurs-tenant-{}", task_id), |json| {
+            crate::tenant::set_servers(json, &task_id, &servers, &shared, &known)
+        })
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()));
+    let outcome = written.as_ref().map(|_| ()).map_err(Clone::clone);
+    audit_tenant_action(&proxy, id, "tenant.servers_set".into(), &outcome).await;
+    match written {
+        Ok(backup) => {
+            reset_tenant(&proxy, id).await;
+            json_ok(json!({ "ok": true, "backup": backup }))
+        }
+        Err(e) => projects_write_error(&e),
+    }
+}
+
+/// Secret déclaré par un serveur du tenant (les jetons OAuth ne s'écrivent pas ici).
+fn declared_secret(id: &str, name: &str) -> Result<(), Vec<u8>> {
+    if !crate::vault::is_valid_name(name) || name.starts_with(crate::oauth::VAULT_PREFIX) {
+        return Err(json_err(400, "nom de secret invalide"));
+    }
+    let tenants = crate::tenant::load_from(&crate::tenant::projects_path()).map_err(|e| json_err(500, &e))?;
+    let def = tenants.get(id).ok_or_else(|| json_err(404, &format!("tenant {} inconnu", id)))?;
+    if def.credentials.values().any(|vars| vars.values().any(|n| n == name)) {
+        Ok(())
+    } else {
+        Err(json_err(400, &format!("{} n'est pas un secret declare par les serveurs du tenant {}", name, id)))
+    }
+}
+
+/// `PUT /api/tenants/<id>/secrets/<NOM>` : {value}. Écriture seule : la valeur part vers le
+/// coffre du tenant et n'est jamais renvoyée ni journalisée.
+async fn handle_set_tenant_secret(proxy: Option<Arc<ProxyServer>>, id: &str, name: &str, body: &str) -> Vec<u8> {
+    if body.len() > SECRET_BODY_MAX {
+        return json_err(413, "valeur trop longue (16 Ko au plus)");
+    }
+    let value = match serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("value").and_then(|x| x.as_str()).map(String::from))
+    {
+        Some(v) if !v.is_empty() => v,
+        _ => return json_err(400, "value requis (texte non vide)"),
+    };
+    if value.contains('\n') || value.contains('\r') {
+        return json_err(400, "valeur sur plusieurs lignes non prise en charge");
+    }
+    if let Err(resp) = declared_secret(id, name) {
+        return resp;
+    }
+    let scope = crate::vault::Scope::Tenant(id.to_string());
+    let task_name = name.to_string();
+    let written = tokio::task::spawn_blocking(move || {
+        let existed = crate::vault::list_names_in(&scope).contains(&task_name);
+        // Un message d'erreur ne doit jamais citer la valeur.
+        crate::vault::set_in(&scope, &task_name, &value)
+            .map(|_| existed)
+            .map_err(|e| e.replace(value.as_str(), "***"))
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()));
+    let outcome = written.as_ref().map(|_| ()).map_err(Clone::clone);
+    audit_tenant_action(&proxy, id, format!("tenant.secret_set {}", name), &outcome).await;
+    match written {
+        Ok(replaced) => {
+            reset_tenant(&proxy, id).await;
+            json_ok(json!({ "ok": true, "replaced": replaced }))
+        }
+        Err(e) => json_err(500, &e),
+    }
+}
+
+/// `DELETE /api/tenants/<id>/secrets/<NOM>`.
+async fn handle_delete_tenant_secret(proxy: Option<Arc<ProxyServer>>, id: &str, name: &str) -> Vec<u8> {
+    if let Err(resp) = declared_secret(id, name) {
+        return resp;
+    }
+    let scope = crate::vault::Scope::Tenant(id.to_string());
+    let task_name = name.to_string();
+    let deleted = tokio::task::spawn_blocking(move || crate::vault::delete_in(&scope, &task_name))
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
+    let outcome = deleted.as_ref().map(|_| ()).map_err(Clone::clone);
+    audit_tenant_action(&proxy, id, format!("tenant.secret_delete {}", name), &outcome).await;
+    match deleted {
+        Ok(existed) => {
+            reset_tenant(&proxy, id).await;
+            json_ok(json!({ "ok": true, "deleted": existed }))
+        }
+        Err(e) => json_err(500, &e),
+    }
+}
+
+/// `POST /api/tenants/<id>/check` : chaque instance peut-elle démarrer ? (`McpHub tenant check`)
+async fn handle_check_tenant(id: &str) -> Vec<u8> {
+    let task_id = id.to_string();
+    let checked = tokio::task::spawn_blocking(move || {
+        let tenants = crate::tenant::load_from(&crate::tenant::projects_path())?;
+        let def = tenants.get(&task_id).ok_or_else(|| format!("tenant {} inconnu", task_id))?;
+        Ok::<_, String>(
+            def.credentials
+                .keys()
+                .map(|server| match crate::tenant::check_server(def, server) {
+                    Ok(message) => json!({ "server": server, "ok": true, "message": message }),
+                    Err(e) => json!({ "server": server, "ok": false, "message": e }),
+                })
+                .collect::<Vec<_>>(),
+        )
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()));
+    match checked {
+        Ok(results) => json_ok(json!({ "results": results })),
+        Err(e) => json_err(404, &e),
+    }
+}
+
+/// Routes `/api/tenants/<id>[/...]`.
+async fn route_tenant(req: &HttpRequest, rest: &str, proxy: Option<Arc<ProxyServer>>) -> Vec<u8> {
+    let parts: Vec<String> = rest.split('/').map(urldecode).collect();
+    let id = parts[0].as_str();
+    if !crate::tenant::is_valid_id(id) {
+        return json_err(400, "id de tenant invalide");
+    }
+    let tail: Vec<&str> = parts[1..].iter().map(String::as_str).collect();
+    match (&req.method[..], tail.as_slice()) {
+        ("DELETE", []) => handle_remove_tenant(proxy, id, query_param(&req.path, "version")).await,
+        ("PUT", ["servers"]) => handle_set_tenant_servers(proxy, id, &req.body).await,
+        ("POST", ["check"]) => handle_check_tenant(id).await,
+        ("PUT", ["secrets", name]) => handle_set_tenant_secret(proxy, id, name, &req.body).await,
+        ("DELETE", ["secrets", name]) => handle_delete_tenant_secret(proxy, id, name).await,
+        (_, [] | ["servers"] | ["check"] | ["secrets", _]) => json_err(405, "Method not allowed"),
+        _ => json_err(404, "Not found"),
+    }
+}
+
 // ─── Router ──────────────────────────────────────────────────
 
 async fn route(
@@ -1223,6 +1627,7 @@ async fn route(
             }
         }
         ("GET", "/api/tenants") => handle_get_tenants(proxy).await,
+        ("POST", "/api/tenants") => handle_add_tenant(proxy, &req.body).await,
         ("GET", "/login") => {
             // Lien à usage unique créé par `McpHub dashboard` : remet le secret de session au
             // tableau de bord (sessionStorage, propre à cette origine), puis efface l'URL.
@@ -1315,6 +1720,9 @@ async fn route(
         ("PUT", "/api/settings") => handle_update_settings(&req.body),
         ("POST", "/api/generate") => handle_generate().await,
         _ => {
+            if let Some(rest) = path.strip_prefix("/api/tenants/") {
+                return route_tenant(req, rest, proxy).await;
+            }
             if let Some(rest) = path.strip_prefix("/api/servers/") {
                 if (rest.ends_with("/toggle") || rest.ends_with("/repair")) && req.method != "POST" {
                     json_err(405, "Method not allowed")

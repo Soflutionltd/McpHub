@@ -368,3 +368,233 @@ fn cli_tenant_et_coffre_du_tenant() {
     // Le coffre McpHub n'a pas bougé.
     assert_eq!(std::fs::read_to_string(fx.hub.join("secrets.env")).unwrap(), "HUB_TOKEN=hub-secret\n");
 }
+
+// ---------------------------------------------------------------------------
+// Écran Client accounts : routes HTTP du tableau de bord (`McpHub serve`)
+// ---------------------------------------------------------------------------
+
+struct Daemon {
+    child: Child,
+    port: u16,
+    token: String,
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Daemon {
+    fn start(fx: &Fixture) -> Self {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let child = fx
+            .command()
+            .arg("serve")
+            .env("MCPHUB_INSTANCE", "tenanthttp")
+            .env("MCPHUB_PORT", port.to_string())
+            .env("MCPHUB_AUTO_UPDATE", "0")
+            .env("MCPHUB_NO_DIALOG", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(if std::env::var("MCPHUB_TEST_STDERR").is_ok() { Stdio::inherit() } else { Stdio::null() })
+            .spawn()
+            .expect("McpHub serve");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(std::time::Instant::now() < deadline, "le demon n'ecoute pas");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        // Le jeton est créé par le démon à la première requête.
+        let mut daemon = Self { child, port, token: String::new() };
+        let (status, _) = daemon.raw("GET", "/api/tenants", None, None, None);
+        assert_eq!(status, 401);
+        daemon.token = std::fs::read_to_string(fx.hub.join("auth-token")).expect("jeton du demon").trim().to_string();
+        daemon
+    }
+
+    /// Requête comme le tableau de bord : Host et Origin locaux, jeton Bearer.
+    fn call(&self, method: &str, path: &str, body: Option<&Value>) -> (u16, String) {
+        let origin = format!("http://127.0.0.1:{}", self.port);
+        self.raw(method, path, body.map(|b| b.to_string()), Some(&self.token), Some(&origin))
+    }
+
+    fn json(&self, method: &str, path: &str, body: Option<&Value>) -> (u16, Value) {
+        let (status, text) = self.call(method, path, body);
+        (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+
+    fn raw(&self, method: &str, path: &str, body: Option<String>, token: Option<&str>, origin: Option<&str>) -> (u16, String) {
+        use std::io::Read;
+        let body = body.unwrap_or_default();
+        let mut request = format!(
+            "{} {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+            method,
+            path,
+            self.port,
+            body.len()
+        );
+        if let Some(t) = token {
+            request.push_str(&format!("Authorization: Bearer {}\r\n", t));
+        }
+        if let Some(o) = origin {
+            request.push_str(&format!("Origin: {}\r\n", o));
+        }
+        request.push_str("\r\n");
+        request.push_str(&body);
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", self.port)).unwrap();
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(30))).unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        let status = response.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let text = response.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
+        (status, text)
+    }
+}
+
+fn read_json(path: &Path) -> Value {
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+#[test]
+fn ecran_client_accounts_par_http() {
+    let fx = Fixture::new("http");
+    // Projets cf-orchestrator (lecture seule) : un projet du client, un projet McpHub.
+    let cf_dir = fx.root.join("user-home").join(".cf-orchestrator");
+    std::fs::create_dir_all(&cf_dir).unwrap();
+    std::fs::write(
+        cf_dir.join("projects.json"),
+        json!({ "projects": {
+            "acme-site": { "type": "pages", "cwd": "/x", "build_cmd": "b", "cf_project_name": "acme-pages", "tenant": "acme" },
+            "hub-site": { "type": "pages", "cwd": "/y", "build_cmd": "b", "cf_project_name": "hub-pages" }
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let daemon = Daemon::start(&fx);
+    let projects_path = fx.hub.join("projects.json");
+    let tenant_secrets = fx.hub.join("tenants").join("acme").join("secrets.env");
+
+    // Sans jeton, ou depuis une autre origine : refusé avant toute action.
+    let (status, _) = daemon.raw("GET", "/api/tenants", None, None, None);
+    assert_eq!(status, 401);
+    let evil = json!({ "value": "pirate" }).to_string();
+    let (status, _) = daemon.raw(
+        "PUT",
+        "/api/tenants/acme/secrets/ACME_TOKEN",
+        Some(evil),
+        Some(&daemon.token),
+        Some("http://evil.example"),
+    );
+    assert_eq!(status, 403);
+    assert!(std::fs::read_to_string(&tenant_secrets).unwrap().contains("ACME_TOKEN=acme-secret"));
+
+    // Lecture : noms et états seulement, jamais une valeur.
+    let (status, text) = daemon.call("GET", "/api/tenants", None);
+    assert_eq!(status, 200, "{}", text);
+    assert!(!text.contains("acme-secret") && !text.contains("hub-secret"), "valeur de secret renvoyee : {}", text);
+    let snapshot: Value = serde_json::from_str(&text).unwrap();
+    let acme = &snapshot["tenants"][0];
+    assert_eq!(acme["id"], "acme");
+    assert_eq!(acme["servers"][0]["secrets"][0], json!({ "var": "TOKEN", "name": "ACME_TOKEN", "present": true }));
+    assert_eq!(acme["cf"]["projects"], json!([{ "name": "acme-site", "cf_project_name": "acme-pages", "type": "pages" }]));
+    let svc = snapshot["available"].as_array().unwrap().iter().find(|a| a["name"] == "svc").unwrap();
+    assert_eq!(svc["required"], json!(["TOKEN"]));
+    assert_eq!(svc["optional"], json!(["P8"]));
+    let version = snapshot["version"].as_str().unwrap().to_string();
+
+    // Écriture d'un secret : la valeur part au coffre du client et ne revient jamais.
+    let (status, text) = daemon.call(
+        "PUT",
+        "/api/tenants/acme/secrets/ACME_TOKEN",
+        Some(&json!({ "value": "acme-rotated" })),
+    );
+    assert_eq!(status, 200, "{}", text);
+    assert!(!text.contains("acme-rotated"));
+    assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["replaced"], true);
+    assert!(std::fs::read_to_string(&tenant_secrets).unwrap().contains("ACME_TOKEN=acme-rotated"));
+    // Le coffre McpHub n'est pas touché.
+    assert!(std::fs::read_to_string(fx.hub.join("secrets.env")).unwrap().contains("HUB_TOKEN=hub-secret"));
+
+    // Seuls les secrets déclarés par les serveurs du client s'écrivent ici.
+    for name in ["HUB_TOKEN", "MCPHUB_OAUTH_SVC", "bad-name"] {
+        let (status, _) =
+            daemon.call("PUT", &format!("/api/tenants/acme/secrets/{}", name), Some(&json!({ "value": "x" })));
+        assert_eq!(status, 400, "{}", name);
+    }
+    let (status, _) =
+        daemon.call("PUT", "/api/tenants/acme/secrets/ACME_TOKEN", Some(&json!({ "value": "a\nb" })));
+    assert_eq!(status, 400);
+    let big = json!({ "value": "x".repeat(17 * 1024) });
+    let (status, _) = daemon.call("PUT", "/api/tenants/acme/secrets/ACME_TOKEN", Some(&big));
+    assert_eq!(status, 413);
+
+    // Serveurs du client : version périmée refusée, puis écriture avec sauvegarde.
+    let servers = json!({ "servers": { "svc": ["TOKEN", "P8"] }, "shared": ["other"], "version": "0-0" });
+    let (status, _) = daemon.json("PUT", "/api/tenants/acme/servers", Some(&servers));
+    assert_eq!(status, 409);
+    let unknown = json!({ "servers": { "nope": [] }, "shared": [], "version": version });
+    let (status, _) = daemon.json("PUT", "/api/tenants/acme/servers", Some(&unknown));
+    assert_eq!(status, 400);
+    let servers = json!({ "servers": { "svc": ["TOKEN", "P8"] }, "shared": ["other"], "version": version });
+    let (status, body) = daemon.json("PUT", "/api/tenants/acme/servers", Some(&servers));
+    assert_eq!(status, 200, "{}", body);
+    assert!(Path::new(body["backup"].as_str().unwrap()).exists());
+    let saved = read_json(&projects_path);
+    assert_eq!(
+        saved["projects"]["acme"]["credentials"]["svc"],
+        json!({ "TOKEN": "vault:acme/ACME_TOKEN", "P8": "vault:acme/P8" })
+    );
+    assert_eq!(saved["projects"]["acme"]["sharedServers"], json!(["other"]));
+
+    // Vérification : le secret P8 manque, sans jamais citer de valeur.
+    let (status, body) = daemon.json("POST", "/api/tenants/acme/check", None);
+    assert_eq!(status, 200);
+    let result = &body["results"][0];
+    assert_eq!(result["ok"], false);
+    assert!(result["message"].as_str().unwrap().contains("P8"));
+    assert!(!body.to_string().contains("acme-rotated"));
+
+    // Ajout d'un client : dossier existant et sans chevauchement.
+    let (_, fresh) = daemon.json("GET", "/api/tenants", None);
+    let version = fresh["version"].as_str().unwrap().to_string();
+    let beta_dir = fx.root.join("clients").join("beta");
+    std::fs::create_dir_all(&beta_dir).unwrap();
+    let overlap = json!({ "id": "beta", "dir": fx.acme.join("sub").to_string_lossy(), "version": version });
+    std::fs::create_dir_all(fx.acme.join("sub")).unwrap();
+    let (status, _) = daemon.json("POST", "/api/tenants", Some(&overlap));
+    assert_eq!(status, 400);
+    let add = json!({ "id": "beta", "dir": beta_dir.to_string_lossy(), "version": version });
+    let (status, body) = daemon.json("POST", "/api/tenants", Some(&add));
+    assert_eq!(status, 200, "{}", body);
+    assert_eq!(read_json(&projects_path)["projects"]["beta"]["tenant"], "beta");
+
+    // Retrait : version exigée, périmée refusée avant la fenêtre ; sans fenêtre validée, rien n'est effacé.
+    let (status, _) = daemon.json("DELETE", "/api/tenants/acme", None);
+    assert_eq!(status, 400);
+    let (status, _) = daemon.json("DELETE", "/api/tenants/acme?version=0-0", None);
+    assert_eq!(status, 409);
+    let (_, fresh) = daemon.json("GET", "/api/tenants", None);
+    let version = fresh["version"].as_str().unwrap().to_string();
+    let (status, body) = daemon.json("DELETE", &format!("/api/tenants/acme?version={}", version), None);
+    assert_eq!(status, 403, "{}", body);
+    assert_eq!(read_json(&projects_path)["projects"]["acme"]["tenant"], "acme");
+    assert!(tenant_secrets.exists());
+
+    // Audit : l'action et le nom du secret, jamais la valeur (écriture en tâche de fond).
+    let audit = fx.hub.join("audit.jsonl");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let text = std::fs::read_to_string(&audit).unwrap_or_default();
+        if text.contains("tenant.remove") {
+            assert!(text.contains("tenant.secret_set ACME_TOKEN"));
+            assert!(text.contains("tenant.servers_set"));
+            assert!(!text.contains("acme-rotated"));
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "audit incomplet : {}", text);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}

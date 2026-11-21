@@ -661,6 +661,20 @@ impl ChildManager {
         }
     }
 
+    /// Retire toutes les instances d'un tenant (configs et processus).
+    pub async fn remove_tenant_instances(&self, tenant: &str) {
+        let of_tenant = |name: &String| {
+            crate::tenant::split_instance(name).is_some_and(|(_, t)| t == tenant)
+        };
+        let mut names: Vec<String> = self.configs.lock().await.keys().filter(|n| of_tenant(n)).cloned().collect();
+        names.extend(self.pools.lock().await.keys().filter(|n| of_tenant(n)).cloned());
+        names.sort();
+        names.dedup();
+        for name in names {
+            self.remove_instance(&name).await;
+        }
+    }
+
     /// Retire une instance de tenant (config et processus).
     pub async fn remove_instance(&self, name: &str) {
         if !crate::tenant::is_instance_name(name) {

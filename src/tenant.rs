@@ -665,12 +665,308 @@ impl Registry {
         derived.get(instance).is_none_or(|at| at.elapsed() >= INSTANCE_CONFIG_TTL)
     }
 
+    /// Oublie les dérivations du tenant : ses instances relisent coffre et config au prochain appel.
+    pub fn forget_tenant(&self, id: &str) {
+        self.derived_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|instance, _| split_instance(instance).is_none_or(|(_, t)| t != id));
+    }
+
     pub fn mark_derived(&self, instance: &str) {
         self.derived_at
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(instance.to_string(), Instant::now());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Édition depuis le tableau de bord (écran Client accounts)
+// ---------------------------------------------------------------------------
+
+/// Refus d'écriture : projects.json a changé depuis l'affichage de l'écran.
+pub const STALE_PROJECTS: &str = "projects.json a change depuis l'affichage : recharger l'ecran avant de modifier";
+
+/// Écritures du tableau de bord sérialisées : deux requêtes ne lisent pas la même version.
+static EDIT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Empreinte de projects.json (date de modification et taille). Une écriture du tableau de bord
+/// est refusée si le fichier a changé depuis l'affichage (édition à la main, CLI).
+pub fn projects_version(path: &Path) -> String {
+    match std::fs::metadata(path) {
+        Ok(m) => {
+            let nanos = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            format!("{}-{}", nanos, m.len())
+        }
+        Err(_) => "absent".into(),
+    }
+}
+
+/// Lit projects.json, applique `edit` et l'écrit (validation, sauvegarde, écriture atomique),
+/// seulement si le fichier n'a pas changé depuis `expected_version`.
+pub fn edit_projects(
+    path: &Path,
+    expected_version: &str,
+    label: &str,
+    edit: impl FnOnce(&mut Value) -> Result<(), String>,
+) -> Result<Option<PathBuf>, String> {
+    let _guard = EDIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if projects_version(path) != expected_version {
+        return Err(STALE_PROJECTS.into());
+    }
+    let mut json = read_projects_raw(path)?;
+    edit(&mut json)?;
+    write_projects(path, &json, label)
+}
+
+/// Ajout d'un tenant depuis le tableau de bord : mêmes contrôles que `McpHub tenant add`.
+pub fn add_from_dashboard(
+    path: &Path,
+    expected_version: &str,
+    id: &str,
+    dir: &Path,
+    project: &str,
+) -> Result<Option<PathBuf>, String> {
+    if !dir.is_absolute() {
+        return Err(format!("dossier non absolu : {}", dir.display()));
+    }
+    if !dir.is_dir() {
+        return Err(format!("dossier introuvable : {}", dir.display()));
+    }
+    if project.trim().is_empty() {
+        return Err("nom de projet vide".into());
+    }
+    let dir = normalize(dir);
+    edit_projects(path, expected_version, &format!("tenant-{}", id), |json| {
+        add_tenant(json, id, &dir, project)
+    })
+}
+
+/// Serveurs déclarés dans config.json (hors serveurs désactivés), config brute.
+pub fn configured_servers() -> Result<BTreeMap<String, Value>, String> {
+    let path = crate::config::dedicated_config_path();
+    let Some(json) = crate::config::read_raw(&path)? else {
+        return Ok(BTreeMap::new());
+    };
+    let servers = json.get("mcpServers").or_else(|| json.get("servers")).unwrap_or(&json);
+    let Some(servers) = servers.as_object() else {
+        return Err(format!("{} : liste de serveurs illisible", path.display()));
+    };
+    Ok(servers
+        .iter()
+        .filter(|(name, raw)| {
+            !is_instance_name(name)
+                && (raw.get("command").is_some() || raw.get("url").is_some())
+                && !raw.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false)
+        })
+        .map(|(name, raw)| (name.clone(), raw.clone()))
+        .collect())
+}
+
+fn collect_refs(value: &Value, out: &mut BTreeSet<String>) {
+    match value {
+        Value::String(s) => {
+            crate::config::expand_with(s, &mut |var| {
+                if crate::vault::is_valid_name(var) {
+                    out.insert(var.to_string());
+                }
+                None
+            });
+        }
+        Value::Array(items) => items.iter().for_each(|v| collect_refs(v, out)),
+        Value::Object(map) => map.values().for_each(|v| collect_refs(v, out)),
+        _ => {}
+    }
+}
+
+/// Variables qu'un serveur attend d'un tenant (noms seulement). `required` : les `${VAR}` de
+/// la config (args, url, en-têtes) et les clés d'env dont la valeur est un `${…}` ; `optional` :
+/// les autres clés d'env, écartées par la liste blanche sauf si le tenant les fournit (un
+/// chemin de clé en dur, par exemple).
+pub fn server_variables(raw: &Value) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut required = BTreeSet::new();
+    let mut optional = BTreeSet::new();
+    let Some(obj) = raw.as_object() else {
+        return (required, optional);
+    };
+    for (key, value) in obj {
+        if key != "env" {
+            collect_refs(value, &mut required);
+        }
+    }
+    if let Some(env) = obj.get("env").and_then(|e| e.as_object()) {
+        for (key, value) in env {
+            if ALWAYS_KEPT_ENV.contains(&key.as_str()) || !crate::vault::is_valid_name(key) {
+                continue;
+            }
+            if value.as_str().is_some_and(|s| s.contains("${")) {
+                required.insert(key.clone());
+            } else {
+                optional.insert(key.clone());
+            }
+        }
+    }
+    optional.retain(|k| !required.contains(k));
+    (required, optional)
+}
+
+/// Remplace les serveurs d'un tenant : `servers` (serveur → variables fournies par son coffre)
+/// et `shared` (serveurs utilisés tels quels). Une variable déjà déclarée garde son secret ;
+/// une nouvelle pointe vers le secret du même nom. Rien ne change en cas d'erreur.
+pub fn set_servers(
+    json: &mut Value,
+    id: &str,
+    servers: &BTreeMap<String, Vec<String>>,
+    shared: &[String],
+    known: &BTreeSet<String>,
+) -> Result<(), String> {
+    let mut candidate = json.clone();
+    let tenants = parse_projects(&candidate)?;
+    let def = tenants.get(id).ok_or_else(|| format!("tenant {} inconnu", id))?;
+    for server in servers.keys().chain(shared.iter()) {
+        if !known.contains(server) {
+            return Err(format!("serveur {} absent de config.json (ou desactive)", server));
+        }
+    }
+    let mut credentials = serde_json::Map::new();
+    for (server, vars) in servers {
+        let mut map = serde_json::Map::new();
+        for var in vars {
+            if !crate::vault::is_valid_name(var) {
+                return Err(format!("variable invalide {}.{}", server, var));
+            }
+            if var.starts_with(crate::oauth::VAULT_PREFIX) {
+                return Err(format!("{} : nom reserve aux jetons OAuth", var));
+            }
+            let secret = def
+                .credentials
+                .get(server)
+                .and_then(|m| m.get(var))
+                .cloned()
+                .unwrap_or_else(|| var.clone());
+            map.insert(var.clone(), json!(format!("{}{}/{}", VAULT_REF_PREFIX, id, secret)));
+        }
+        credentials.insert(server.clone(), Value::Object(map));
+    }
+    let shared: BTreeSet<&String> = shared.iter().collect();
+    let entry = candidate
+        .get_mut("projects")
+        .and_then(|p| p.get_mut(&def.project))
+        .and_then(|e| e.as_object_mut())
+        .ok_or_else(|| format!("projet {} introuvable", def.project))?;
+    entry.insert("credentials".into(), Value::Object(credentials));
+    entry.insert("sharedServers".into(), json!(shared));
+    if let Some(keep) = entry.get_mut("keepEnv").and_then(|k| k.as_object_mut()) {
+        keep.retain(|server, _| servers.contains_key(server));
+    }
+    parse_projects(&candidate)?;
+    *json = candidate;
+    Ok(())
+}
+
+/// Vérifie qu'une instance peut démarrer : variables couvertes, secrets présents, OAuth connecté.
+/// Le message ne contient jamais de valeur.
+pub fn check_server(tenant: &TenantDef, server: &str) -> Result<String, String> {
+    let config = derive_from_vault(tenant, server)?;
+    if !config.oauth {
+        return Ok("ok".into());
+    }
+    let connected = crate::oauth::load(&instance_name(server, &tenant.id))
+        .and_then(|s| s.tokens)
+        .is_some();
+    if connected {
+        Ok("ok (OAuth connecte)".into())
+    } else {
+        Err(format!(
+            "OAuth non connecte : McpHub oauth login --tenant {} {}",
+            tenant.id, server
+        ))
+    }
+}
+
+/// Efface tout ce qui appartient au tenant (jetons OAuth, coffre, dossier et HOME isolé), puis
+/// le retire de projects.json (le projet et ses dossiers restent). Renvoie le compte rendu.
+/// Le coffre est effacé en premier : en cas d'échec, rien d'autre n'est touché.
+/// `expected_version` (tableau de bord) : refus si projects.json a changé depuis l'affichage.
+pub fn purge_tenant(path: &Path, id: &str, expected_version: Option<&str>) -> Result<Vec<String>, String> {
+    if !is_valid_id(id) {
+        return Err(format!("id invalide : {}", id));
+    }
+    let _guard = EDIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if expected_version.is_some_and(|v| v != projects_version(path)) {
+        return Err(STALE_PROJECTS.into());
+    }
+    let mut report = Vec::new();
+    let mut json = read_projects_raw(path)?;
+    if let Ok(tenants) = parse_projects(&json) {
+        if let Some(def) = tenants.get(id) {
+            for server in def.credentials.keys() {
+                // Vide aussi le cache des jetons du processus courant (démon).
+                if let Err(e) = crate::oauth::forget(&instance_name(server, id)) {
+                    report.push(format!("Avertissement : jetons OAuth de {} : {}", server, e));
+                }
+            }
+        }
+    }
+    let scope = Scope::Tenant(id.to_string());
+    let erased = crate::vault::purge(&scope).map_err(|e| format!("rien d'autre n'a ete touche : {}", e))?;
+    report.push(format!("Coffre du tenant {} efface ({} elements).", id, erased));
+    for dir in [tenant_dir(id), tenant_home(id)] {
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => report.push(format!("Supprime : {}", dir.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => report.push(format!("Avertissement : {} : {}", dir.display(), e)),
+        }
+    }
+    match remove_tenant(&mut json, id) {
+        Ok(project) => {
+            let backup = write_projects(path, &json, &format!("rm-tenant-{}", id))
+                .map_err(|e| format!("ecriture de {} : {}", path.display(), e))?;
+            report.push(format!("Tenant {} retire du projet {}.", id, project));
+            if let Some(b) = backup {
+                report.push(format!("Sauvegarde : {}", b.display()));
+            }
+        }
+        Err(e) => report.push(format!("({} : {})", path.display(), e)),
+    }
+    Ok(report)
+}
+
+/// Fichier des projets de cf-orchestrator (dans le vrai dossier personnel, comme lui).
+pub fn cf_orchestrator_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".cf-orchestrator").join("projects.json"))
+}
+
+/// Projets cf-orchestrator rattachés au tenant (lecture seule) : nom, projet Cloudflare, type.
+pub fn cf_orchestrator_projects(path: &Path, tenant: &str) -> Result<Vec<Value>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("{} illisible : {}", path.display(), e)),
+    };
+    let json: Value =
+        serde_json::from_str(&text).map_err(|e| format!("{} : JSON invalide ({})", path.display(), e))?;
+    let projects = json
+        .get("projects")
+        .and_then(|p| p.as_object())
+        .ok_or_else(|| format!("{} : objet \"projects\" absent", path.display()))?;
+    Ok(projects
+        .iter()
+        .filter(|(_, p)| p.get("tenant").and_then(|t| t.as_str()) == Some(tenant))
+        .map(|(name, p)| {
+            json!({
+                "name": name,
+                "cf_project_name": p.get("cf_project_name").and_then(|v| v.as_str()),
+                "type": p.get("type").and_then(|v| v.as_str()),
+            })
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -909,19 +1205,8 @@ pub fn run_cli(args: &[String]) -> i32 {
             };
             let mut failures = 0;
             for server in tenant.credentials.keys() {
-                match derive_from_vault(tenant, server) {
-                    Ok(cfg) if cfg.oauth => {
-                        let connected = crate::oauth::load(&instance_name(server, &id))
-                            .and_then(|s| s.tokens)
-                            .is_some();
-                        if connected {
-                            println!("  {:24} ok (OAuth connecte)", server);
-                        } else {
-                            failures += 1;
-                            println!("  {:24} OAuth non connecte : McpHub oauth login --tenant {} {}", server, id, server);
-                        }
-                    }
-                    Ok(_) => println!("  {:24} ok", server),
+                match check_server(tenant, server) {
+                    Ok(message) => println!("  {:24} {}", server, message),
                     Err(e) => {
                         failures += 1;
                         println!("  {:24} ERREUR : {}", server, e);
@@ -1001,49 +1286,16 @@ fn confirm_removal(id: &str) -> bool {
 }
 
 fn remove_cli(path: &Path, id: &str) -> i32 {
-    let mut json = match read_projects_raw(path) {
-        Ok(j) => j,
+    match purge_tenant(path, id, None) {
+        Ok(report) => {
+            for line in report {
+                println!("{}", line);
+            }
+            0
+        }
         Err(e) => {
             eprintln!("Erreur : {}", e);
-            return 1;
-        }
-    };
-    if !is_valid_id(id) {
-        eprintln!("id invalide : {}", id);
-        return 1;
-    }
-    let scope = Scope::Tenant(id.to_string());
-    match crate::vault::purge(&scope) {
-        Ok(n) => println!("Coffre du tenant {} efface ({} elements).", id, n),
-        Err(e) => {
-            eprintln!("Erreur, rien d'autre n'a ete touche : {}", e);
-            return 1;
-        }
-    }
-    for dir in [tenant_dir(id), tenant_home(id)] {
-        match std::fs::remove_dir_all(&dir) {
-            Ok(()) => println!("Supprime : {}", dir.display()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => eprintln!("Avertissement : {} : {}", dir.display(), e),
-        }
-    }
-    match remove_tenant(&mut json, id) {
-        Ok(project) => match write_projects(path, &json, &format!("rm-tenant-{}", id)) {
-            Ok(backup) => {
-                println!("Tenant {} retire du projet {}.", id, project);
-                if let Some(b) = backup {
-                    println!("Sauvegarde : {}", b.display());
-                }
-                0
-            }
-            Err(e) => {
-                eprintln!("Erreur d'ecriture de {} : {}", path.display(), e);
-                1
-            }
-        },
-        Err(e) => {
-            println!("({} : {})", path.display(), e);
-            0
+            1
         }
     }
 }
@@ -1305,6 +1557,115 @@ mod tests {
         assert!(json["projects"]["soflution-app"].get("tenant").is_none());
         assert!(json["projects"]["soflution-app"].get("workspaces").is_some());
         assert!(parse_projects(&json).unwrap().get("sof").is_none());
+    }
+
+    #[test]
+    fn serveurs_d_un_tenant_depuis_l_ecran() {
+        let known: BTreeSet<String> =
+            ["cloudflare-api", "supabase", "stripe", "context7", "svelte"].iter().map(|s| s.to_string()).collect();
+        let mut json = projects();
+        let servers: BTreeMap<String, Vec<String>> = [
+            // Variable déjà déclarée : elle garde son secret (CF_TOKEN), la nouvelle prend son nom.
+            ("cloudflare-api".to_string(), vec!["CLOUDFLARE_MCP_TOKEN".to_string(), "ACCOUNT_ID".to_string()]),
+            ("stripe".to_string(), vec![]),
+        ]
+        .into_iter()
+        .collect();
+        set_servers(&mut json, "acme", &servers, &["svelte".into(), "context7".into()], &known).unwrap();
+        let entry = &json["projects"]["acme"];
+        assert_eq!(
+            entry["credentials"],
+            json!({
+                "cloudflare-api": { "CLOUDFLARE_MCP_TOKEN": "vault:acme/CF_TOKEN", "ACCOUNT_ID": "vault:acme/ACCOUNT_ID" },
+                "stripe": {}
+            })
+        );
+        assert_eq!(entry["sharedServers"], json!(["context7", "svelte"]));
+        // keepEnv d'un serveur retiré disparaît avec lui.
+        assert_eq!(entry["keepEnv"], json!({}));
+        assert_eq!(json["projects"]["soflution-app"], projects()["projects"]["soflution-app"]);
+
+        // Refus sans rien modifier : serveur inconnu, nom OAuth réservé, double déclaration.
+        let before = json.clone();
+        let unknown: BTreeMap<String, Vec<String>> = [("inconnu".to_string(), vec![])].into_iter().collect();
+        assert!(set_servers(&mut json, "acme", &unknown, &[], &known).is_err());
+        let oauth: BTreeMap<String, Vec<String>> =
+            [("stripe".to_string(), vec!["MCPHUB_OAUTH_STRIPE".to_string()])].into_iter().collect();
+        assert!(set_servers(&mut json, "acme", &oauth, &[], &known).is_err());
+        let both: BTreeMap<String, Vec<String>> = [("stripe".to_string(), vec![])].into_iter().collect();
+        assert!(set_servers(&mut json, "acme", &both, &["stripe".into()], &known).is_err());
+        assert!(set_servers(&mut json, "inconnu", &both, &[], &known).is_err());
+        assert_eq!(json, before);
+    }
+
+    #[test]
+    fn variables_attendues_d_un_serveur() {
+        let stdio = json!({
+            "command": "npx",
+            "args": ["-y", "pkg", "--account=${ACCOUNT_ID}"],
+            "env": { "API_TOKEN": "${HUB_TOKEN}", "P8_PATH": "/cle.p8", "PATH": "/bin" }
+        });
+        let (required, optional) = server_variables(&stdio);
+        assert_eq!(required.into_iter().collect::<Vec<_>>(), ["ACCOUNT_ID", "API_TOKEN"]);
+        assert_eq!(optional.into_iter().collect::<Vec<_>>(), ["P8_PATH"]);
+        let remote = json!({ "url": "https://x.example/mcp", "headers": { "Authorization": "Bearer ${X_TOKEN}" } });
+        let (required, optional) = server_variables(&remote);
+        assert_eq!(required.into_iter().collect::<Vec<_>>(), ["X_TOKEN"]);
+        assert!(optional.is_empty());
+    }
+
+    #[test]
+    fn ecriture_refusee_si_projects_json_a_change() {
+        let dir = std::env::temp_dir().join(format!("tenant-version-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("projects.json");
+        std::fs::write(&path, projects().to_string()).unwrap();
+        let version = projects_version(&path);
+        // Modification à la main entre l'affichage et l'écriture.
+        std::fs::write(&path, format!("{}\n", projects())).unwrap();
+        let stale = edit_projects(&path, &version, "test", |_| Ok(()));
+        assert_eq!(stale.unwrap_err(), STALE_PROJECTS);
+        let fresh = projects_version(&path);
+        let backup = edit_projects(&path, &fresh, "test", |json| {
+            json["projects"]["acme"]["sharedServers"] = json!([]);
+            Ok(())
+        })
+        .unwrap();
+        assert!(backup.unwrap().exists());
+        assert_ne!(projects_version(&path), fresh);
+        // Une modification invalide n'est jamais écrite.
+        let current = projects_version(&path);
+        let invalid = edit_projects(&path, &current, "test", |json| {
+            json["projects"]["acme"]["tenant"] = json!("A B");
+            Ok(())
+        });
+        assert!(invalid.is_err());
+        assert_eq!(projects_version(&path), current);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn projets_cf_orchestrator_du_tenant() {
+        let dir = std::env::temp_dir().join(format!("tenant-cf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("projects.json");
+        assert!(cf_orchestrator_projects(&path, "acme").unwrap().is_empty());
+        std::fs::write(
+            &path,
+            json!({ "projects": {
+                "site": { "cf_project_name": "acme-site", "type": "pages", "tenant": "acme" },
+                "hub": { "cf_project_name": "hub-site", "type": "workers" }
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            cf_orchestrator_projects(&path, "acme").unwrap(),
+            vec![json!({ "name": "site", "cf_project_name": "acme-site", "type": "pages" })]
+        );
+        std::fs::write(&path, "pas du json").unwrap();
+        assert!(cf_orchestrator_projects(&path, "acme").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

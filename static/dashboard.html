@@ -149,6 +149,45 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
 .lib-field.missing input{border-color:var(--danger)}
 .lib-links a{color:var(--blue);font-size:12px;margin-right:12px;text-decoration:none}
 </style>
+<style>
+/* Client accounts */
+#view-clients .btn{white-space:nowrap}
+.cl-path{flex:1;min-width:0;font-size:12px;color:var(--text-dim);text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl}
+.cl-intro{font-size:12px;color:var(--text-dim);line-height:1.5;margin-bottom:16px;max-width:760px}
+.cl-card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:18px;margin-bottom:14px}
+.cl-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:10px;flex-wrap:wrap}
+.cl-title{font-size:16px;font-weight:700;color:var(--accent)}
+.cl-actions{display:flex;gap:8px;flex-wrap:wrap}
+.cl-folders{font-size:12px;color:var(--text-dim);font-family:'SF Mono',Monaco,monospace;margin-bottom:12px;word-break:break-all}
+.cl-table-wrap{overflow-x:auto}
+.cl-table{width:100%;border-collapse:collapse;font-size:12px;text-align:left}
+.cl-table th{color:var(--text-dim);font-weight:600;padding:6px 8px;border-bottom:1px solid var(--border);white-space:nowrap}
+.cl-table td{padding:8px;border-bottom:1px solid var(--border);vertical-align:top}
+.cl-server{font-weight:600;white-space:nowrap}
+.cl-dim{color:var(--text-dim)}
+.cl-ok{color:var(--ok);font-weight:600}
+.cl-miss{color:var(--danger);font-weight:600}
+.cl-err{color:var(--danger);margin-top:3px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cl-dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:5px;vertical-align:middle}
+.cl-off{background:var(--border)}
+.cl-secret{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:2px 0}
+.cl-name{font-family:'SF Mono',Monaco,monospace}
+.cl-link{background:none;border:none;color:var(--blue);font-size:12px;cursor:pointer;padding:0}
+.cl-link:hover{text-decoration:underline}
+.cl-link-danger{color:var(--danger)}
+.cl-check{max-width:260px;word-break:break-word}
+.cl-section{font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-dim);margin:14px 0 6px}
+.cl-chip{display:inline-block;font-size:12px;padding:2px 8px;border-radius:6px;background:var(--surface);border:1px solid var(--border);margin:0 4px 4px 0}
+.cl-warn{font-size:12px;color:var(--accent);margin-top:6px}
+.cl-row{border:1px solid var(--border);border-radius:10px;padding:10px 12px;margin-bottom:6px}
+.cl-row-head{display:flex;align-items:center;gap:10px}
+.cl-row-name{flex:1;font-weight:600;font-size:13px;word-break:break-all}
+.cl-row select,.cl-input{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:6px 10px;color:var(--text);font-size:12px;outline:none}
+.cl-row select:focus,.cl-input:focus{border-color:var(--accent)}
+.cl-vars{display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:8px;font-size:12px}
+.cl-vars label{display:flex;align-items:center;gap:5px;font-family:'SF Mono',Monaco,monospace}
+.cl-url{width:100%;font-family:'SF Mono',Monaco,monospace;font-size:12px}
+</style>
 </head><body>
 <div class="container" id="main-content">
   <header>
@@ -157,6 +196,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
       <div class="tab active" data-view="servers" onclick="switchView('servers')">Servers</div>
       <div class="tab" data-view="library" onclick="switchView('library')">Library</div>
       <div class="tab" data-view="tools" onclick="switchView('tools')">Tools</div>
+      <div class="tab" data-view="clients" onclick="switchView('clients')">Client accounts</div>
       <div class="tab" data-view="metrics" onclick="switchView('metrics')">Metrics</div>
       <div class="tab" data-view="logs" onclick="switchView('logs')">Logs</div>
       <div class="tab" data-view="settings" onclick="switchView('settings')">Settings</div>
@@ -198,6 +238,17 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
     <div class="tool-list" id="tool-list"></div>
   </div>
 
+  <!-- Client accounts View -->
+  <div id="view-clients" class="hidden">
+    <div class="toolbar">
+      <button class="btn btn-primary" onclick="clientAddOpen()">+ Add client</button>
+      <button class="btn btn-ghost" onclick="fetchClients()">↻ Refresh</button>
+      <div class="cl-path" id="clients-path"></div>
+    </div>
+    <div class="cl-intro">Each client account has its own tokens (in its own Keychain item), its own server instances and its own isolated HOME. It is used automatically when an agent works in one of its folders. Token values are write-only here: they are never shown or sent back to this page.</div>
+    <div id="clients-list"></div>
+  </div>
+
   <!-- Metrics View -->
   <div id="view-metrics" class="hidden">
     <div style="background:var(--card);border:1px solid var(--border);border-radius:14px;padding:20px;margin-bottom:16px">
@@ -224,8 +275,6 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
     <h3 style="margin:20px 0 12px;font-size:15px">Tool Metrics</h3>
     <div id="tool-metrics" style="font-size:12px"></div>
 
-    <h3 style="margin:20px 0 12px;font-size:15px">Tenants</h3>
-    <div id="tenants-list" style="font-size:12px"></div>
   </div>
 
   <!-- Logs View -->
@@ -301,6 +350,42 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
     </div>
   </div>
 
+  <!-- Client accounts modals -->
+  <div class="overlay hidden" id="client-add-modal" onclick="clientHide('client-add-modal')">
+    <div class="modal" onclick="event.stopPropagation()">
+      <div class="modal-head"><h2 class="modal-title">Add client account</h2><button class="modal-close" aria-label="Close" onclick="clientHide('client-add-modal')">✕</button></div>
+      <div class="lib-field"><label for="client-add-id">Id</label><div class="hint">1 to 32 lowercase letters, digits or dashes, for example acme.</div><input id="client-add-id" autocomplete="off" spellcheck="false"></div>
+      <div class="lib-field"><label for="client-add-dir">Folder</label><div class="hint">Absolute path of the client's work folder. Agents working in it use this account.</div><input id="client-add-dir" autocomplete="off" spellcheck="false" placeholder="/Users/me/Clients/Acme"></div>
+      <div class="lib-field"><label for="client-add-project">Project (optional)</label><div class="hint">Project name in projects.json. An existing project keeps its settings; defaults to the id.</div><input id="client-add-project" autocomplete="off" spellcheck="false"></div>
+      <div class="modal-actions"><button class="btn btn-ghost" onclick="clientHide('client-add-modal')">Cancel</button><button class="btn btn-primary" onclick="clientAddSubmit()">Add</button></div>
+    </div>
+  </div>
+  <div class="overlay hidden" id="client-servers-modal" onclick="clientHide('client-servers-modal')">
+    <div class="modal" style="width:640px" onclick="event.stopPropagation()">
+      <div class="modal-head"><h2 class="modal-title" id="client-servers-title">Servers</h2><button class="modal-close" aria-label="Close" onclick="clientHide('client-servers-modal')">✕</button></div>
+      <div class="json-hint"><b>Own tokens</b>: an isolated instance runs with this client's tokens; choose the variables it gets from the client's Keychain. <b>Shared</b>: the server is used as is (documentation, tools without an account). Any other server is refused in the client's folders.</div>
+      <div class="search" style="margin-bottom:10px"><input id="client-servers-filter" placeholder="Filter servers..." oninput="clientServersRender()" aria-label="Filter servers"></div>
+      <div id="client-servers-rows"></div>
+      <div class="modal-actions"><button class="btn btn-ghost" onclick="clientHide('client-servers-modal')">Cancel</button><button class="btn btn-primary" onclick="clientServersSave()">Save</button></div>
+    </div>
+  </div>
+  <div class="overlay hidden" id="client-secret-modal" onclick="clientSecretClose()">
+    <div class="modal" onclick="event.stopPropagation()">
+      <div class="modal-head"><h2 class="modal-title" id="client-secret-title">Set secret</h2><button class="modal-close" aria-label="Close" onclick="clientSecretClose()">✕</button></div>
+      <div class="json-hint" id="client-secret-hint"></div>
+      <div class="lib-field"><label for="client-secret-value">Value</label><input id="client-secret-value" type="password" autocomplete="new-password" spellcheck="false" onkeydown="if(event.key==='Enter')clientSecretSubmit()"></div>
+      <div class="modal-actions"><button class="btn btn-ghost" onclick="clientSecretClose()">Cancel</button><button class="btn btn-primary" onclick="clientSecretSubmit()">Save to Keychain</button></div>
+    </div>
+  </div>
+  <div class="overlay hidden" id="client-oauth-modal" onclick="clientOauthClose()">
+    <div class="modal" onclick="event.stopPropagation()">
+      <div class="modal-head"><h2 class="modal-title" id="client-oauth-title">Connect</h2><button class="modal-close" aria-label="Close" onclick="clientOauthClose()">✕</button></div>
+      <div class="info-box info-fail" style="margin-top:0"><div class="info-title">Open this address in the client's browser profile</div><div class="info-desc">Use a browser profile signed in to the client's account, not yours: the access is saved for whichever account approves it.</div></div>
+      <div class="lib-field" style="margin-top:14px"><label for="client-oauth-url">Sign-in address</label><input id="client-oauth-url" class="cl-input cl-url" readonly onclick="this.select()"></div>
+      <div class="json-hint" id="client-oauth-status">Waiting for the sign-in to complete...</div>
+      <div class="modal-actions"><button class="btn btn-ghost" onclick="clientOauthClose()">Close</button><button class="btn btn-primary" onclick="clientOauthCopy()">Copy address</button></div>
+    </div>
+  </div>
   <div class="toast hidden" id="toast"></div>
 
   <!-- Welcome popup (first visit) -->
@@ -386,8 +471,10 @@ function switchView(view){
   document.getElementById('view-metrics').classList.toggle('hidden',view!=='metrics');
   document.getElementById('view-logs').classList.toggle('hidden',view!=='logs');
   document.getElementById('view-settings').classList.toggle('hidden',view!=='settings');
+  document.getElementById('view-clients').classList.toggle('hidden',view!=='clients');
   if(view==='tools')renderTools();
   if(view==='metrics')fetchMetrics();
+  if(view==='clients')fetchClients();
   if(view==='library'&&!libLoaded)libSearch();
 }
 async function fetchServers(){
@@ -664,25 +751,6 @@ function splitTenant(key){
   return{name,tenant:head.slice(at+1)};
 }
 
-async function fetchTenants(){
-  const box=document.getElementById('tenants-list');
-  try{
-    const res=await fetch('/api/tenants');
-    if(!res.ok){box.textContent='Tenants unavailable.';return}
-    const data=await res.json();
-    if(!data.tenants.length){box.innerHTML='<div style="color:var(--text-dim)">No tenant declared (projects.json).</div>';return}
-    box.innerHTML=data.tenants.map(t=>`<div class="card" style="cursor:default;margin-bottom:8px">
-      <div style="font-weight:600;font-size:14px;margin-bottom:6px">${esc(t.id)} <span style="font-weight:400;color:var(--text-dim)">project ${esc(t.project)}</span></div>
-      <div style="color:var(--text-dim);margin-bottom:6px">${t.workspaces.map(esc).join('<br>')}</div>
-      <table style="width:100%;border-collapse:collapse;text-align:left">
-        <thead><tr style="color:var(--text-dim)"><th scope="col">Server</th><th scope="col">Instance</th><th scope="col">Secrets</th><th scope="col">OAuth</th></tr></thead>
-        <tbody>${t.servers.map(s=>`<tr><td>${esc(s.server)}</td><td>${s.running?'running':'stopped'}</td><td>${s.secrets.length?s.secrets.map(x=>esc(x.name)+(x.present?'':' (missing)')).join(', '):'-'}</td><td>${s.oauth_connected?'connected':'-'}</td></tr>`).join('')}</tbody>
-      </table>
-      ${t.shared_servers.length?`<div style="color:var(--text-dim);margin-top:6px">Shared: ${t.shared_servers.map(esc).join(', ')}</div>`:''}
-    </div>`).join('');
-  }catch(e){box.textContent='Tenants unavailable.'}
-}
-
 async function fetchMetrics(){
   try{
     const res=await fetch('/api/metrics');
@@ -711,7 +779,6 @@ async function fetchMetrics(){
         <tbody>${toolRows.map(([name,t])=>{const k=splitTenant(name);return `<tr><td>${esc(k.name)}</td><td>${k.tenant?esc(k.tenant):'-'}</td><td>${t.calls}</td><td>${t.errors}</td><td>${t.cache_hits}</td><td>${ms(t.p50_ms)}</td><td>${ms(t.p95_ms)}</td></tr>`}).join('')}</tbody>
       </table>`;
 
-    fetchTenants();
     const grid=document.getElementById('metrics-grid');
     if(Object.keys(m.servers).length===0) {
       grid.innerHTML='<div style="color:var(--text-dim);font-size:12px">No calls recorded yet.</div>';
@@ -890,4 +957,217 @@ async function libOauth(server){try{await fetch('/api/oauth/login',{method:'POST
 fetchServers();
 checkWelcome();
 setTimeout(()=>document.body.classList.add('ready'),80);
+
+// ─── Client accounts (tenants) ───────────────────────────────
+// Écran en écriture seule pour les secrets : aucune valeur n'est jamais lue ici.
+let clients=null, clientChecks={}, srvEdit=null, srvTenant=null, secretTarget=null, oauthPoll=null;
+async function api(method,url,body){
+  const opts={method,headers:{'Content-Type':'application/json'}};
+  if(body!==undefined)opts.body=JSON.stringify(body);
+  const r=await fetch(url,opts);
+  let d={};try{d=await r.json()}catch(e){d={}}
+  if(!r.ok)throw new Error(d.error||('HTTP '+r.status));
+  return d;
+}
+function clientShow(id){document.getElementById(id).classList.remove('hidden')}
+function clientHide(id){document.getElementById(id).classList.add('hidden')}
+function tenantUrl(t,suffix){return '/api/tenants/'+encodeURIComponent(t.id)+(suffix||'')}
+async function fetchClients(){
+  const box=document.getElementById('clients-list');
+  try{
+    clients=await api('GET','/api/tenants');
+    // Marques gauche-à-droite : le chemin reste lisible malgré l'ellipse à gauche (direction rtl).
+    document.getElementById('clients-path').textContent=clients.projects_path?'\u200E'+clients.projects_path+'\u200E':'';
+    renderClients();
+  }catch(e){
+    clients=null;
+    box.innerHTML=`<div class="info-box info-fail"><div class="info-title">Client accounts unavailable</div><div class="info-desc">${esc(e.message)}</div></div>`;
+  }
+}
+function fmtExpiry(ms){return ms?' · token valid until '+new Date(ms).toLocaleString():''}
+function renderClients(){
+  const box=document.getElementById('clients-list');
+  let html='';
+  if(clients.config_error)html+=`<div class="info-box info-fail" style="margin-bottom:12px"><div class="info-title">config.json unreadable</div><div class="info-desc">${esc(clients.config_error)}</div></div>`;
+  if(!clients.tenants.length)html+='<div class="cl-card cl-dim">No client account yet.</div>';
+  html+=clients.tenants.map(clientCard).join('');
+  box.innerHTML=html;
+}
+function clientServerRow(t,ti,s,si){
+  const checks=clientChecks[t.id]||{};
+  const run=s.running?'<span class="cl-dot dot-ok"></span>running':'<span class="cl-dot cl-off"></span>stopped';
+  const m=s.metrics?`<div class="cl-dim">${s.metrics.calls} calls, ${s.metrics.errors} errors</div>`:'';
+  const lastErr=s.metrics&&s.metrics.last_error?`<div class="cl-err" title="${esc(s.metrics.last_error)}">${esc(s.metrics.last_error)}</div>`:'';
+  const missingCfg=s.in_config?'':'<div class="cl-err">Not in config.json (or disabled)</div>';
+  const secrets=s.secrets.length?s.secrets.map((k,ki)=>`<div class="cl-secret"><span class="cl-name" title="${esc(k.var)}">${esc(k.name)}</span>${k.present?'<span class="cl-ok">present</span>':'<span class="cl-miss">missing</span>'}<button class="cl-link" onclick="clientSecretOpen(${ti},${si},${ki})">${k.present?'Replace':'Set'}</button>${k.present?`<button class="cl-link cl-link-danger" onclick="clientSecretDelete(${ti},${si},${ki})">Delete</button>`:''}</div>`).join(''):'<span class="cl-dim">none</span>';
+  const o=s.oauth;
+  let oauth='<span class="cl-dim">n/a</span>';
+  if(o.connected)oauth=`<span class="cl-ok">connected</span><span class="cl-dim">${fmtExpiry(o.expires_at)}</span><div><button class="cl-link" onclick="clientOauthConnect(${ti},${si})">Reconnect</button> <button class="cl-link cl-link-danger" onclick="clientOauthLogout(${ti},${si})">Disconnect</button></div>`;
+  else if(o.capable)oauth=`<span class="cl-miss">not connected</span><div><button class="cl-link" onclick="clientOauthConnect(${ti},${si})">Connect</button></div>`;
+  const c=checks[s.server];
+  const check=c?`<span class="${c.ok?'cl-ok':'cl-miss'}">${esc(c.message)}</span>`:'<span class="cl-dim">-</span>';
+  return `<tr><td><div class="cl-server">${icon(s.server)} ${esc(s.server)}</div>${missingCfg}</td><td>${run}${m}${lastErr}</td><td>${secrets}</td><td>${oauth}</td><td class="cl-check">${check}</td></tr>`;
+}
+function clientCfBlock(t){
+  const cf=t.cf||{projects:[]};
+  const declared=(t.servers.find(s=>s.server==='cf-orchestrator')||{secrets:[]}).secrets.map(k=>k.var);
+  const missing=['CLOUDFLARE_API_TOKEN','CLOUDFLARE_ACCOUNT_ID'].filter(v=>!declared.includes(v));
+  let html='<div class="cl-section">Cloudflare deploys (cf-orchestrator, read only)</div>';
+  if(cf.error)return html+`<div class="cl-err" style="white-space:normal;max-width:none">${esc(cf.error)}</div>`;
+  if(!cf.projects.length)return html+'<div class="cl-dim" style="font-size:12px">No cf-orchestrator project marked with this client.</div>';
+  html+=cf.projects.map(p=>`<span class="cl-chip">${esc(p.name)}${p.cf_project_name?` <span class="cl-dim">→ ${esc(p.cf_project_name)}</span>`:''}</span>`).join('');
+  if(missing.length)html+=`<div class="cl-warn">cf-orchestrator needs ${missing.map(esc).join(' and ')} from this client's tokens: add cf-orchestrator under Servers, otherwise these deploys are refused.</div>`;
+  return html;
+}
+function clientCard(t,ti){
+  const rows=t.servers.map((s,si)=>clientServerRow(t,ti,s,si)).join('');
+  const table=t.servers.length?`<div class="cl-table-wrap"><table class="cl-table"><thead><tr><th scope="col">Server</th><th scope="col">Instance</th><th scope="col">Secrets</th><th scope="col">OAuth</th><th scope="col">Check</th></tr></thead><tbody>${rows}</tbody></table></div>`:'<div class="cl-dim" style="font-size:12px">No server with this client\'s own tokens yet: choose them under Servers.</div>';
+  const shared=t.shared_servers.length?t.shared_servers.map(s=>`<span class="cl-chip">${esc(s)}</span>`).join(''):'<span class="cl-dim" style="font-size:12px">none</span>';
+  return `<div class="cl-card">
+    <div class="cl-head"><div><div class="cl-title">${esc(t.id)}</div><div class="cl-dim" style="font-size:12px">project ${esc(t.project)}</div></div>
+      <div class="cl-actions"><button class="btn btn-ghost" onclick="clientServersOpen(${ti})">Servers</button><button class="btn btn-ghost" onclick="clientCheck(${ti})">Check</button><button class="btn btn-danger" onclick="clientRemove(${ti})">Remove</button></div></div>
+    <div class="cl-folders">${t.workspaces.map(esc).join('<br>')}</div>
+    ${table}
+    <div class="cl-section">Shared servers</div>${shared}
+    ${clientCfBlock(t)}
+  </div>`;
+}
+function clientAddOpen(){
+  ['client-add-id','client-add-dir','client-add-project'].forEach(id=>document.getElementById(id).value='');
+  clientShow('client-add-modal');document.getElementById('client-add-id').focus();
+}
+async function clientAddSubmit(){
+  const id=document.getElementById('client-add-id').value.trim();
+  const dir=document.getElementById('client-add-dir').value.trim();
+  const project=document.getElementById('client-add-project').value.trim();
+  if(!/^[a-z0-9-]{1,32}$/.test(id)){notify('Id: 1 to 32 lowercase letters, digits or dashes','danger');return}
+  if(!dir.startsWith('/')){notify('Folder: absolute path expected','danger');return}
+  if(!clients){notify('Reload the screen first','danger');return}
+  try{
+    await api('POST','/api/tenants',{id,dir,project,version:clients.version});
+    clientHide('client-add-modal');notify('Client account '+id+' added');fetchClients();
+  }catch(e){notify(e.message,'danger')}
+}
+function clientServersOpen(ti){
+  const t=clients.tenants[ti];srvTenant=t;
+  const own=Object.fromEntries(t.servers.map(s=>[s.server,s.secrets.map(k=>k.var)]));
+  const avail=Object.fromEntries(clients.available.map(a=>[a.name,a]));
+  const names=[...new Set([...clients.available.map(a=>a.name),...Object.keys(own),...t.shared_servers])].sort((a,b)=>a.localeCompare(b));
+  srvEdit=names.map(name=>{
+    const a=avail[name]||{required:[],optional:[],oauth:false};
+    const current=own[name]||[];
+    const isOwn=Object.prototype.hasOwnProperty.call(own,name);
+    const varNames=[...new Set([...a.required,...a.optional,...current])];
+    return{name,unknown:!avail[name],oauth:a.oauth,mode:isOwn?'own':(t.shared_servers.includes(name)?'shared':'none'),
+      vars:varNames.map(v=>({name:v,required:a.required.includes(v),checked:isOwn?current.includes(v):a.required.includes(v)})),extra:''};
+  });
+  document.getElementById('client-servers-title').textContent='Servers of '+t.id;
+  document.getElementById('client-servers-filter').value='';
+  clientServersRender();clientShow('client-servers-modal');
+}
+function clientServersRender(){
+  const q=document.getElementById('client-servers-filter').value.toLowerCase();
+  document.getElementById('client-servers-rows').innerHTML=srvEdit.map((r,ri)=>{
+    if(q&&!r.name.toLowerCase().includes(q)&&r.mode==='none')return '';
+    const vars=r.mode==='own'?`<div class="cl-vars">${r.vars.length?r.vars.map((v,vi)=>`<label><input type="checkbox" ${v.checked?'checked':''} onchange="srvEdit[${ri}].vars[${vi}].checked=this.checked">${esc(v.name)}${v.required?'':' <span class="cl-dim">(optional)</span>'}</label>`).join(''):`<span class="cl-dim">${r.oauth?'No variable: OAuth sign-in only.':'No variable in its config.'}</span>`}</div>
+      <input class="cl-input" style="margin-top:8px;width:100%" placeholder="Other variables, comma separated" aria-label="Other variables for ${esc(r.name)}" value="${esc(r.extra)}" oninput="srvEdit[${ri}].extra=this.value">`:'';
+    return `<div class="cl-row"><div class="cl-row-head"><div class="cl-row-name">${icon(r.name)} ${esc(r.name)}${r.oauth?'<span class="pill" style="background:var(--accent-dim);color:var(--accent)">OAuth</span>':''}${r.unknown?'<span class="pill pill-red">not in config.json</span>':''}</div>
+      <select aria-label="Use of ${esc(r.name)}" onchange="srvEdit[${ri}].mode=this.value;clientServersRender()">
+        <option value="none" ${r.mode==='none'?'selected':''}>Not used</option>
+        <option value="own" ${r.mode==='own'?'selected':''}>Own tokens</option>
+        <option value="shared" ${r.mode==='shared'?'selected':''}>Shared</option>
+      </select></div>${vars}</div>`;
+  }).join('');
+}
+async function clientServersSave(){
+  const servers={},shared=[];
+  for(const r of srvEdit){
+    if(r.mode==='own'){
+      const vars=r.vars.filter(v=>v.checked).map(v=>v.name);
+      for(const v of r.extra.split(/[\s,]+/).filter(Boolean)){
+        if(!/^[A-Za-z_][A-Za-z0-9_]*$/.test(v)){notify('Invalid variable name: '+v,'danger');return}
+        if(!vars.includes(v))vars.push(v);
+      }
+      servers[r.name]=vars;
+    }else if(r.mode==='shared')shared.push(r.name);
+  }
+  try{
+    await api('PUT',tenantUrl(srvTenant,'/servers'),{servers,shared,version:clients.version});
+    clientHide('client-servers-modal');notify('Servers of '+srvTenant.id+' saved');fetchClients();
+  }catch(e){notify(e.message,'danger')}
+}
+function clientSecretOpen(ti,si,ki){
+  const t=clients.tenants[ti],k=t.servers[si].secrets[ki];
+  secretTarget={t,k};
+  document.getElementById('client-secret-title').textContent=(k.present?'Replace ':'Set ')+k.name;
+  document.getElementById('client-secret-hint').textContent='Client '+t.id+'. The value goes to this client\'s Keychain item. It is never shown again, never sent back to this page and never logged.';
+  const input=document.getElementById('client-secret-value');input.value='';
+  clientShow('client-secret-modal');input.focus();
+}
+function clientSecretClose(){document.getElementById('client-secret-value').value='';secretTarget=null;clientHide('client-secret-modal')}
+async function clientSecretSubmit(){
+  const input=document.getElementById('client-secret-value');
+  const value=input.value;
+  if(!secretTarget||!value){notify('Enter a value','danger');return}
+  const {t,k}=secretTarget;
+  if(k.present&&!confirm('Replace the existing '+k.name+' of client '+t.id+'? The old value is lost.'))return;
+  input.value='';
+  try{
+    await api('PUT',tenantUrl(t,'/secrets/'+encodeURIComponent(k.name)),{value});
+    clientSecretClose();notify(k.name+' saved for '+t.id);fetchClients();
+  }catch(e){notify(e.message,'danger')}
+}
+async function clientSecretDelete(ti,si,ki){
+  const t=clients.tenants[ti],k=t.servers[si].secrets[ki];
+  if(!confirm('Delete '+k.name+' from the Keychain of client '+t.id+'? This cannot be undone.'))return;
+  try{await api('DELETE',tenantUrl(t,'/secrets/'+encodeURIComponent(k.name)));notify(k.name+' deleted');fetchClients()}catch(e){notify(e.message,'danger')}
+}
+async function clientOauthConnect(ti,si){
+  const t=clients.tenants[ti],s=t.servers[si];
+  try{
+    const d=await api('POST','/api/oauth/login',{server:s.server,tenant:t.id});
+    document.getElementById('client-oauth-title').textContent='Connect '+s.server+' for '+t.id;
+    document.getElementById('client-oauth-url').value=d.url;
+    document.getElementById('client-oauth-status').textContent='Waiting for the sign-in to complete...';
+    clientShow('client-oauth-modal');
+    const started=Date.now();
+    clearInterval(oauthPoll);
+    oauthPoll=setInterval(async()=>{
+      if(Date.now()-started>5*60*1000){clearInterval(oauthPoll);document.getElementById('client-oauth-status').textContent='No sign-in received after 5 minutes: start again with Connect.';return}
+      try{
+        const fresh=await api('GET','/api/tenants');
+        const ft=fresh.tenants.find(x=>x.id===t.id);const fs=ft&&ft.servers.find(x=>x.server===s.server);
+        if(fs&&fs.oauth.connected&&!(s.oauth.connected&&fs.oauth.expires_at===s.oauth.expires_at)){
+          clients=fresh;renderClients();clientOauthClose();notify(s.server+' connected for '+t.id);
+        }
+      }catch(e){document.getElementById('client-oauth-status').textContent=e.message}
+    },3000);
+  }catch(e){notify(e.message,'danger')}
+}
+function clientOauthClose(){clearInterval(oauthPoll);oauthPoll=null;document.getElementById('client-oauth-url').value='';clientHide('client-oauth-modal')}
+async function clientOauthCopy(){
+  const input=document.getElementById('client-oauth-url');
+  try{await navigator.clipboard.writeText(input.value);notify('Address copied')}catch(e){input.select();notify('Select the address and copy it','danger')}
+}
+async function clientOauthLogout(ti,si){
+  const t=clients.tenants[ti],s=t.servers[si];
+  if(!confirm('Disconnect '+s.server+' for client '+t.id+'? Its tokens are deleted from the client\'s Keychain.'))return;
+  try{await api('POST','/api/oauth/logout',{server:s.server,tenant:t.id});notify(s.server+' disconnected');fetchClients()}catch(e){notify(e.message,'danger')}
+}
+async function clientCheck(ti){
+  const t=clients.tenants[ti];
+  try{
+    const d=await api('POST',tenantUrl(t,'/check'));
+    clientChecks[t.id]=Object.fromEntries(d.results.map(r=>[r.server,r]));
+    renderClients();
+    const failed=d.results.filter(r=>!r.ok).length;
+    notify(failed?failed+' server(s) cannot start for '+t.id:'All servers of '+t.id+' can start',failed?'danger':'success');
+  }catch(e){notify(e.message,'danger')}
+}
+async function clientRemove(ti){
+  const t=clients.tenants[ti];
+  if(!confirm('Remove client account '+t.id+'? Its tokens are erased from the Keychain. You will confirm in a macOS dialog.'))return;
+  notify('Confirm in the macOS dialog');
+  try{await api('DELETE',tenantUrl(t,'?version='+encodeURIComponent(clients.version)));delete clientChecks[t.id];notify('Client account '+t.id+' removed');fetchClients()}catch(e){notify(e.message,'danger')}
+}
 </script></body></html>

@@ -51,6 +51,15 @@ fn recent_denials() -> std::sync::MutexGuard<'static, HashMap<String, Instant>> 
         .unwrap_or_else(|e| e.into_inner())
 }
 
+/// Fenêtre de confirmation native ouverte hors d'un appel d'outil (tableau de bord) : les
+/// serveurs capables de piloter l'ordinateur sont mis en pause pendant ce temps aussi.
+pub async fn ask_human(message: String, timeout_secs: u64) -> crate::confirm_dialog::DialogAnswer {
+    DIALOG_OPEN.store(true, std::sync::atomic::Ordering::SeqCst);
+    let answer = crate::confirm_dialog::ask(message, timeout_secs).await;
+    DIALOG_OPEN.store(false, std::sync::atomic::Ordering::SeqCst);
+    answer
+}
+
 /// Profil actif : celui de la requête HTTP, sinon la variable MCPHUB_PROFILE (mode stdio).
 pub fn current_profile() -> Option<String> {
     REQUEST_PROFILE
@@ -341,6 +350,18 @@ impl ProxyServer {
     /// Instance de tenant en cours d'exécution (tableau de bord).
     pub async fn instance_running(&self, instance: &str) -> bool {
         self.child_manager.is_running(instance).await
+    }
+
+    /// Arrête les instances du tenant et oublie leurs configs : le prochain appel relit son
+    /// coffre et projects.json (après un secret écrit, des serveurs modifiés ou un retrait).
+    pub async fn reset_tenant(&self, tenant: &str) {
+        self.tenants.forget_tenant(tenant);
+        self.child_manager.remove_tenant_instances(tenant).await;
+    }
+
+    /// Action faite depuis le tableau de bord, notée au journal d'audit (jamais de valeur).
+    pub async fn record_dashboard_audit(&self, entry: AuditEntry) {
+        self.record_audit(entry).await;
     }
 
     pub fn in_flight(&self) -> usize {
