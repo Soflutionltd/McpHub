@@ -31,7 +31,7 @@ install: build
 	fi
 	@echo ""
 	@echo "✓ Installed: $(BIN)"
-	@$(BIN) help | head -2
+	@$(BIN) version
 
 dev: install
 	@echo "Reload Cursor to pick up changes."
