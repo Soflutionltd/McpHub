@@ -34,7 +34,8 @@ const MAX_DIALOGS_PER_RUN: usize = 3;
 
 /// Une fenêtre de confirmation est ouverte : les serveurs capables de piloter l'ordinateur
 /// (et donc de cliquer « Autoriser » à la place de l'utilisateur) sont mis en pause.
-static DIALOG_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Compteur (et non booléen) : la première fenêtre fermée ne lève pas la pause des autres.
+static DIALOG_OPEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn controls_computer(server: &str) -> bool {
     let s = server.to_ascii_lowercase();
@@ -54,9 +55,9 @@ fn recent_denials() -> std::sync::MutexGuard<'static, HashMap<String, Instant>> 
 /// Fenêtre de confirmation native ouverte hors d'un appel d'outil (tableau de bord) : les
 /// serveurs capables de piloter l'ordinateur sont mis en pause pendant ce temps aussi.
 pub async fn ask_human(message: String, timeout_secs: u64) -> crate::confirm_dialog::DialogAnswer {
-    DIALOG_OPEN.store(true, std::sync::atomic::Ordering::SeqCst);
+    DIALOG_OPEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let answer = crate::confirm_dialog::ask(message, timeout_secs).await;
-    DIALOG_OPEN.store(false, std::sync::atomic::Ordering::SeqCst);
+    DIALOG_OPEN.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     answer
 }
 
@@ -480,7 +481,7 @@ impl ProxyServer {
         decision: crate::permissions::Decision,
     ) -> PolicyGate {
         let GateTarget { mode, server, instance, tool, arguments } = target;
-        if DIALOG_OPEN.load(std::sync::atomic::Ordering::SeqCst) && controls_computer(server) {
+        if DIALOG_OPEN.load(std::sync::atomic::Ordering::SeqCst) > 0 && controls_computer(server) {
             return PolicyGate::Respond(JsonRpcResponse::error(
                 id.clone(),
                 -32001,
@@ -595,9 +596,9 @@ impl ProxyServer {
                     let preview = crate::audit::safe_arguments(arguments);
                     let message =
                         crate::confirm_dialog::build_message(instance, tool, &reason, &preview, &origin);
-                    DIALOG_OPEN.store(true, std::sync::atomic::Ordering::SeqCst);
+                    DIALOG_OPEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let answer = crate::confirm_dialog::ask(message, permissions.dialog_timeout_secs).await;
-                    DIALOG_OPEN.store(false, std::sync::atomic::Ordering::SeqCst);
+                    DIALOG_OPEN.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     match answer {
                         crate::confirm_dialog::DialogAnswer::Allow => {
                             return PolicyGate::Proceed {
