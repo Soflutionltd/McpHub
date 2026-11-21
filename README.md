@@ -213,7 +213,7 @@ From a clone instead: `cd client && npm ci`, then point `args` at `/path/to/McpH
 
 ### Working on client accounts
 
-Connecting to a client's Stripe (or Supabase, Cloudflare…) should not log you out of your own, and your own agent should never reach theirs by mistake. Two levels, from light to strict:
+Connecting to a client's Stripe (or Supabase, Cloudflare…) should not log you out of your own, and your own agent should never reach theirs by mistake. Three levels, from light to strict:
 
 **1. Client-owned servers (same McpHub).** Add the client's server under its own name (`stripe-acme`, with its own OAuth token or restricted key, since tokens are stored per server name) and list it in the client project's `ownedServers`:
 
@@ -228,7 +228,44 @@ Connecting to a client's Stripe (or Supabase, Cloudflare…) should not log you 
 
 An owned server only answers, appears in `mcphub_search` and in `mcphub_status` when `working_dir` is inside that client's workspace; the `project` argument alone is not enough. A server owned by two projects is a start-up error. This guard lives in the Node client: an editor connected straight to the daemon still sees every server, so give it a profile with `"excludeServers": ["*-acme"]`.
 
-**2. A separate instance (nothing shared).** For clients who require it, run a second McpHub with its own folder, port, Keychain service, auth token and LaunchAgent:
+**2. Tenants (same McpHub, the client's own tokens, enforced by the daemon).** Mark the client's project as a tenant and declare, server by server, which secrets of *its* vault replace yours:
+
+```bash
+McpHub tenant add acme --dir "/Users/you/Clients/Acme"      # writes projects.json (backup first)
+McpHub vault set --tenant acme SUPABASE_ACCESS_TOKEN         # Keychain service McpHub-tenant-acme
+McpHub vault set --tenant acme CLOUDFLARE_MCP_TOKEN
+McpHub oauth login --tenant acme stripe                      # prints the URL, never opens your browser
+McpHub tenant check acme                                     # can every instance start?
+```
+
+```json
+"acme": {
+  "workspaces": ["/Users/you/Clients/Acme"],
+  "aliases": { "product": "Acme" },
+  "tenant": "acme",
+  "credentials": {
+    "supabase": { "SUPABASE_ACCESS_TOKEN": "vault:acme/SUPABASE_ACCESS_TOKEN" },
+    "cloudflare-api": { "CLOUDFLARE_MCP_TOKEN": "vault:acme/CLOUDFLARE_MCP_TOKEN" },
+    "stripe": {}
+  },
+  "keepEnv": { "supabase": ["NODE_OPTIONS"] },
+  "sharedServers": ["context7", "svelte", "MemoryPilot"]
+}
+```
+
+From a folder of that project, a call to `supabase` runs `supabase@acme`: a separate process started from the same `config.json` entry, with the client's token. The daemon decides, not the client: it reads `projects.json` itself and derives the tenant from the folders the client sends with every call (`working_dir`, else the folder the agent was started in). Rules:
+
+- From a tenant folder, only the servers listed in `credentials` (as `server@tenant`) and in `sharedServers` answer. Every other server is refused, never silently served with your accounts. A client started in a tenant folder cannot aim `working_dir` elsewhere.
+- Without a known folder, or from any other folder, a tenant instance is unreachable, and no name (`supabase@acme`) reaches it: not `mcphub_call`, not passthrough, not the dashboard.
+- A tenant instance gets an allow-listed environment only: the base system variables, its secrets, `PATH` and the names in `keepEnv`. A literal value of yours (a `.p8` key path) is dropped, `inheritEnv` and the SSH agent are never passed, and a `${VAR}` its vault does not provide stops it from starting. `HOME` and `XDG_*` point to `~/Library/Application Support/McpHub/tenants/<id>/home`, so CLI logins saved on disk (gh, wrangler, supabase) are not yours. `MCPHUB_TENANT=<id>` tells the server which tenant it serves.
+- Tenant secrets live in their own Keychain service (`McpHub-tenant-<id>`, index in `~/.McpHub/tenants/<id>/`), are read when the instance starts and never loaded into the daemon environment. OAuth tokens of `stripe@acme` are stored there too; `oauth login --tenant` prints the authorization URL so you open it in a browser profile signed in to the client's account. A tenant instance never starts an OAuth sign-in by itself.
+- Cached answers, metrics and the audit log are per instance: `McpHub audit --tenant acme`, a `tenant` field in `audit.jsonl`, a Tenant column and a Tenants panel in the dashboard (read-only, secret names only).
+- `McpHub tenant rm acme` erases every secret and OAuth token of the tenant, its isolated `HOME`, then removes `tenant`, `credentials`, `keepEnv` and `sharedServers` from the project (asks you to retype the id, or `--yes`).
+- An invalid `projects.json` refuses every call that carries a folder. The client refuses calls from a tenant folder when the daemon is too old to isolate tenants.
+
+This protects against agent and configuration mistakes, not against a malicious local process, which can claim any folder and read your Keychain with your session.
+
+**3. A separate instance (nothing shared).** For clients who require it, run a second McpHub with its own folder, port, Keychain service, auth token and LaunchAgent:
 
 ```bash
 export MCPHUB_INSTANCE=acme MCPHUB_PORT=24690
@@ -560,14 +597,15 @@ McpHub search "send email"
 McpHub dashboard          # open the dashboard (one-time link)
 McpHub logs               # follow the daemon log
 McpHub add                # interactive server wizard
-McpHub vault ...          # Keychain secrets: status, list, set, get, rm, migrate
+McpHub vault ...          # Keychain secrets: status, list, set, get, rm, migrate (--tenant ID)
+McpHub tenant ...         # client accounts: add ID --dir DIR, list, check ID, rm ID
 McpHub registry ...       # Library: search, info, install, uninstall, sync
 McpHub sync ...           # export / import to another machine, secrets encrypted
-McpHub oauth ...          # remote servers: status, login, logout, migrate
+McpHub oauth ...          # remote servers: status, login, logout, migrate (--tenant ID)
 McpHub pins ...           # tool pinning: status, approve, reset, scan
 McpHub sandbox [show S]   # server isolation
 McpHub policy test S T    # which permission applies
-McpHub audit --tail 50    # recent calls
+McpHub audit --tail 50    # recent calls (--tenant ID)
 McpHub update [--check]   # install the latest signed release now (automatic otherwise)
 McpHub version | help
 ```

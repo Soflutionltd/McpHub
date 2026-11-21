@@ -10,6 +10,17 @@
         "cloudflareProject": "demo-web"
       },
       "allowedServers": ["MemoryPilot", "supabase", "cloudflare", "context7", "github"]
+    },
+    "acme": {
+      "workspaces": ["/Users/you/Clients/Acme"],
+      "aliases": { "product": "Acme" },
+      "tenant": "acme",
+      "credentials": {
+        "supabase": { "SUPABASE_ACCESS_TOKEN": "vault:acme/SUPABASE_ACCESS_TOKEN" },
+        "cloudflare-api": { "CLOUDFLARE_MCP_TOKEN": "vault:acme/CLOUDFLARE_MCP_TOKEN" },
+        "stripe": {}
+      },
+      "sharedServers": ["context7", "MemoryPilot"]
     }
   }
 }
