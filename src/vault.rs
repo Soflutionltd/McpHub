@@ -14,8 +14,49 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+/// Périmètre d'un secret : le coffre de McpHub (Soflution) ou celui d'un tenant.
+/// Chaque tenant a son propre service du Trousseau et son propre index : effacer un tenant
+/// ne touche jamais aux secrets Soflution, et l'inverse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Scope {
+    Hub,
+    Tenant(String),
+}
+
+impl Scope {
+    pub fn service(&self) -> String {
+        let base = crate::instance::current().vault_service.clone();
+        match self {
+            Scope::Hub => base,
+            Scope::Tenant(id) => format!("{}-tenant-{}", base, id),
+        }
+    }
+
+    fn dir(&self) -> PathBuf {
+        match self {
+            Scope::Hub => crate::instance::hub_dir(),
+            Scope::Tenant(id) => crate::tenant::tenant_dir(id),
+        }
+    }
+
+    fn index_path(&self) -> PathBuf {
+        self.dir().join("vault-index.json")
+    }
+
+    fn secrets_env_path(&self) -> PathBuf {
+        self.dir().join("secrets.env")
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            Scope::Hub => "McpHub".into(),
+            Scope::Tenant(id) => format!("tenant {}", id),
+        }
+    }
+}
+
 fn service() -> String {
-    crate::instance::current().vault_service.clone()
+    Scope::Hub.service()
 }
 
 /// Trousseau explicite (tests, ou trousseau dédié). Par défaut : trousseau de session.
@@ -27,19 +68,15 @@ fn keychain_args() -> Vec<String> {
         .collect()
 }
 
-fn mcphub_dir() -> Option<PathBuf> {
-    Some(crate::instance::hub_dir())
-}
-
-fn index_path() -> Option<PathBuf> {
-    mcphub_dir().map(|d| d.join("vault-index.json"))
-}
-
 pub fn secrets_env_path() -> Option<PathBuf> {
-    mcphub_dir().map(|d| d.join("secrets.env"))
+    Some(Scope::Hub.secrets_env_path())
 }
 
+/// `MCPHUB_VAULT_BACKEND=file` force le coffre fichier (tests, machines sans Trousseau).
 pub fn is_available() -> bool {
+    if std::env::var("MCPHUB_VAULT_BACKEND").is_ok_and(|v| v == "file") {
+        return false;
+    }
     cfg!(target_os = "macos") && std::path::Path::new("/usr/bin/security").exists()
 }
 
@@ -58,13 +95,14 @@ pub fn is_valid_name(name: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 pub fn list_names() -> Vec<String> {
+    list_names_in(&Scope::Hub)
+}
+
+pub fn list_names_in(scope: &Scope) -> Vec<String> {
     if !is_available() {
-        return file_backend::read().into_iter().map(|(k, _)| k).collect();
+        return file_backend::read(scope).into_iter().map(|(k, _)| k).collect();
     }
-    let path = match index_path() {
-        Some(p) => p,
-        None => return Vec::new(),
-    };
+    let path = scope.index_path();
     let content = match fs::read_to_string(&path) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
@@ -86,13 +124,13 @@ pub fn list_names() -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn save_names(names: &BTreeSet<String>) -> Result<(), String> {
-    let path = index_path().ok_or("dossier ~/.McpHub introuvable")?;
+fn save_names(scope: &Scope, names: &BTreeSet<String>) -> Result<(), String> {
+    let path = scope.index_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let json = serde_json::json!({
-        "service": service(),
+        "service": scope.service(),
         "note": "Noms des secrets stockes dans le Trousseau macOS. Aucune valeur ici.",
         "keys": names.iter().collect::<Vec<_>>(),
     });
@@ -108,8 +146,8 @@ fn save_names(names: &BTreeSet<String>) -> Result<(), String> {
 }
 
 /// Lecture-modification-écriture de l'index sous verrou inter-processus.
-fn update_names(f: impl FnOnce(&mut BTreeSet<String>)) -> Result<(), String> {
-    let path = index_path().ok_or("dossier ~/.McpHub introuvable")?;
+fn update_names(scope: &Scope, f: impl FnOnce(&mut BTreeSet<String>)) -> Result<(), String> {
+    let path = scope.index_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -120,21 +158,21 @@ fn update_names(f: impl FnOnce(&mut BTreeSet<String>)) -> Result<(), String> {
         .open(path.with_extension("json.lock"))
         .map_err(|e| e.to_string())?;
     lock.lock().map_err(|e| e.to_string())?;
-    let mut names: BTreeSet<String> = list_names().into_iter().collect();
+    let mut names: BTreeSet<String> = list_names_in(scope).into_iter().collect();
     f(&mut names);
-    let res = save_names(&names);
+    let res = save_names(scope, &names);
     let _ = lock.unlock();
     res
 }
 
-fn add_name(name: &str) -> Result<(), String> {
-    update_names(|names| {
+fn add_name(scope: &Scope, name: &str) -> Result<(), String> {
+    update_names(scope, |names| {
         names.insert(name.to_string());
     })
 }
 
-fn remove_name(name: &str) -> Result<(), String> {
-    update_names(|names| {
+fn remove_name(scope: &Scope, name: &str) -> Result<(), String> {
+    update_names(scope, |names| {
         names.remove(name);
     })
 }
@@ -153,8 +191,12 @@ pub fn restrict_permissions(_path: &std::path::Path) {}
 // ---------------------------------------------------------------------------
 
 pub fn get(name: &str) -> Result<Option<String>, String> {
+    get_in(&Scope::Hub, name)
+}
+
+pub fn get_in(scope: &Scope, name: &str) -> Result<Option<String>, String> {
     if !is_available() {
-        return Ok(file_backend::read().into_iter().find(|(k, _)| k == name).map(|(_, v)| v));
+        return Ok(file_backend::read(scope).into_iter().find(|(k, _)| k == name).map(|(_, v)| v));
     }
     if !is_valid_name(name) {
         return Err(format!("nom invalide: {}", name));
@@ -162,7 +204,7 @@ pub fn get(name: &str) -> Result<Option<String>, String> {
     // -g écrit la valeur sur stderr sous la forme `password: "texte"` ou, pour les
     // caractères non ASCII, `password: 0xC3A9...  "..."` : on décode l'hexadécimal.
     let out = Command::new("/usr/bin/security")
-        .args(["find-generic-password", "-s", &service(), "-a", name, "-g"])
+        .args(["find-generic-password", "-s", &scope.service(), "-a", name, "-g"])
         .args(keychain_args())
         .stdin(Stdio::null())
         .output()
@@ -228,6 +270,10 @@ fn quote_for_security(s: &str) -> String {
 }
 
 pub fn set(name: &str, value: &str) -> Result<(), String> {
+    set_in(&Scope::Hub, name, value)
+}
+
+pub fn set_in(scope: &Scope, name: &str, value: &str) -> Result<(), String> {
     if !is_valid_name(name) {
         return Err(format!("nom invalide: {}", name));
     }
@@ -238,16 +284,16 @@ pub fn set(name: &str, value: &str) -> Result<(), String> {
         return Err("valeur sur plusieurs lignes non prise en charge".into());
     }
     if !is_available() {
-        return file_backend::upsert(name, Some(value)).map(|_| ());
+        return file_backend::upsert(scope, name, Some(value)).map(|_| ());
     }
     // La commande passe par l'entrée standard de `security -i` : la valeur n'apparaît
     // jamais dans les arguments du processus (invisible pour `ps`).
     // -U : met à jour l'élément s'il existe déjà.
     let mut command = format!(
         "add-generic-password -U -s {} -a {} -l {} -w {}",
-        quote_for_security(&service()),
+        quote_for_security(&scope.service()),
         quote_for_security(name),
-        quote_for_security(&format!("McpHub: {}", name)),
+        quote_for_security(&format!("McpHub ({}): {}", scope.label(), name)),
         quote_for_security(value)
     );
     for k in keychain_args() {
@@ -269,8 +315,8 @@ pub fn set(name: &str, value: &str) -> Result<(), String> {
     }
     let out = child.wait_with_output().map_err(|e| e.to_string())?;
     // `security -i` renvoie 0 même si la commande échoue : on vérifie en relisant.
-    match get(name) {
-        Ok(Some(read_back)) if read_back == value => add_name(name),
+    match get_in(scope, name) {
+        Ok(Some(read_back)) if read_back == value => add_name(scope, name),
         Ok(Some(_)) => Err("relecture differente apres ecriture".into()),
         Ok(None) => Err(format!(
             "echec d'ecriture dans le Trousseau: {}",
@@ -280,15 +326,15 @@ pub fn set(name: &str, value: &str) -> Result<(), String> {
     }
 }
 
-pub fn delete(name: &str) -> Result<bool, String> {
+pub fn delete_in(scope: &Scope, name: &str) -> Result<bool, String> {
     if !is_available() {
-        return file_backend::upsert(name, None);
+        return file_backend::upsert(scope, name, None);
     }
     if !is_valid_name(name) {
         return Err(format!("nom invalide: {}", name));
     }
     let out = Command::new("/usr/bin/security")
-        .args(["delete-generic-password", "-s", &service(), "-a", name])
+        .args(["delete-generic-password", "-s", &scope.service(), "-a", name])
         .args(keychain_args())
         .stdin(Stdio::null())
         .output()
@@ -301,7 +347,51 @@ pub fn delete(name: &str) -> Result<bool, String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    remove_name(name)?;
+    remove_name(scope, name)?;
+    Ok(removed)
+}
+
+/// Efface tout le coffre d'un tenant : chaque nom de l'index, puis tout élément restant du
+/// service (créé hors index), puis l'index lui-même. Renvoie le nombre d'éléments effacés.
+/// Refuse le coffre McpHub : seul un tenant s'efface en bloc.
+pub fn purge(scope: &Scope) -> Result<usize, String> {
+    if *scope == Scope::Hub {
+        return Err("le coffre McpHub ne s'efface pas en bloc".into());
+    }
+    let mut removed = 0;
+    for name in list_names_in(scope) {
+        if delete_in(scope, &name)? {
+            removed += 1;
+        }
+    }
+    if is_available() {
+        // Éléments du service absents de l'index : on les retire un par un jusqu'au code 44.
+        for _ in 0..1000 {
+            let out = Command::new("/usr/bin/security")
+                .args(["delete-generic-password", "-s", &scope.service()])
+                .args(keychain_args())
+                .stdin(Stdio::null())
+                .output()
+                .map_err(|e| e.to_string())?;
+            if !out.status.success() {
+                if out.status.code() == Some(44) {
+                    break;
+                }
+                return Err(format!(
+                    "suppression refusee par le Trousseau: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+            removed += 1;
+        }
+    }
+    for path in [scope.index_path(), scope.secrets_env_path()] {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("{} : {}", path.display(), e)),
+        }
+    }
     Ok(removed)
 }
 
@@ -361,16 +451,18 @@ mod file_backend {
     use std::fs;
     use std::io::Write;
 
-    pub fn read() -> Vec<(String, String)> {
-        super::secrets_env_path()
-            .and_then(|p| fs::read_to_string(p).ok())
+    use super::Scope;
+
+    pub fn read(scope: &Scope) -> Vec<(String, String)> {
+        fs::read_to_string(scope.secrets_env_path())
+            .ok()
             .map(|c| super::parse_env_file(&c))
             .unwrap_or_default()
     }
 
     /// Ajoute, remplace (Some) ou retire (None) une variable. Renvoie vrai si elle existait.
-    pub fn upsert(name: &str, value: Option<&str>) -> Result<bool, String> {
-        let path = super::secrets_env_path().ok_or("dossier ~/.McpHub introuvable")?;
+    pub fn upsert(scope: &Scope, name: &str, value: Option<&str>) -> Result<bool, String> {
+        let path = scope.secrets_env_path();
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
@@ -493,7 +585,19 @@ fn atty_stdin() -> bool {
 // ---------------------------------------------------------------------------
 
 pub fn run_cli(args: &[String]) {
+    // `--tenant <id>` : le coffre de ce tenant au lieu de celui de McpHub.
+    let (scope, args) = match crate::tenant::take_tenant_flag(args) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(2);
+        }
+    };
     let sub = args.first().map(|s| s.as_str()).unwrap_or("status");
+    if scope != Scope::Hub && matches!(sub, "status" | "migrate") {
+        eprintln!("'{}' ne concerne que le coffre McpHub (sans --tenant).", sub);
+        std::process::exit(2);
+    }
     if !is_available() && matches!(sub, "status" | "migrate") {
         // Hors macOS : le coffre est secrets.env (mode 600, caché aux serveurs isolés).
         let p = crate::instance::hub_dir().join("secrets.env");
@@ -503,20 +607,20 @@ pub fn run_cli(args: &[String]) {
     }
     match sub {
         "status" => cli_status(),
-        "list" | "ls" => cli_list(),
+        "list" | "ls" => cli_list(&scope),
         "set" | "add" => match args.get(1) {
-            Some(name) => cli_set(name),
+            Some(name) => cli_set(&scope, name),
             None => {
-                eprintln!("Usage: McpHub vault set NOM   (la valeur est lue sur l'entree standard)")
+                eprintln!("Usage: McpHub vault set [--tenant ID] NOM   (la valeur est lue sur l'entree standard)")
             }
         },
         "get" => match args.get(1) {
-            Some(name) => cli_get(name, args.iter().any(|a| a == "--reveal")),
-            None => eprintln!("Usage: McpHub vault get NOM [--reveal]"),
+            Some(name) => cli_get(&scope, name, args.iter().any(|a| a == "--reveal")),
+            None => eprintln!("Usage: McpHub vault get [--tenant ID] NOM [--reveal]"),
         },
         "rm" | "delete" | "remove" => match args.get(1) {
-            Some(name) => cli_rm(name),
-            None => eprintln!("Usage: McpHub vault rm NOM"),
+            Some(name) => cli_rm(&scope, name),
+            None => eprintln!("Usage: McpHub vault rm [--tenant ID] NOM"),
         },
         "migrate" => cli_migrate(),
         _ => print_help(),
@@ -534,6 +638,9 @@ fn print_help() {
   McpHub vault get NOM        Affiche la valeur masquee (--reveal pour la valeur complete)
   McpHub vault rm NOM         Supprime un secret
   McpHub vault migrate        Copie secrets.env dans le Trousseau, verifie, puis renomme secrets.env
+
+  --tenant ID (avec list, set, get, rm) : coffre isole du tenant ID (service "McpHub-tenant-ID"),
+  jamais charge dans l'environnement du demon. ex. : McpHub vault set --tenant acme SUPABASE_ACCESS_TOKEN
 
 Dans config.json, les secrets s'utilisent comme avant : "${{NOM}}".
 Redemarrer le daemon apres une modification : McpHub uninstall && McpHub install"#
@@ -558,14 +665,17 @@ fn cli_status() {
     }
 }
 
-fn cli_list() {
-    let names = list_names();
+fn cli_list(scope: &Scope) {
+    let names = list_names_in(scope);
     if names.is_empty() {
-        println!("Coffre vide. 'McpHub vault migrate' pour importer secrets.env.");
+        match scope {
+            Scope::Hub => println!("Coffre vide. 'McpHub vault migrate' pour importer secrets.env."),
+            Scope::Tenant(_) => println!("Coffre du {} vide.", scope.label()),
+        }
         return;
     }
     for name in names {
-        let state = match get(&name) {
+        let state = match get_in(scope, &name) {
             Ok(Some(_)) => "ok",
             _ => "INTROUVABLE dans le Trousseau",
         };
@@ -573,7 +683,7 @@ fn cli_list() {
     }
 }
 
-fn cli_set(name: &str) {
+fn cli_set(scope: &Scope, name: &str) {
     if !is_valid_name(name) {
         eprintln!("Nom invalide : lettres, chiffres et _ uniquement (ex. GITHUB_TOKEN).");
         return;
@@ -585,14 +695,14 @@ fn cli_set(name: &str) {
             return;
         }
     };
-    match set(name, &value) {
-        Ok(()) => println!("{} enregistre dans le Trousseau ({}).", name, mask(&value)),
+    match set_in(scope, name, &value) {
+        Ok(()) => println!("{} enregistre dans le coffre {} ({}).", name, scope.label(), mask(&value)),
         Err(e) => eprintln!("Erreur : {}", e),
     }
 }
 
-fn cli_get(name: &str, reveal: bool) {
-    match get(name) {
+fn cli_get(scope: &Scope, name: &str, reveal: bool) {
+    match get_in(scope, name) {
         Ok(Some(v)) if reveal => println!("{}", v),
         Ok(Some(v)) => println!("{} = {}", name, mask(&v)),
         Ok(None) => eprintln!("{} introuvable dans le Trousseau.", name),
@@ -600,8 +710,8 @@ fn cli_get(name: &str, reveal: bool) {
     }
 }
 
-fn cli_rm(name: &str) {
-    match delete(name) {
+fn cli_rm(scope: &Scope, name: &str) {
+    match delete_in(scope, name) {
         Ok(true) => println!("{} supprime.", name),
         Ok(false) => println!(
             "{} n'etait pas dans le Trousseau (retire de l'index).",

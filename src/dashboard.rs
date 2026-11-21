@@ -633,6 +633,85 @@ fn handle_get_settings() -> Vec<u8> {
     json_ok(settings)
 }
 
+/// Tenant déclaré et serveur qui lui appartient.
+fn tenant_server(server: &str, tenant: &str) -> Result<crate::tenant::TenantDef, String> {
+    let tenants = crate::tenant::load_from(&crate::tenant::projects_path())?;
+    let def = tenants.get(tenant).ok_or_else(|| format!("tenant {} inconnu", tenant))?;
+    if !def.owns(server) {
+        return Err(format!("{} n'est pas un serveur du tenant {}", server, tenant));
+    }
+    Ok(def.clone())
+}
+
+/// Connexion OAuth d'un serveur pour un tenant : la page d'autorisation n'est PAS ouverte dans
+/// le navigateur par défaut (connecté aux comptes McpHub) ; son adresse est renvoyée pour être
+/// ouverte dans le profil de navigateur du client. Jetons enregistrés dans le coffre du tenant.
+async fn tenant_oauth_login(server: &str, tenant: &str) -> Vec<u8> {
+    let def = match tenant_server(server, tenant) {
+        Ok(d) => d,
+        Err(e) => return json_err(400, &e),
+    };
+    let base = server.to_string();
+    let derived = tokio::task::spawn_blocking(move || crate::tenant::derive_from_vault(&def, &base)).await;
+    let config = match derived {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => return json_err(400, &e),
+        Err(e) => return json_err(500, &e.to_string()),
+    };
+    let Some(url) = config.url.filter(|_| config.oauth) else {
+        return json_err(400, "serveur sans OAuth gere par McpHub (pas d'url ou auth != oauth)");
+    };
+    let instance = crate::tenant::instance_name(server, tenant);
+    match crate::oauth::prepare_login(&instance, &url, None).await {
+        Ok(prepared) => {
+            let auth_url = prepared.auth_url.clone();
+            tokio::spawn(async move {
+                if let Err(e) = crate::oauth::finish_login(prepared).await {
+                    eprintln!("[McpHub][OAUTH] {} : echec de connexion : {}", instance, e);
+                }
+            });
+            json_ok(json!({ "ok": true, "url": auth_url }))
+        }
+        Err(e) => json_err(400, &e),
+    }
+}
+
+/// Tenants déclarés et état de leurs instances (noms de secrets seulement, jamais les valeurs).
+async fn handle_get_tenants(proxy: Option<Arc<ProxyServer>>) -> Vec<u8> {
+    let tenants = match crate::tenant::load_from(&crate::tenant::projects_path()) {
+        Ok(t) => t,
+        Err(e) => return json_err(500, &e),
+    };
+    let mut out = Vec::new();
+    for t in &tenants.tenants {
+        let stored: std::collections::BTreeSet<String> =
+            crate::vault::list_names_in(&crate::vault::Scope::Tenant(t.id.clone())).into_iter().collect();
+        let mut servers = Vec::new();
+        for (server, vars) in &t.credentials {
+            let instance = crate::tenant::instance_name(server, &t.id);
+            let running = match &proxy {
+                Some(p) => p.instance_running(&instance).await,
+                None => false,
+            };
+            servers.push(json!({
+                "server": server,
+                "instance": instance,
+                "running": running,
+                "secrets": vars.values().map(|n| json!({ "name": n, "present": stored.contains(n) })).collect::<Vec<_>>(),
+                "oauth_connected": stored.contains(&crate::oauth::vault_name(server)),
+            }));
+        }
+        out.push(json!({
+            "id": t.id,
+            "project": t.project,
+            "workspaces": t.workspaces,
+            "servers": servers,
+            "shared_servers": t.shared_servers,
+        }));
+    }
+    json_ok(json!({ "tenants": out }))
+}
+
 async fn handle_get_metrics(
     proxy: Option<Arc<ProxyServer>>,
     sse: Option<Arc<SseManager>>,
@@ -1096,12 +1175,16 @@ async fn route(
             )
         }
         ("POST", "/api/oauth/login") => {
-            let server = serde_json::from_str::<Value>(&req.body)
-                .ok()
-                .and_then(|v| v.get("server").and_then(|s| s.as_str()).map(String::from));
-            match server {
-                None => json_err(400, "server requis"),
-                Some(server) => {
+            let body = serde_json::from_str::<Value>(&req.body).unwrap_or(Value::Null);
+            let server = body.get("server").and_then(|s| s.as_str()).map(String::from);
+            let tenant = body.get("tenant").and_then(|s| s.as_str()).map(String::from);
+            match (server, tenant) {
+                (None, _) => json_err(400, "server requis"),
+                (Some(server), _) if crate::tenant::is_instance_name(&server) => {
+                    json_err(400, "nom de serveur invalide : passer le tenant dans \"tenant\"")
+                }
+                (Some(server), Some(tenant)) => tenant_oauth_login(&server, &tenant).await,
+                (Some(server), None) => {
                     let cfg = crate::config::auto_detect();
                     match cfg.servers.get(&server).and_then(|s| s.url.clone()) {
                         None => json_err(404, "serveur distant inconnu (pas d'url dans la config)"),
@@ -1118,17 +1201,28 @@ async fn route(
             }
         }
         ("POST", "/api/oauth/logout") => {
-            match serde_json::from_str::<Value>(&req.body)
-                .ok()
-                .and_then(|v| v.get("server").and_then(|s| s.as_str()).map(String::from))
-            {
-                None => json_err(400, "server requis"),
-                Some(server) => match crate::oauth::forget(&server) {
+            let body = serde_json::from_str::<Value>(&req.body).unwrap_or(Value::Null);
+            let server = body.get("server").and_then(|s| s.as_str()).map(String::from);
+            let tenant = body.get("tenant").and_then(|s| s.as_str()).map(String::from);
+            let target = match (server, tenant) {
+                (None, _) => Err(json_err(400, "server requis")),
+                (Some(server), _) if crate::tenant::is_instance_name(&server) => {
+                    Err(json_err(400, "nom de serveur invalide : passer le tenant dans \"tenant\""))
+                }
+                (Some(server), Some(tenant)) => tenant_server(&server, &tenant)
+                    .map(|_| crate::tenant::instance_name(&server, &tenant))
+                    .map_err(|e| json_err(400, &e)),
+                (Some(server), None) => Ok(server),
+            };
+            match target {
+                Err(resp) => resp,
+                Ok(name) => match crate::oauth::forget(&name) {
                     Ok(_) => http_response(200, "OK", "application/json", "{\"ok\":true}"),
                     Err(e) => json_err(500, &e),
                 },
             }
         }
+        ("GET", "/api/tenants") => handle_get_tenants(proxy).await,
         ("GET", "/login") => {
             // Lien à usage unique créé par `McpHub dashboard` : remet le secret de session au
             // tableau de bord (sessionStorage, propre à cette origine), puis efface l'URL.

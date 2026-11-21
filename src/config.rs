@@ -23,6 +23,9 @@ pub struct ServerConfig {
     pub headers: HashMap<String, String>,
     /// OAuth géré par McpHub (jetons au Trousseau).
     pub oauth: bool,
+    /// Instance d'un tenant (`serveur@tenant`) : environnement en liste blanche, HOME isolé,
+    /// jamais l'agent SSH ni les variables du démon.
+    pub tenant: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -182,6 +185,20 @@ fn load_secrets_env() {
 /// Remplace les motifs ${VAR} par la valeur de la variable d'environnement.
 /// Si la variable est absente, le motif est laisse tel quel et un avertissement est emis.
 fn expand_vars(input: &str) -> String {
+    expand_with(input, &mut |var| match std::env::var(var) {
+        Ok(val) => Some(val),
+        Err(_) => {
+            eprintln!(
+                "[McpHub][WARN] variable ${{{}}} introuvable (Trousseau et secrets.env)",
+                var
+            );
+            None
+        }
+    })
+}
+
+/// Remplace chaque ${VAR} par `lookup(VAR)` ; un motif sans valeur est laissé tel quel.
+pub(crate) fn expand_with(input: &str, lookup: &mut dyn FnMut(&str) -> Option<String>) -> String {
     if !input.contains("${") {
         return input.to_string();
     }
@@ -192,13 +209,9 @@ fn expand_vars(input: &str) -> String {
         let after = &rest[start + 2..];
         if let Some(end) = after.find('}') {
             let var = &after[..end];
-            match std::env::var(var) {
-                Ok(val) => out.push_str(&val),
-                Err(_) => {
-                    eprintln!(
-                        "[McpHub][WARN] variable ${{{}}} introuvable (Trousseau et secrets.env)",
-                        var
-                    );
+            match lookup(var) {
+                Some(val) => out.push_str(&val),
+                None => {
                     out.push_str("${");
                     out.push_str(var);
                     out.push('}');
@@ -213,6 +226,9 @@ fn expand_vars(input: &str) -> String {
     out.push_str(rest);
     out
 }
+
+/// Fonction de remplacement des ${VAR} d'un serveur : erreur = serveur refusé.
+pub(crate) type Expander<'a> = dyn Fn(&str) -> Result<String, String> + 'a;
 
 fn parse_servers(json: &Value) -> Result<HashMap<String, ServerConfig>, String> {
     load_secrets_env();
@@ -242,96 +258,103 @@ fn parse_servers(json: &Value) -> Result<HashMap<String, ServerConfig>, String> 
             eprintln!("[McpHub][INFO] Skipped disabled: {}", name);
             continue;
         }
-        if let Some(cmd) = config.get("command").and_then(|v| v.as_str()) {
-            let args: Vec<String> = config
-                .get("args")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(expand_vars))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let env: HashMap<String, String> = config
-                .get("env")
-                .and_then(|v| v.as_object())
-                .map(|obj| {
-                    obj.iter()
-                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), expand_vars(s))))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let pool = config.get("pool").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
-            let request_timeout_secs = config
-                .get("requestTimeoutSecs")
-                .or_else(|| config.get("requestTimeout"))
-                .and_then(|v| v.as_u64());
-            let command = expand_vars(cmd);
-            let sandbox = crate::sandbox::resolve(
-                name,
-                config,
-                json.get("settings").and_then(|s| s.get("sandbox")),
-                &command,
-                &args,
-            )?;
-            result.insert(
-                name.clone(),
-                ServerConfig {
-                    command,
-                    args,
-                    env,
-                    pool,
-                    request_timeout_secs,
-                    sandbox,
-                    inherit_env: config
-                        .get("inheritEnv")
-                        .and_then(|v| v.as_array())
-                        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-                        .unwrap_or_default(),
-                    url: None,
-                    headers: HashMap::new(),
-                    oauth: false,
-                },
-            );
-        } else if let Some(url) = config.get("url").and_then(|v| v.as_str()) {
-            // Serveur distant natif : {"url": "...", "headers": {...}, "auth": "oauth" | "none"}
-            let headers: HashMap<String, String> = config
-                .get("headers")
-                .and_then(|v| v.as_object())
-                .map(|obj| {
-                    obj.iter()
-                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), expand_vars(s))))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let has_auth_header = headers.keys().any(|k| k.eq_ignore_ascii_case("authorization"));
-            let oauth = match config.get("auth").and_then(|v| v.as_str()) {
-                Some(a) => a.eq_ignore_ascii_case("oauth"),
-                None => !has_auth_header,
-            };
-            result.insert(
-                name.clone(),
-                ServerConfig {
-                    command: String::new(),
-                    args: Vec::new(),
-                    env: HashMap::new(),
-                    pool: config.get("pool").and_then(|v| v.as_u64()).unwrap_or(1) as usize,
-                    request_timeout_secs: config
-                        .get("requestTimeoutSecs")
-                        .or_else(|| config.get("requestTimeout"))
-                        .and_then(|v| v.as_u64()),
-                    sandbox: None,
-                    inherit_env: Vec::new(),
-                    url: Some(expand_vars(url)),
-                    headers,
-                    oauth,
-                },
-            );
-        } else {
-            return Err(format!("{} : ni \"command\" ni \"url\"", name));
+        if name.contains('@') {
+            return Err(format!(
+                "{} : le caractere @ est reserve aux instances des tenants (serveur@tenant)",
+                name
+            ));
         }
+        let server = parse_server_entry(name, config, json.get("settings"), &|v| Ok(expand_vars(v)))?;
+        result.insert(name.clone(), server);
     }
     Ok(result)
+}
+
+fn expand_string_map(value: Option<&Value>, expand: &Expander) -> Result<HashMap<String, String>, String> {
+    let mut out = HashMap::new();
+    if let Some(obj) = value.and_then(|v| v.as_object()) {
+        for (k, v) in obj {
+            if let Some(s) = v.as_str() {
+                out.insert(k.clone(), expand(s)?);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn request_timeout(config: &Value) -> Option<u64> {
+    config
+        .get("requestTimeoutSecs")
+        .or_else(|| config.get("requestTimeout"))
+        .and_then(|v| v.as_u64())
+}
+
+/// Une entrée de `mcpServers`, ${VAR} remplacés par `expand`. Utilisée pour la config
+/// normale et pour les instances des tenants (avec leur propre coffre).
+pub(crate) fn parse_server_entry(
+    name: &str,
+    config: &Value,
+    settings: Option<&Value>,
+    expand: &Expander,
+) -> Result<ServerConfig, String> {
+    if let Some(cmd) = config.get("command").and_then(|v| v.as_str()) {
+        let args: Vec<String> = config
+            .get("args")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).map(expand).collect::<Result<_, _>>())
+            .transpose()?
+            .unwrap_or_default();
+        let env = expand_string_map(config.get("env"), expand)?;
+        let pool = config.get("pool").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+        let command = expand(cmd)?;
+        let sandbox = crate::sandbox::resolve(
+            name,
+            config,
+            settings.and_then(|s| s.get("sandbox")),
+            &command,
+            &args,
+        )?;
+        Ok(ServerConfig {
+            command,
+            args,
+            env,
+            pool,
+            request_timeout_secs: request_timeout(config),
+            sandbox,
+            inherit_env: config
+                .get("inheritEnv")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default(),
+            url: None,
+            headers: HashMap::new(),
+            oauth: false,
+            tenant: None,
+        })
+    } else if let Some(url) = config.get("url").and_then(|v| v.as_str()) {
+        // Serveur distant natif : {"url": "...", "headers": {...}, "auth": "oauth" | "none"}
+        let headers = expand_string_map(config.get("headers"), expand)?;
+        let has_auth_header = headers.keys().any(|k| k.eq_ignore_ascii_case("authorization"));
+        let oauth = match config.get("auth").and_then(|v| v.as_str()) {
+            Some(a) => a.eq_ignore_ascii_case("oauth"),
+            None => !has_auth_header,
+        };
+        Ok(ServerConfig {
+            command: String::new(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            pool: config.get("pool").and_then(|v| v.as_u64()).unwrap_or(1) as usize,
+            request_timeout_secs: request_timeout(config),
+            sandbox: None,
+            inherit_env: Vec::new(),
+            url: Some(expand(url)?),
+            headers,
+            oauth,
+            tenant: None,
+        })
+    } else {
+        Err(format!("{} : ni \"command\" ni \"url\"", name))
+    }
 }
 
 /// Réglages de garde des outils de la config dédiée (pour la commande `McpHub pins`).

@@ -536,7 +536,9 @@ pub fn local_command(name: &str, config: &ServerConfig) -> Command {
     let mut cmd = Command::new(&program);
     cmd.args(&program_args).kill_on_drop(true);
     cmd.env_clear();
-    for (k, v) in base_child_env(config.sandbox.is_none(), &config.inherit_env) {
+    // Instance d'un tenant : jamais l'agent SSH ni les variables héritées du démon.
+    let inherit: &[String] = if config.tenant.is_some() { &[] } else { &config.inherit_env };
+    for (k, v) in base_child_env(config.sandbox.is_none() && config.tenant.is_none(), inherit) {
         cmd.env(k, v);
     }
     for (k, v) in &config.env {
@@ -645,21 +647,53 @@ impl ChildManager {
         }
     }
 
+    /// Installe ou remplace la config d'une instance de tenant. Une instance dont la config
+    /// change (secret modifié, config de base modifiée) est arrêtée et relancée au prochain appel.
+    pub async fn set_instance_config(&self, name: &str, config: ServerConfig) {
+        let changed = {
+            let mut configs = self.configs.lock().await;
+            let changed = configs.get(name).is_some_and(|old| *old != config);
+            configs.insert(name.to_string(), config);
+            changed
+        };
+        if changed {
+            self.stop_server(name).await;
+        }
+    }
+
+    pub async fn has_config(&self, name: &str) -> bool {
+        self.configs.lock().await.contains_key(name)
+    }
+
+    /// Nom exact d'une instance de tenant, sinon résolution normale.
+    async fn resolve_internal(&self, name: &str) -> Option<String> {
+        if crate::tenant::is_instance_name(name) {
+            return self.configs.lock().await.contains_key(name).then(|| name.to_string());
+        }
+        self.resolve_name(name).await
+    }
+
     /// Nom canonique (clé de config) d'un serveur. Utilisé aussi par le proxy pour que
     /// les permissions s'appliquent exactement au serveur qui sera appelé.
+    ///
+    /// Un nom venu de l'extérieur ne désigne jamais une instance de tenant (`serveur@tenant`) :
+    /// celles-ci ne s'atteignent que par le routage des tenants (`resolve_instance`).
     pub async fn resolve_name(&self, name: &str) -> Option<String> {
+        if crate::tenant::is_instance_name(name) {
+            return None;
+        }
         let configs = self.configs.lock().await;
         if configs.contains_key(name) {
             return Some(name.to_string());
         }
         let lower = name.to_lowercase();
-        for key in configs.keys() {
+        for key in configs.keys().filter(|k| !crate::tenant::is_instance_name(k)) {
             if key.to_lowercase() == lower {
                 return Some(key.clone());
             }
         }
         let normalized = lower.replace(['-', '_'], "");
-        for key in configs.keys() {
+        for key in configs.keys().filter(|k| !crate::tenant::is_instance_name(k)) {
             let key_normalized = key.to_lowercase().replace(['-', '_'], "");
             if key_normalized == normalized {
                 return Some(key.clone());
@@ -693,7 +727,7 @@ impl ChildManager {
 
     pub async fn start_server(&self, name: &str) -> Result<Vec<ToolDef>, String> {
         let name_resolved = self
-            .resolve_name(name)
+            .resolve_internal(name)
             .await
             .ok_or_else(|| format!("Unknown server: {}", name))?;
         let name = name_resolved.as_str();
@@ -854,7 +888,7 @@ impl ChildManager {
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         let resolved = self
-            .resolve_name(server_name)
+            .resolve_internal(server_name)
             .await
             .ok_or_else(|| format!("Unknown server: {}", server_name))?;
         let server_name = resolved.as_str();
@@ -893,7 +927,7 @@ impl ChildManager {
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         let resolved = self
-            .resolve_name(server_name)
+            .resolve_internal(server_name)
             .await
             .ok_or_else(|| format!("Unknown server: {}", server_name))?;
         let server_name = resolved.as_str();
@@ -1347,6 +1381,7 @@ done
             url: None,
             headers: HashMap::new(),
             oauth: false,
+            tenant: None,
         }
     }
 
@@ -1465,6 +1500,7 @@ done
             url: Some(url.to_string()),
             headers: HashMap::new(),
             oauth: false,
+            tenant: None,
         }
     }
 

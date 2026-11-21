@@ -378,6 +378,10 @@ pub fn tool_definition() -> Value {
                 "policy": {
                     "type": "object",
                     "description": "Set by the McpHub client, not by the model."
+                },
+                "_mcphub_context": {
+                    "type": "object",
+                    "description": "Set by the McpHub client (working_dir, cwd): tenant isolation. Never set by hand."
                 }
             },
             "required": ["code"]

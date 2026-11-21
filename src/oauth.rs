@@ -80,6 +80,15 @@ pub fn vault_name(server: &str) -> String {
     format!("{}{}", VAULT_PREFIX, norm)
 }
 
+/// Coffre et nom d'élément des jetons d'un serveur : `serveur@tenant` vit dans le coffre du
+/// tenant, jamais dans celui de McpHub.
+fn storage(server: &str) -> (crate::vault::Scope, String) {
+    match crate::tenant::split_instance(server) {
+        Some((base, tenant)) => (crate::vault::Scope::Tenant(tenant.to_string()), vault_name(base)),
+        None => (crate::vault::Scope::Hub, vault_name(server)),
+    }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -100,7 +109,8 @@ pub fn load(server: &str) -> Option<Stored> {
     if let Some(s) = cache().get(server) {
         return Some(s.clone());
     }
-    let raw = crate::vault::get(&vault_name(server)).ok().flatten()?;
+    let (scope, name) = storage(server);
+    let raw = crate::vault::get_in(&scope, &name).ok().flatten()?;
     let s: Stored = serde_json::from_str(&raw).ok()?;
     cache().insert(server.to_string(), s.clone());
     Some(s)
@@ -109,7 +119,8 @@ pub fn load(server: &str) -> Option<Stored> {
 /// Relit le Trousseau en ignorant le cache : un autre processus McpHub (démon, stdio,
 /// extension Claude) a peut-être renouvelé le jeton entre-temps.
 fn load_shared(server: &str) -> Option<Stored> {
-    let raw = crate::vault::get(&vault_name(server)).ok().flatten()?;
+    let (scope, name) = storage(server);
+    let raw = crate::vault::get_in(&scope, &name).ok().flatten()?;
     let s: Stored = serde_json::from_str(&raw).ok()?;
     cache().insert(server.to_string(), s.clone());
     Some(s)
@@ -129,7 +140,12 @@ impl Drop for CrossProcessLock {
 }
 
 fn lock_path(server: &str) -> std::path::PathBuf {
-    crate::instance::hub_dir().join("oauth-locks").join(format!("{}.lock", vault_name(server)))
+    let (scope, name) = storage(server);
+    let file = match scope {
+        crate::vault::Scope::Hub => format!("{}.lock", name),
+        crate::vault::Scope::Tenant(tenant) => format!("{}@{}.lock", name, tenant),
+    };
+    crate::instance::hub_dir().join("oauth-locks").join(file)
 }
 
 fn lock_file(path: &std::path::Path) -> Result<CrossProcessLock, String> {
@@ -188,14 +204,16 @@ fn recovery_after_refusal(used_refresh: &str, latest: Option<&Tokens>) -> Recove
 
 pub fn save(server: &str, s: &Stored) -> Result<(), String> {
     let raw = serde_json::to_string(s).map_err(|e| e.to_string())?;
-    crate::vault::set(&vault_name(server), &raw)?;
+    let (scope, name) = storage(server);
+    crate::vault::set_in(&scope, &name, &raw)?;
     cache().insert(server.to_string(), s.clone());
     Ok(())
 }
 
 pub fn forget(server: &str) -> Result<bool, String> {
     cache().remove(server);
-    crate::vault::delete(&vault_name(server))
+    let (scope, name) = storage(server);
+    crate::vault::delete_in(&scope, &name)
 }
 
 // ─── Outils ──────────────────────────────────────────────────
@@ -611,16 +629,42 @@ impl Drop for LoginGuard {
     }
 }
 
+/// Connexion préparée : page d'autorisation à ouvrir, puis attente du retour.
+pub struct PreparedLogin {
+    server: String,
+    url: String,
+    pub auth_url: String,
+    state: String,
+    verifier: String,
+    meta: AuthServerMeta,
+    client: ClientInfo,
+    resource: Option<String>,
+    scope: Option<String>,
+    rx: tokio::sync::oneshot::Receiver<CallbackResult>,
+    _login: LoginGuard,
+}
+
 pub async fn interactive_login(server: &str, url: &str, www_authenticate: Option<&str>) -> Result<(), String> {
+    let prepared = prepare_login(server, url, www_authenticate).await?;
+    eprintln!("[McpHub][OAUTH] {} : connexion ouverte dans le navigateur", server);
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(&prepared.auth_url).spawn();
+    #[cfg(not(target_os = "macos"))]
+    eprintln!("[McpHub][OAUTH] Ouvrir : {}", prepared.auth_url);
+    finish_login(prepared).await
+}
+
+/// Prépare la connexion sans ouvrir de navigateur (tenants : la page doit s'ouvrir dans le
+/// profil de navigateur du client, pas dans celui connecté aux comptes McpHub).
+pub async fn prepare_login(server: &str, url: &str, www_authenticate: Option<&str>) -> Result<PreparedLogin, String> {
     // Une seule connexion à la fois par serveur, et sans bloquer ses appels en attendant le
     // navigateur (le verrou du serveur n'est pris qu'à l'enregistrement final).
     if !logins_in_progress().insert(server.to_string()) {
         return Err("une connexion est deja en cours pour ce serveur".into());
     }
-    let _login = LoginGuard(server.to_string());
+    let login = LoginGuard(server.to_string());
     let (meta, resource, scope) = discover(url, www_authenticate).await?;
-    let mut stored = load(server).unwrap_or_default();
-    stored.url = url.to_string();
+    let stored = load(server).unwrap_or_default();
     let reuse = stored.client.as_ref().filter(|c| {
         c.redirect_uri.as_deref() == Some(redirect_uri().as_str())
             && stored.meta.as_ref().map(|m| m.issuer == meta.issuer).unwrap_or(false)
@@ -634,6 +678,7 @@ pub async fn interactive_login(server: &str, url: &str, www_authenticate: Option
     if !secure_url(&meta.authorization_endpoint) {
         return Err("page de connexion non HTTPS refusee".into());
     }
+    let scope = scope.or(stored.scope);
     let mut auth = Url::parse(&meta.authorization_endpoint).map_err(|e| e.to_string())?;
     {
         let mut q = auth.query_pairs_mut();
@@ -643,7 +688,7 @@ pub async fn interactive_login(server: &str, url: &str, www_authenticate: Option
             .append_pair("code_challenge", &pkce_challenge(&verifier))
             .append_pair("code_challenge_method", "S256")
             .append_pair("state", &state);
-        if let Some(sc) = scope.as_ref().or(stored.scope.as_ref()) {
+        if let Some(sc) = scope.as_ref() {
             q.append_pair("scope", sc);
         }
         if let Some(r) = &resource {
@@ -652,16 +697,29 @@ pub async fn interactive_login(server: &str, url: &str, www_authenticate: Option
     }
     let (tx, rx) = tokio::sync::oneshot::channel();
     pending().insert(state.clone(), tx);
-    eprintln!("[McpHub][OAUTH] {} : connexion ouverte dans le navigateur", server);
-    #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(auth.as_str()).spawn();
-    #[cfg(not(target_os = "macos"))]
-    eprintln!("[McpHub][OAUTH] Ouvrir : {}", auth);
-    let code = match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
+    Ok(PreparedLogin {
+        server: server.to_string(),
+        url: url.to_string(),
+        auth_url: auth.to_string(),
+        state,
+        verifier,
+        meta,
+        client,
+        resource,
+        scope,
+        rx,
+        _login: login,
+    })
+}
+
+/// Attend le retour du navigateur (5 minutes au plus) et enregistre les jetons.
+pub async fn finish_login(p: PreparedLogin) -> Result<(), String> {
+    let server = p.server.as_str();
+    let code = match tokio::time::timeout(std::time::Duration::from_secs(300), p.rx).await {
         Ok(Ok(Ok(code))) => code,
         Ok(Ok(Err(e))) => return Err(format!("connexion refusee : {}", e)),
         _ => {
-            pending().remove(&state);
+            pending().remove(&p.state);
             return Err("connexion non terminee dans les 5 minutes".into());
         }
     };
@@ -669,19 +727,21 @@ pub async fn interactive_login(server: &str, url: &str, www_authenticate: Option
         ("grant_type", "authorization_code".to_string()),
         ("code", code),
         ("redirect_uri", redirect_uri()),
-        ("code_verifier", verifier),
+        ("code_verifier", p.verifier),
     ];
-    if let Some(r) = &resource {
+    if let Some(r) = &p.resource {
         form.push(("resource", r.clone()));
     }
-    let v = token_request(&meta, &client, form).await?;
+    let v = token_request(&p.meta, &p.client, form).await?;
     let lock = server_lock(server);
     let _g = lock.lock().await;
+    let mut stored = load(server).unwrap_or_default();
+    stored.url = p.url.clone();
     stored.tokens = Some(parse_tokens(&v, None)?);
-    stored.client = Some(client);
-    stored.meta = Some(meta);
-    stored.resource = resource;
-    stored.scope = scope.or(stored.scope);
+    stored.client = Some(p.client);
+    stored.meta = Some(p.meta);
+    stored.resource = p.resource;
+    stored.scope = p.scope;
     save(server, &stored)?;
     eprintln!("[McpHub][OAUTH] {} : connecte", server);
     Ok(())
@@ -739,6 +799,111 @@ pub fn import_mcp_remote(server: &str, url: &str) -> Result<bool, String> {
 }
 
 // ─── Commande `McpHub oauth` ─────────────────────────────────
+
+/// `McpHub oauth status|login|logout --tenant ID [SERVEUR]`.
+async fn tenant_cli(tenant: &str, args: &[String]) -> i32 {
+    let tenants = match crate::tenant::load_from(&crate::tenant::projects_path()) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{}", e);
+            return 1;
+        }
+    };
+    let Some(def) = tenants.get(tenant) else {
+        eprintln!("tenant {} inconnu", tenant);
+        return 1;
+    };
+    let sub = args.first().map(|s| s.as_str()).unwrap_or("status");
+    if sub == "status" {
+        for server in def.credentials.keys() {
+            let instance = crate::tenant::instance_name(server, tenant);
+            let state = load(&instance).map(|s| describe(&s)).unwrap_or_else(|| "pas de jeton OAuth".into());
+            println!("{:24} {}", server, state);
+        }
+        return 0;
+    }
+    let Some(server) = args.get(1) else {
+        eprintln!("Usage : McpHub oauth {} --tenant {} SERVEUR", sub, tenant);
+        return 2;
+    };
+    if !def.owns(server) {
+        eprintln!("{} n'est pas un serveur du tenant {} (credentials dans projects.json)", server, tenant);
+        return 1;
+    }
+    let instance = crate::tenant::instance_name(server, tenant);
+    let token = crate::dashboard::get_auth_token();
+    let body = serde_json::json!({ "server": server, "tenant": tenant });
+    match sub {
+        "login" => {
+            let url = format!("http://127.0.0.1:{}/api/oauth/login", crate::instance::port());
+            let r = reqwest::Client::new().post(&url).bearer_auth(token).json(&body).send().await;
+            let auth_url = match r {
+                Ok(r) if r.status().is_success() => r
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(String::from)),
+                Ok(r) => {
+                    eprintln!("Refuse par le demon : {}", r.text().await.unwrap_or_default());
+                    return 1;
+                }
+                Err(e) => {
+                    eprintln!("Demon McpHub injoignable ({}). Il doit tourner (McpHub install).", e);
+                    return 1;
+                }
+            };
+            let Some(auth_url) = auth_url else {
+                eprintln!("Reponse du demon sans adresse de connexion.");
+                return 1;
+            };
+            println!("Connexion de {} pour le tenant {}.", server, tenant);
+            println!("Ouvrir cette adresse dans un profil de navigateur connecte au compte du CLIENT");
+            println!("(pas celui de vos propres comptes), puis autoriser :\n\n{}\n", auth_url);
+            println!("En attente (5 min max)...");
+            let before = load(&instance).and_then(|s| s.tokens).map(|t| t.access_token);
+            for _ in 0..150 {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                cache().remove(instance.as_str());
+                let now = load(&instance).and_then(|s| s.tokens).map(|t| t.access_token);
+                if now.is_some() && now != before {
+                    println!("{} : connecte pour le tenant {} (jetons dans son coffre).", server, tenant);
+                    return 0;
+                }
+            }
+            eprintln!("Pas de connexion terminee. Voir : McpHub logs");
+            1
+        }
+        "logout" => {
+            let url = format!("http://127.0.0.1:{}/api/oauth/logout", crate::instance::port());
+            let via_daemon = reqwest::Client::new()
+                .post(&url)
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false);
+            match (via_daemon, forget(&instance)) {
+                (_, Err(e)) => {
+                    eprintln!("{}", e);
+                    1
+                }
+                (true, _) | (_, Ok(true)) => {
+                    println!("{} : deconnecte pour le tenant {}.", server, tenant);
+                    0
+                }
+                (false, Ok(false)) => {
+                    println!("{} : aucun jeton pour le tenant {}.", server, tenant);
+                    0
+                }
+            }
+        }
+        _ => {
+            eprintln!("Avec --tenant : status, login SERVEUR, logout SERVEUR");
+            2
+        }
+    }
+}
 
 fn remote_servers() -> Vec<(String, crate::config::ServerConfig)> {
     let cfg = crate::config::auto_detect();
@@ -798,6 +963,18 @@ fn mcp_remote_args(args: &[Value]) -> Option<(String, Vec<(String, String)>)> {
 }
 
 pub async fn run_cli(args: &[String]) -> i32 {
+    // `--tenant ID` : jetons du coffre de ce tenant.
+    let (scope, args) = match crate::tenant::take_tenant_flag(args) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            eprintln!("{}", e);
+            return 2;
+        }
+    };
+    if let crate::vault::Scope::Tenant(tenant) = &scope {
+        return tenant_cli(tenant, &args).await;
+    }
+    let args = args.as_slice();
     match args.first().map(|s| s.as_str()).unwrap_or("status") {
         "status" => {
             let servers = remote_servers();

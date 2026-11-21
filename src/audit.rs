@@ -68,6 +68,8 @@ pub struct AuditEntry {
     pub duration_ms: Option<u64>,
     pub arguments: Option<Value>,
     pub error: Option<String>,
+    /// Tenant (compte client) à l'origine de l'appel ; absent = comptes McpHub.
+    pub tenant: Option<String>,
 }
 
 pub struct AuditLogger {
@@ -127,6 +129,9 @@ pub fn format_entry(cfg: &AuditConfig, e: &AuditEntry) -> String {
     });
     if let Some(d) = e.duration_ms {
         obj["duration_ms"] = json!(d);
+    }
+    if let Some(t) = &e.tenant {
+        obj["tenant"] = json!(t);
     }
     if cfg.log_arguments {
         if let Some(args) = &e.arguments {
@@ -263,12 +268,13 @@ pub fn iso_utc(secs: u64, millis: u32) -> String {
     )
 }
 
-/// `McpHub audit [--tail N] [--server S] [--tool T] [--decision D] [--json]`
+/// `McpHub audit [--tail N] [--server S] [--tool T] [--decision D] [--tenant ID] [--json]`
 pub fn run_cli(args: &[String]) {
     let mut tail = 30usize;
     let mut server: Option<String> = None;
     let mut tool: Option<String> = None;
     let mut decision: Option<String> = None;
+    let mut tenant: Option<String> = None;
     let mut raw = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -279,6 +285,7 @@ pub fn run_cli(args: &[String]) {
             "--server" => server = it.next().cloned(),
             "--tool" => tool = it.next().cloned(),
             "--decision" => decision = it.next().cloned(),
+            "--tenant" => tenant = it.next().cloned(),
             "--json" => raw = true,
             _ => {}
         }
@@ -306,6 +313,7 @@ pub fn run_cli(args: &[String]) {
             matches(v, "server", &server)
                 && matches(v, "tool", &tool)
                 && matches(v, "decision", &decision)
+                && matches(v, "tenant", &tenant)
         })
         .collect();
     let start = rows.len().saturating_sub(tail);
@@ -325,11 +333,17 @@ pub fn run_cli(args: &[String]) {
             .and_then(|x| x.as_str())
             .map(|e| format!("  ! {}", e))
             .unwrap_or_default();
+        let tenant = v
+            .get("tenant")
+            .and_then(|x| x.as_str())
+            .map(|t| format!("[{}] ", t))
+            .unwrap_or_default();
         println!(
-            "{}  {:<9} {:<18} {}/{}{}{}",
+            "{}  {:<9} {:<18} {}{}/{}{}{}",
             s("ts"),
             s("status"),
             s("decision"),
+            tenant,
             s("server"),
             s("tool"),
             dur,

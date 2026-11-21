@@ -17,6 +17,7 @@ use crate::permissions::{Action, ConfirmStore};
 use crate::protocol::*;
 use crate::response_cache::ResponseCache;
 use crate::search::{IndexedTool, SearchEngine};
+use crate::tenant::{CallOrigin, Context, Route};
 use crate::untrusted;
 
 tokio::task_local! {
@@ -24,6 +25,8 @@ tokio::task_local! {
     static REQUEST_PROFILE: Option<String>;
     /// Appel lancé depuis le code mode : nombre de fenêtres de confirmation déjà ouvertes.
     static CODE_RUN: std::sync::Arc<std::sync::atomic::AtomicUsize>;
+    /// Tenant de l'appel en cours : noté dans chaque entrée du journal d'audit.
+    static CALL_TENANT: Option<String>;
 }
 
 /// Fenêtres de confirmation au plus par exécution de `mcphub_run`.
@@ -188,6 +191,8 @@ pub struct ProxyServer {
     audit: Arc<AuditLogger>,
     /// Requêtes en cours : le redémarrage après une mise à jour attend qu'il n'y en ait plus.
     in_flight: Arc<AtomicUsize>,
+    /// Tenants (projects.json) : contexte de chaque appel et instances `serveur@tenant`.
+    tenants: Arc<crate::tenant::Registry>,
 }
 
 struct InFlight(Arc<AtomicUsize>);
@@ -249,7 +254,80 @@ impl ProxyServer {
             confirmations: Arc::new(ConfirmStore::new()),
             audit: Arc::new(AuditLogger::new(crate::audit::default_path())),
             in_flight: Arc::new(AtomicUsize::new(0)),
+            tenants: Arc::new(crate::tenant::Registry::new(crate::tenant::projects_path())),
         }
+    }
+
+    /// Contexte d'un appel (McpHub ou tenant), déduit par le démon du dossier transmis.
+    fn call_context(&self, origin: &CallOrigin) -> Result<Context, String> {
+        self.tenants.context(origin)
+    }
+
+    /// Route d'un appel vers un serveur (nom canonique) ; prépare l'instance du tenant.
+    /// Seul chemin vers une instance `serveur@tenant`.
+    async fn route_call(&self, ctx: &Context, server: &str) -> Result<Route, String> {
+        let route = crate::tenant::route(ctx, server)?;
+        if let (Route::Tenant { server, instance, .. }, Context::Tenant(def)) = (&route, ctx) {
+            self.ensure_instance(def.clone(), server, instance).await?;
+        }
+        Ok(route)
+    }
+
+    async fn ensure_instance(
+        &self,
+        def: Arc<crate::tenant::TenantDef>,
+        server: &str,
+        instance: &str,
+    ) -> Result<(), String> {
+        let present = self.child_manager.has_config(instance).await;
+        if !self.tenants.needs_derivation(instance, present) {
+            return Ok(());
+        }
+        let base = server.to_string();
+        // Lectures du Trousseau : bloquantes, hors du fil asynchrone.
+        let config = tokio::task::spawn_blocking(move || crate::tenant::derive_from_vault(&def, &base))
+            .await
+            .map_err(|e| format!("instance {} : {}", instance, e))??;
+        self.child_manager.set_instance_config(instance, config).await;
+        self.tenants.mark_derived(instance);
+        Ok(())
+    }
+
+    async fn refuse_for_tenant(
+        &self,
+        id: Option<serde_json::Value>,
+        ctx: Option<&Context>,
+        server: &str,
+        tool: &str,
+        reason: String,
+    ) -> JsonRpcResponse {
+        self.record_audit(AuditEntry {
+            server: server.to_string(),
+            tool: tool.to_string(),
+            mode: "discover",
+            decision: "deny",
+            status: "blocked",
+            policy: "tenant".into(),
+            tenant: ctx.and_then(|c| c.tenant_id()).map(String::from),
+            ..Default::default()
+        })
+        .await;
+        JsonRpcResponse::error_with_data(
+            id,
+            -32001,
+            format!("Bloque par McpHub (tenants) : {}", reason),
+            serde_json::json!({
+                "server": server,
+                "tool": tool,
+                "policy": "tenant",
+                "hint": "Cloisonnement des comptes clients : ne pas contourner, verifier working_dir ou le signaler a l'utilisateur."
+            }),
+        )
+    }
+
+    /// Instance de tenant en cours d'exécution (tableau de bord).
+    pub async fn instance_running(&self, instance: &str) -> bool {
+        self.child_manager.is_running(instance).await
     }
 
     pub fn in_flight(&self) -> usize {
@@ -260,7 +338,10 @@ impl ProxyServer {
         self.config.lock().await.audit.clone()
     }
 
-    async fn record_audit(&self, entry: AuditEntry) {
+    async fn record_audit(&self, mut entry: AuditEntry) {
+        if entry.tenant.is_none() {
+            entry.tenant = CALL_TENANT.try_with(|t| t.clone()).ok().flatten();
+        }
         let cfg = self.audit_config().await;
         self.audit.record(&cfg, entry);
     }
@@ -271,16 +352,19 @@ impl ProxyServer {
         &self,
         id: &Option<serde_json::Value>,
         mode: &'static str,
-        server: &str,
+        route: &Route,
         tool: &str,
         arguments: &serde_json::Value,
         confirmation_token: Option<&str>,
     ) -> PolicyGate {
         let permissions = self.config.lock().await.permissions.clone();
+        // Permissions et épinglage portent sur le serveur de base ; le processus démarré est
+        // l'instance du tenant le cas échéant.
+        let server = route.server();
         // Toujours partir de la définition EN DIRECT : le serveur est démarré (ou réveillé)
         // avant le contrôle, donc épinglé et analysé avant que l'appel parte. Démarrer un
         // serveur déjà actif ne coûte qu'un verrou.
-        let live = self.child_manager.start_server(server).await;
+        let live = self.child_manager.start_server(route.key()).await;
         let (tool_def, live_block) = match &live {
             Ok(tools) => match tools.iter().find(|t| t.name == tool) {
                 Some(def) => (Some(def.clone()), None),
@@ -1097,6 +1181,10 @@ impl ProxyServer {
                         "expand": {
                             "type": "boolean",
                             "description": "If true, include full inputSchema in each result. Default false (compact, ~80% fewer tokens)."
+                        },
+                        "_mcphub_context": {
+                            "type": "object",
+                            "description": "Set by the McpHub client (working_dir, cwd): the daemon derives the tenant from it. Never set by hand."
                         }
                     },
                     "required": ["query"]
@@ -1128,6 +1216,10 @@ impl ProxyServer {
                         "confirmation_token": {
                             "type": "string",
                             "description": "Only when a previous call answered confirmation_required AND the user explicitly approved. Same server, tool and arguments."
+                        },
+                        "_mcphub_context": {
+                            "type": "object",
+                            "description": "Set by the McpHub client (working_dir, cwd): the daemon derives the tenant from it. Never set by hand."
                         }
                     },
                     "required": ["server", "tool"]
@@ -1226,6 +1318,10 @@ impl ProxyServer {
         args: serde_json::Value,
     ) -> JsonRpcResponse {
         let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+        let ctx = match self.call_context(&CallOrigin::from_args(&args)) {
+            Ok(ctx) => ctx,
+            Err(reason) => return self.refuse_for_tenant(id, None, "*", "mcphub_search", reason).await,
+        };
         let explicit_server_filter = args
             .get("server")
             .and_then(|v| v.as_str())
@@ -1257,6 +1353,9 @@ impl ProxyServer {
         all_server_names.sort();
         let profile = current_profile();
         all_server_names.retain(|s| crate::toolguard::server_visible(s, profile.as_deref()));
+        // Depuis le dossier d'un tenant : ses serveurs et les serveurs partagés seulement.
+        let tenant_scoped = matches!(ctx, Context::Tenant(_));
+        all_server_names.retain(|s| crate::tenant::visible(&ctx, s));
         let engine = self.search_engine.lock().await;
         let (effective_server_filter, filter_source) = infer_discover_server_filter(
             query,
@@ -1281,7 +1380,7 @@ impl ProxyServer {
             .unwrap_or(false);
 
         if engine.tool_count() > 0 && !should_try_live_discovery {
-            let allowed_servers = if effective_server_filter.is_some() || profile.is_some() {
+            let allowed_servers = if effective_server_filter.is_some() || profile.is_some() || tenant_scoped {
                 Some(
                     visible_server_names
                         .iter()
@@ -1412,7 +1511,14 @@ impl ProxyServer {
         drop(engine);
 
         if let Some(filter) = effective_server_filter.as_ref() {
-            match self.child_manager.start_server(filter).await {
+            // Recherche en direct : sur l'instance du tenant si le serveur est le sien.
+            let live_key = match self.route_call(&ctx, filter).await {
+                Ok(route) => route.key().to_string(),
+                Err(reason) => {
+                    return self.refuse_for_tenant(id, Some(&ctx), filter, "mcphub_search", reason).await
+                }
+            };
+            match self.child_manager.start_server(&live_key).await {
                 Ok(tools) => {
                     let tools: Vec<ToolDef> = crate::toolguard::present_tools(filter, &tools)
                         .into_iter()
@@ -1545,6 +1651,8 @@ impl ProxyServer {
         let Some(code) = args.get("code").and_then(|v| v.as_str()).map(String::from) else {
             return JsonRpcResponse::error(id, -32602, "Missing 'code' parameter".into());
         };
+        // Les appels du programme partent avec le dossier de l'appelant : même cloisonnement.
+        let run_origin = CallOrigin::from_args(&args).to_json();
         // Règles de projet : contrôlées avant de lancer quoi que ce soit.
         let policy = match args.get("policy").map(crate::codemode::RunPolicy::from_json) {
             None => None,
@@ -1635,6 +1743,7 @@ impl ProxyServer {
                         serde_json::json!({"id": req_id, "ok": false, "error": refusal})
                     } else {
                         let call_args = serde_json::json!({
+                            "_mcphub_context": run_origin.clone(),
                             "server": msg.get("server").cloned().unwrap_or_default(),
                             "tool": msg.get("tool").cloned().unwrap_or_default(),
                             "arguments": msg.get("args").cloned().unwrap_or(serde_json::json!({})),
@@ -1681,6 +1790,7 @@ impl ProxyServer {
                         serde_json::json!({"id": req_id, "ok": false, "error": refusal})
                     } else {
                         let mut search_args = serde_json::json!({
+                            "_mcphub_context": run_origin.clone(),
                             "query": msg.get("query").cloned().unwrap_or_default(),
                             // Sous policy, on cherche plus large : le filtrage retire des résultats.
                             "top_k": if policy.is_some() { 50 } else { SEARCH_RESULTS },
@@ -1740,6 +1850,7 @@ impl ProxyServer {
             duration_ms: Some(elapsed),
             arguments: Some(serde_json::json!({ "code": code, "calls": calls })),
             error: outcome.as_ref().err().cloned(),
+            tenant: None,
         })
         .await;
         let mut payload = crate::codemode::run_payload(calls, elapsed, logs, policy.is_some());
@@ -1811,6 +1922,7 @@ impl ProxyServer {
                 duration_ms: Some(started.elapsed().as_millis() as u64),
                 arguments: Some(crate::audit::safe_arguments(&arguments)),
                 error: outcome.as_ref().err().cloned(),
+                tenant: None,
             })
             .await;
         }
@@ -1899,6 +2011,27 @@ impl ProxyServer {
         id: Option<serde_json::Value>,
         args: serde_json::Value,
     ) -> JsonRpcResponse {
+        let origin = CallOrigin::from_args(&args);
+        let ctx = match self.call_context(&origin) {
+            Ok(ctx) => ctx,
+            Err(reason) => {
+                let server = args.get("server").and_then(|v| v.as_str()).unwrap_or("?");
+                let tool = args.get("tool").and_then(|v| v.as_str()).unwrap_or("?");
+                return self.refuse_for_tenant(id, None, server, tool, reason).await;
+            }
+        };
+        let tenant = ctx.tenant_id().map(String::from);
+        CALL_TENANT
+            .scope(tenant, Box::pin(self.handle_execute_in(id, args, ctx)))
+            .await
+    }
+
+    async fn handle_execute_in(
+        &self,
+        id: Option<serde_json::Value>,
+        args: serde_json::Value,
+        ctx: Context,
+    ) -> JsonRpcResponse {
         let server = match args.get("server").and_then(|v| v.as_str()) {
             Some(s) => s.to_string(),
             None => return JsonRpcResponse::error(id, -32602, "Missing 'server' parameter".into()),
@@ -1917,6 +2050,16 @@ impl ProxyServer {
             let token = args.get("confirmation_token").and_then(|v| v.as_str());
             return self.handle_hub_tool(id, &tool, arguments, token).await;
         }
+        // Cloisonnement des tenants : décidé avant tout le reste, sur le nom canonique.
+        let canonical = self
+            .child_manager
+            .resolve_name(&server)
+            .await
+            .unwrap_or_else(|| server.clone());
+        let route = match self.route_call(&ctx, &canonical).await {
+            Ok(route) => route,
+            Err(reason) => return self.refuse_for_tenant(id, Some(&ctx), &server, &tool, reason).await,
+        };
         let bypass_cache = args
             .get("bypass_cache")
             .and_then(|v| v.as_bool())
@@ -2024,7 +2167,7 @@ impl ProxyServer {
             .policy_gate(
                 &id,
                 "discover",
-                &server,
+                &route,
                 &tool,
                 &arguments,
                 confirmation_token.as_deref(),
@@ -2051,10 +2194,13 @@ impl ProxyServer {
         // Règle inchangée : tout appel non cacheable vide le cache de son serveur.
         let mutating = !read_only;
         let epoch = self.child_manager.epoch();
+        // Cache, processus et métriques : par instance (`serveur@tenant`), jamais partagés
+        // entre McpHub et un tenant.
+        let process_key = route.key().to_string();
         // Relevée avant l'appel : une écriture concurrente la fait avancer.
-        let cache_generation = self.response_cache.generation(&server);
+        let cache_generation = self.response_cache.generation(&process_key);
         if cacheable {
-            if let Some(hit) = self.response_cache.get(&server, &tool, &arguments, epoch) {
+            if let Some(hit) = self.response_cache.get(&process_key, &tool, &arguments, epoch) {
                 let mut value = hit.value;
                 if let Some(obj) = value.as_object_mut() {
                     obj.insert(
@@ -2079,7 +2225,7 @@ impl ProxyServer {
                     .lock()
                     .await
                     .tools
-                    .entry(format!("{}__{}", server, tool))
+                    .entry(format!("{}__{}", process_key, tool))
                     .or_default()
                     .record_cache_hit();
                 self.record_execute_route(execute_strategy).await;
@@ -2095,23 +2241,23 @@ impl ProxyServer {
 
         // Avant et après : une lecture lancée pendant l'écriture ne doit pas survivre à celle-ci.
         if mutating {
-            self.response_cache.invalidate_server(&server);
+            self.response_cache.invalidate_server(&process_key);
         }
         let start_time = Instant::now();
         let res = self
             .child_manager
-            .call_tool(&server, &tool, arguments.clone())
+            .call_tool(&process_key, &tool, arguments.clone())
             .await;
         if mutating {
-            self.response_cache.invalidate_server(&server);
+            self.response_cache.invalidate_server(&process_key);
         }
         let elapsed = start_time.elapsed().as_millis() as u64;
 
-        let usage_key = format!("{}__{}", server, tool);
+        let usage_key = format!("{}__{}", process_key, tool);
         let usage_snapshot = {
             let mut m = self.metrics.lock().await;
             m.total_requests += 1;
-            let sm = m.servers.entry(server.clone()).or_default();
+            let sm = m.servers.entry(process_key.clone()).or_default();
             sm.call_count += 1;
             sm.total_latency_ms += elapsed;
             sm.last_call_time = Some(SystemTime::now());
@@ -2150,7 +2296,7 @@ impl ProxyServer {
                 if cacheable {
                     self.response_cache
                         .put_if_current(
-                            &server,
+                            &process_key,
                             &tool,
                             &arguments,
                             normalized.clone(),
@@ -2213,6 +2359,12 @@ impl ProxyServer {
             .unwrap_or_else(|| parts[0].to_string());
         let server = canonical_server.as_str();
         let tool = parts[1];
+        // Le passthrough n'a pas de dossier de travail : comptes McpHub uniquement, jamais
+        // une instance de tenant.
+        let route = match crate::tenant::route(&Context::Hub, server) {
+            Ok(route) => route,
+            Err(reason) => return self.refuse_for_tenant(id, None, server, tool, reason).await,
+        };
 
         // En mode passthrough, le jeton de confirmation voyage dans un argument réservé,
         // retiré avant l'envoi au serveur.
@@ -2225,7 +2377,7 @@ impl ProxyServer {
             .policy_gate(
                 &id,
                 "passthrough",
-                server,
+                &route,
                 tool,
                 &arguments,
                 confirmation_token.as_deref(),
@@ -2254,6 +2406,7 @@ impl ProxyServer {
             duration_ms: Some(elapsed),
             arguments: Some(audit_arguments),
             error: res.as_ref().err().cloned(),
+            tenant: None,
         })
         .await;
 
@@ -3080,6 +3233,7 @@ done
             url: None,
             headers: HashMap::new(),
             oauth: false,
+            tenant: None,
         };
         let mut servers: HashMap<String, crate::config::ServerConfig> = names
             .iter()

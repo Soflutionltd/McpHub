@@ -126,6 +126,7 @@ mod tests {
             url: None,
             headers: HashMap::new(),
             oauth: false,
+            tenant: None,
         }
     }
 

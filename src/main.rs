@@ -29,6 +29,7 @@ mod sandbox;
 mod search;
 mod sse;
 mod sync;
+mod tenant;
 mod toolguard;
 mod untrusted;
 mod update;
@@ -64,10 +65,13 @@ USAGE:
   McpHub import       Import configuration from a file
   McpHub search "q"   Test BM25 search
   McpHub vault        Secrets in the macOS Keychain (status, list, set, get, rm, migrate)
+                      --tenant ID: the isolated vault of a tenant (client accounts)
+  McpHub tenant       Client accounts isolated from yours: add ID --dir DIR, list, check ID, rm ID
   McpHub policy       Show tool permissions; 'policy test SERVER TOOL' to check one
   McpHub audit        Show the audit log (--tail N, --server S, --tool T, --decision D, --json)
   McpHub sandbox      Server isolation (macOS sandbox): list, or 'sandbox show SERVER'
   McpHub oauth        Remote servers: status, login SERVER, logout SERVER, migrate [--apply] (from mcp-remote)
+                      --tenant ID: tokens of a tenant (login prints the URL, never opens your browser)
   McpHub pins         Tool pinning (anti rug-pull): list, status, approve SERVER [TOOL], reset SERVER, scan
   McpHub registry     Library of the official MCP Registry: search, info, install, uninstall
   McpHub sync         Move the config to another machine with no plaintext secret (export, import)
@@ -362,6 +366,7 @@ async fn main() {
             cmd_search(query);
         }
         Some("vault") => vault::run_cli(&args[2..]),
+        Some("tenant") | Some("tenants") => std::process::exit(tenant::run_cli(&args[2..])),
         Some("policy") => {
             let config = auto_detect();
             permissions::run_cli(&args[2..], &config.permissions);
