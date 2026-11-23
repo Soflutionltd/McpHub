@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { readFile, stat, writeFile } from 'node:fs/promises';
+import { open, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, normalize, parse, sep } from 'node:path';
@@ -38,6 +38,7 @@ const hubDirectory =
   join(homedir(), instanceName ? `.McpHub-${instanceName}` : '.McpHub');
 const projectsPath = process.env.MCPHUB_PROJECTS ?? join(hubDirectory, 'projects.json');
 const usagePath = join(hubDirectory, 'client-usage-stats.json');
+const usageLockPath = `${usagePath}.lock`;
 const schemaCachePath = join(hubDirectory, 'schema-cache.json');
 const authTokenPath = join(hubDirectory, 'auth-token');
 const hubBinaryPath = process.env.MCPHUB_BINARY ?? join(homedir(), '.local', 'bin', 'McpHub');
@@ -52,6 +53,9 @@ const childCallTimeoutMs = Number(process.env.MCPHUB_CALL_TIMEOUT_MS ?? 600_000)
 const daemonProbeTimeoutMs = 1_500;
 const daemonRetryIntervalMs = Number(process.env.MCPHUB_DAEMON_RETRY_MS ?? 60_000);
 const usageFlushDelayMs = 2_000;
+// Verrou du fichier de statistiques : attente maximale, et âge au-delà duquel il est abandonné.
+const usageLockWaitMs = 2_000;
+const usageLockStaleMs = 5_000;
 const unknownSuggestionCount = 5;
 // Au-delà, le texte d'un résultat est coupé et le reste se lit par poignée.
 const defaultResultMaxChars = Number(process.env.MCPHUB_RESULT_MAX_CHARS ?? 60_000);
@@ -95,22 +99,48 @@ let lastDaemonProbeAt = 0;
 /** @type {Map<string, Promise<{ memory?: string, memoryError?: string }>>} */
 const pendingBootstraps = new Map();
 
-let usage = await readJson(usagePath, {
-  calls: 0,
-  searches: 0,
-  batches: 0,
-  bootstrapCalls: 0,
-  suggestionsServed: 0,
-  runs: 0,
-  runCalls: 0,
-  childResultBytes: 0,
-  startedAt: new Date().toISOString()
-});
-usage.suggestionsServed ??= 0;
-usage.runs ??= 0;
-usage.runCalls ??= 0;
-// Sans prototype : un nom de serveur vient de l'agent et sert de clé.
-usage.byServer = Object.assign(Object.create(null), usage.byServer);
+// Plusieurs fenêtres partagent client-usage-stats.json : chacune ne garde en mémoire que ce
+// qu'elle a compté depuis sa dernière écriture, et l'ajoute aux totaux du fichier.
+const usageCounters = [
+  'calls',
+  'searches',
+  'batches',
+  'bootstrapCalls',
+  'suggestionsServed',
+  'runs',
+  'runCalls',
+  'childResultBytes'
+];
+
+function emptyUsage() {
+  return {
+    ...Object.fromEntries(usageCounters.map((counter) => [counter, 0])),
+    // Sans prototype : un nom de serveur vient de l'agent et sert de clé.
+    byServer: Object.create(null)
+  };
+}
+
+const countOf = (value) => (Number.isFinite(value) && value > 0 ? value : 0);
+
+function addUsage(target, added) {
+  for (const counter of usageCounters) target[counter] += countOf(added?.[counter]);
+  for (const [server, entry] of Object.entries(added?.byServer ?? {})) {
+    const total = (target.byServer[server] ??= { calls: 0, resultBytes: 0 });
+    total.calls += countOf(entry?.calls);
+    total.resultBytes += countOf(entry?.resultBytes);
+  }
+  return target;
+}
+
+async function readUsageTotals() {
+  const stored = await readJson(usagePath, {});
+  return {
+    ...addUsage(emptyUsage(), stored),
+    startedAt: typeof stored?.startedAt === 'string' ? stored.startedAt : new Date().toISOString()
+  };
+}
+
+let usage = emptyUsage();
 
 async function readJson(path, fallback) {
   try {
@@ -181,15 +211,67 @@ function recordServerUsage(server, delivered) {
   markUsageDirty();
 }
 
+async function withUsageLock(task) {
+  const deadline = Date.now() + usageLockWaitMs;
+  for (;;) {
+    try {
+      await (await open(usageLockPath, 'wx', 0o600)).close();
+      break;
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+      const lock = await stat(usageLockPath).catch(() => undefined);
+      if (!lock) continue;
+      if (Date.now() - lock.mtimeMs > usageLockStaleMs) {
+        // Une fenêtre arrêtée pendant son écriture a laissé le verrou.
+        await unlink(usageLockPath).catch(() => {});
+        continue;
+      }
+      if (Date.now() > deadline) throw new Error('client-usage-stats.json is locked by another window');
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+  try {
+    return await task();
+  } finally {
+    await unlink(usageLockPath).catch(() => {});
+  }
+}
+
+async function mergeUsageIntoFile() {
+  // Échangé avant toute attente : ce qui est compté pendant l'écriture part à la suivante.
+  const counted = usage;
+  usage = emptyUsage();
+  try {
+    await withUsageLock(async () => {
+      const totals = addUsage(await readUsageTotals(), counted);
+      const temporaryPath = `${usagePath}.${process.pid}.tmp`;
+      try {
+        await writeFile(temporaryPath, `${JSON.stringify(totals, null, 2)}\n`, { mode: 0o600 });
+        await rename(temporaryPath, usagePath);
+      } catch (error) {
+        await unlink(temporaryPath).catch(() => {});
+        throw error;
+      }
+    });
+  } catch {
+    // Les statistiques ne doivent jamais faire échouer un appel d'outil : ce qui
+    // n'a pas pu être écrit reste compté pour la prochaine écriture.
+    addUsage(usage, counted);
+    usageDirty = true;
+  }
+}
+
 function flushUsage() {
   if (!usageDirty) return usageFlushing;
   usageDirty = false;
-  usageFlushing = writeFile(usagePath, `${JSON.stringify(usage, null, 2)}\n`, {
-    mode: 0o600
-  }).catch(() => {
-    // Les statistiques ne doivent jamais faire échouer un appel d'outil.
-  });
+  usageFlushing = usageFlushing.then(mergeUsageIntoFile);
   return usageFlushing;
+}
+
+// Totaux de toutes les fenêtres, plus ce que celle-ci n'a pas encore pu écrire.
+async function readSharedUsage() {
+  await flushUsage();
+  return addUsage(await readUsageTotals(), usage);
 }
 
 for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
@@ -1632,7 +1714,8 @@ registerHubTool(
   async () => {
     try {
       const catalog = await readSchemaCatalog();
-      const { byServer: _detailedBelow, ...totalUsage } = usage;
+      const sharedUsage = await readSharedUsage();
+      const { byServer: serverUsage, ...totalUsage } = sharedUsage;
       const catalogSaved = Math.max(
         0,
         catalog.cursorCatalogBytes - hubCatalog.fullBytes
@@ -1686,13 +1769,13 @@ registerHubTool(
               : 'Child servers are spawned per Cursor window. Start the daemon (McpHub install) to share them.'
         },
         codeMode: {
-          runs: usage.runs,
-          callsInsideScripts: usage.runCalls,
-          roundTripsSaved: Math.max(0, usage.runCalls - usage.runs),
+          runs: sharedUsage.runs,
+          callsInsideScripts: sharedUsage.runCalls,
+          roundTripsSaved: Math.max(0, sharedUsage.runCalls - sharedUsage.runs),
           note: 'Each mcphub_run is one round trip, whatever the number of tool calls its script makes.'
         },
         perServer: {
-          servers: Object.entries(usage.byServer)
+          servers: Object.entries(serverUsage)
             .map(([server, { calls, resultBytes }]) => ({
               server,
               calls,

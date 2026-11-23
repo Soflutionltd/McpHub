@@ -515,6 +515,39 @@ try {
     await claudeCode.close();
   }
 
+  // Several windows share one statistics file: each adds what it counted, none erases the others.
+  const windows = await Promise.all(
+    [1, 2, 3].map(async () => {
+      const window = new Client({ name: 'mcphub-offline-window', version: '1.0.0' });
+      await window.connect(
+        new StdioClientTransport({
+          command: process.execPath,
+          args: [process.env.MCPHUB_CLIENT_ENTRY ?? 'index.js'],
+          cwd: new URL('.', import.meta.url).pathname,
+          env: { ...process.env, ...clientEnv },
+          stderr: 'pipe'
+        })
+      );
+      return window;
+    })
+  );
+  try {
+    const windowCall = { name: 'mcphub_call', arguments: { server: 'windows', tool: 'read_row', arguments: { id: 1 } } };
+    await Promise.all(windows.flatMap((window) => [1, 2, 3, 4].map(() => window.callTool(windowCall))));
+    // Every window writes at the same moment, then any of them reports the total of all.
+    const reports = await Promise.all(
+      windows.map(async (window) => JSON.parse(text(await window.callTool({ name: 'mcphub_savings', arguments: {} }))))
+    );
+    const lastReport = JSON.parse(text(await windows[0].callTool({ name: 'mcphub_savings', arguments: {} })));
+    const shared = lastReport.perServer.servers.find((entry) => entry.server === 'windows');
+    assert.equal(shared.calls, 12);
+    // The same answer twelve times: the bytes add up exactly.
+    assert.ok(shared.resultBytes > 0 && shared.resultBytes % 12 === 0, String(shared.resultBytes));
+    assert.ok(reports.every((report) => report.perServer.servers.some((entry) => entry.server === 'windows')));
+  } finally {
+    await Promise.all(windows.map((window) => window.close()));
+  }
+
   console.log('offline client tests: ok');
 } finally {
   await client.close();
