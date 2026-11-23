@@ -136,12 +136,30 @@ fn redact_json_value_with_parent(parent_key: Option<&str>, value: &Value) -> Val
         }
         Value::Array(array) => {
             if parent_key == Some("args") {
+                // Le contexte compte : la valeur qui suit un flag sensible ("--token", "abc")
+                // et celle d'un "--password=..." sont masquées quelle que soit leur forme.
+                let mut after_sensitive_flag = false;
                 Value::Array(
                     array
                         .iter()
                         .map(|item| match item {
-                            Value::String(argument) => Value::String(redact_text(argument)),
-                            other => redact_json_value(other),
+                            Value::String(argument) => {
+                                let follows_flag = std::mem::take(&mut after_sensitive_flag);
+                                if follows_flag {
+                                    return Value::String(redact_value(argument));
+                                }
+                                if let Some((key, value)) = argument.split_once('=') {
+                                    if key.starts_with('-') && is_sensitive_flag(key) {
+                                        return Value::String(format!("{key}={}", redact_value(value)));
+                                    }
+                                }
+                                after_sensitive_flag = argument.starts_with('-') && is_sensitive_flag(argument);
+                                Value::String(redact_text(argument))
+                            }
+                            other => {
+                                after_sensitive_flag = false;
+                                redact_json_value(other)
+                            }
                         })
                         .collect(),
                 )
@@ -183,12 +201,12 @@ fn redact_value(value: &str) -> String {
     format!("[REDACTED:{}]", value.len())
 }
 
-fn is_sensitive_flag(flag: &str) -> bool {
+pub(crate) fn is_sensitive_flag(flag: &str) -> bool {
     let trimmed = flag.trim_start_matches('-');
     is_sensitive_key(trimmed)
 }
 
-fn is_sensitive_key(key: &str) -> bool {
+pub(crate) fn is_sensitive_key(key: &str) -> bool {
     let normalized: String = key
         .chars()
         .filter(|char| char.is_ascii_alphanumeric())
@@ -204,7 +222,7 @@ fn is_sensitive_key(key: &str) -> bool {
         .any(|keyword| normalized.contains(keyword))
 }
 
-fn looks_like_secret_value(value: &str) -> bool {
+pub(crate) fn looks_like_secret_value(value: &str) -> bool {
     let trimmed = value.trim_matches(|char: char| {
         matches!(
             char,
@@ -265,6 +283,15 @@ mod tests {
         let redacted = redact_text("Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9");
         assert!(redacted.contains("Bearer [REDACTED:36]"));
         assert!(!redacted.contains("eyJhbGci"));
+    }
+
+    #[test]
+    fn test_redact_json_value_masks_args_after_sensitive_flag() {
+        let redacted = redact_json_value(&json!({
+            "args": ["-y", "pkg", "--token", "abc", "--password=hunter2", "--verbose", "keep"]
+        }));
+        let args: Vec<&str> = redacted["args"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(args, vec!["-y", "pkg", "--token", "[REDACTED:3]", "--password=[REDACTED:7]", "--verbose", "keep"]);
     }
 
     #[test]
