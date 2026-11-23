@@ -419,6 +419,123 @@ pub fn write_raw_atomic(path: &Path, config: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Sauvegardes gardées dans `backups/` à côté de la config.
+const BACKUPS_KEPT: usize = 20;
+
+/// Une seule modification protégée à la fois dans ce processus.
+static GUARDED_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Empreinte courte du contenu d'un fichier de config ("" pour un fichier absent).
+pub fn revision_of(bytes: Option<&[u8]>) -> String {
+    use sha2::{Digest, Sha256};
+    match bytes {
+        None => String::new(),
+        Some(b) => Sha256::digest(b).iter().take(8).map(|x| format!("{:02x}", x)).collect(),
+    }
+}
+
+fn read_bytes(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    match fs::read(path) {
+        Ok(b) => Ok(Some(b)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{} illisible : {}", path.display(), e)),
+    }
+}
+
+/// Config brute et son empreinte, pour une lecture suivie d'une modification protégée.
+pub fn read_raw_with_revision(path: &Path) -> Result<(Option<Value>, String), String> {
+    let bytes = read_bytes(path)?;
+    let revision = revision_of(bytes.as_deref());
+    Ok((read_raw(path)?, revision))
+}
+
+/// Copie du fichier actuel dans `backups/config-<horodatage>.json` (600), puis seules les
+/// `BACKUPS_KEPT` plus récentes sont gardées.
+fn backup_config(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| format!("{} : pas de dossier parent", path.display()))?
+        .join("backups");
+    fs::create_dir_all(&dir).map_err(|e| format!("{} : {}", dir.display(), e))?;
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let stamp: String = crate::audit::iso_utc(d.as_secs(), d.subsec_millis())
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    let seq = WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let target = dir.join(format!("config-{}-{:06}.json", stamp, seq % 1_000_000));
+    write_private_synced(&target, bytes).map_err(|e| format!("{} : {}", target.display(), e))?;
+    let mut existing: Vec<PathBuf> = fs::read_dir(&dir)
+        .map_err(|e| format!("{} : {}", dir.display(), e))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("config-") && n.ends_with(".json"))
+        })
+        .collect();
+    existing.sort();
+    let excess = existing.len().saturating_sub(BACKUPS_KEPT);
+    for old in existing.into_iter().take(excess) {
+        let _ = fs::remove_file(old);
+    }
+    Ok(target)
+}
+
+/// Résultat d'une modification protégée.
+pub struct GuardedWrite<T> {
+    pub value: T,
+    /// Empreinte du fichier après écriture (inchangée si rien n'a été écrit).
+    pub revision: String,
+    pub backup: Option<PathBuf>,
+}
+
+/// Modification protégée de la config : refus si `expected` (empreinte lue plus tôt par
+/// l'appelant) ne correspond plus, sauvegarde avant écriture, et refus si le fichier a changé
+/// pendant la modification. `mutate` renvoie `false` en second élément pour ne rien écrire.
+pub fn update_raw_guarded<T>(
+    path: &Path,
+    expected: Option<&str>,
+    mutate: impl FnOnce(&mut Value) -> Result<(T, bool), String>,
+) -> Result<GuardedWrite<T>, String> {
+    let _lock = GUARDED_WRITE.lock().unwrap_or_else(|p| p.into_inner());
+    let before = read_bytes(path)?;
+    let revision = revision_of(before.as_deref());
+    if let Some(exp) = expected {
+        if exp != revision {
+            return Err(format!(
+                "{} a change depuis la lecture (revision {} attendue, {} actuelle) : relire avec servers_list puis reessayer",
+                path.display(),
+                exp,
+                revision
+            ));
+        }
+    }
+    let mut config = match &before {
+        None => serde_json::json!({ "mcpServers": {} }),
+        Some(_) => read_raw(path)?.unwrap_or_else(|| serde_json::json!({ "mcpServers": {} })),
+    };
+    let (value, write) = mutate(&mut config)?;
+    if !write {
+        return Ok(GuardedWrite { value, revision, backup: None });
+    }
+    let backup = match &before {
+        Some(bytes) => Some(backup_config(path, bytes)?),
+        None => None,
+    };
+    if revision_of(read_bytes(path)?.as_deref()) != revision {
+        return Err(format!(
+            "{} modifie par un autre programme pendant l'operation : rien n'a ete ecrit, reessayer",
+            path.display()
+        ));
+    }
+    write_raw_atomic(path, &config)?;
+    let revision = revision_of(read_bytes(path)?.as_deref());
+    Ok(GuardedWrite { value, revision, backup })
+}
+
 /// Fichier neuf, créé directement en 600 (la config peut contenir des secrets en clair) et
 /// écrit sur disque avant le renommage, pour qu'une coupure ne laisse pas un config.json vide.
 fn write_private_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -850,5 +967,52 @@ mod tests {
         .expect("parse config");
 
         assert_eq!(parsed.request_timeout_secs, 180);
+    }
+
+    #[test]
+    fn ecriture_protegee_sauvegarde_et_detecte_les_conflits() {
+        let dir = std::env::temp_dir().join(format!("mcphub-guarded-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        fs::write(&path, r#"{"mcpServers":{"a":{"command":"x"}}}"#).unwrap();
+        let (_, rev) = read_raw_with_revision(&path).unwrap();
+        assert_eq!(rev.len(), 16);
+
+        let done = update_raw_guarded(&path, Some(&rev), |c| {
+            c["mcpServers"]["b"] = json!({"command": "y"});
+            Ok(((), true))
+        })
+        .unwrap();
+        assert_ne!(done.revision, rev);
+        let backup = done.backup.expect("sauvegarde");
+        assert!(fs::read_to_string(&backup).unwrap().contains("\"a\""));
+        assert!(!fs::read_to_string(&backup).unwrap().contains("\"b\""));
+
+        // Ancienne révision : refus, rien d'écrit.
+        let err = update_raw_guarded(&path, Some(&rev), |c| {
+            c["mcpServers"]["c"] = json!({});
+            Ok(((), true))
+        })
+        .err()
+        .expect("conflit");
+        assert!(err.contains("a change"), "{}", err);
+        assert!(!fs::read_to_string(&path).unwrap().contains("\"c\""));
+
+        // Rien à écrire : pas de sauvegarde, révision inchangée.
+        let same = update_raw_guarded(&path, None, |_| Ok(((), false))).unwrap();
+        assert!(same.backup.is_none());
+        assert_eq!(same.revision, done.revision);
+
+        for _ in 0..(BACKUPS_KEPT + 3) {
+            update_raw_guarded(&path, None, |c| {
+                c["n"] = json!(c["n"].as_u64().unwrap_or(0) + 1);
+                Ok(((), true))
+            })
+            .unwrap();
+        }
+        let kept = fs::read_dir(dir.join("backups")).unwrap().count();
+        assert_eq!(kept, BACKUPS_KEPT);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

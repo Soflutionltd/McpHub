@@ -1679,10 +1679,6 @@ fn servers_obj(config: &Value) -> Option<&Map<String, Value>> {
     config.get(servers_key(config)).and_then(|v| v.as_object())
 }
 
-fn write_hub_config(config: &Value) -> Result<(), String> {
-    crate::config::write_raw_atomic(&hub_config_path(), config)
-}
-
 /// Nom local libre dérivé du nom du registre ("io.github.acme/weather-mcp" -> "weather-mcp").
 fn local_slug(name: &str, taken: &Map<String, Value>) -> String {
     let base: String = short_name(name)
@@ -1816,8 +1812,30 @@ pub async fn install(req: InstallRequest) -> Result<Value, String> {
         "installedAt": crate::audit::iso_utc_now(),
         "by": req.by,
     });
-    config[key][&local] = cfg.clone();
-    write_hub_config(&config)?;
+    // Relu et vérifié sous verrou : une modification faite pendant l'installation n'est pas
+    // écrasée, et la config précédente est sauvegardée.
+    let previous_name = previous.clone();
+    let written = crate::config::update_raw_guarded(&hub_config_path(), None, |fresh| {
+        let key = servers_key(fresh);
+        if fresh.get(key).and_then(|v| v.as_object()).is_none() {
+            fresh[key] = json!({});
+        }
+        if previous_name.as_deref() != Some(local.as_str()) && fresh[key].get(&local).is_some() {
+            return Err(format!("a server named {} already exists", local));
+        }
+        fresh[key][&local] = cfg.clone();
+        Ok(((), true))
+    });
+    if let Err(e) = written {
+        // Bundle téléchargé pour une nouvelle entrée qui n'a pas pu être écrite : pas d'orphelin.
+        if kind == "mcpb" && previous.is_none() {
+            let dir = servers_dir().join(&local);
+            if dir.starts_with(servers_dir()) && dir != servers_dir() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+        return Err(e);
+    }
 
     let oauth = kind == "remote" && cfg["auth"] == "oauth";
     let shown = crate::redaction::redact_json_value(&cfg);
@@ -1838,11 +1856,13 @@ pub async fn install(req: InstallRequest) -> Result<Value, String> {
 /// Retire un serveur installé depuis le registre (et son bundle éventuel). Les secrets restent
 /// au Trousseau : ils peuvent servir à d'autres serveurs.
 pub fn uninstall(local: &str) -> Result<bool, String> {
-    let mut config = read_hub_config()?;
-    let key = servers_key(&config);
-    let removed = config.get_mut(key).and_then(|v| v.as_object_mut()).and_then(|o| o.remove(local)).is_some();
+    let removed = crate::config::update_raw_guarded(&hub_config_path(), None, |config| {
+        let key = servers_key(config);
+        let removed = config.get_mut(key).and_then(|v| v.as_object_mut()).and_then(|o| o.remove(local)).is_some();
+        Ok((removed, removed))
+    })?
+    .value;
     if removed {
-        write_hub_config(&config)?;
         let dir = servers_dir().join(local);
         if dir.starts_with(servers_dir()) {
             let _ = std::fs::remove_dir_all(dir);
@@ -1943,8 +1963,9 @@ pub async fn agent_call(tool: &str, args: &Value) -> Result<Value, String> {
             .await
         }
         other => Err(format!(
-            "unknown McpHub tool {}: use registry_search, registry_info or registry_install",
-            other
+            "unknown McpHub tool {}: use registry_search, registry_info, registry_install, {}",
+            other,
+            crate::server_admin::ADMIN_TOOLS.join(", ")
         )),
     }
 }
