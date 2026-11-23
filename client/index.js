@@ -109,6 +109,8 @@ let usage = await readJson(usagePath, {
 usage.suggestionsServed ??= 0;
 usage.runs ??= 0;
 usage.runCalls ??= 0;
+// Sans prototype : un nom de serveur vient de l'agent et sert de clé.
+usage.byServer = Object.assign(Object.create(null), usage.byServer);
 
 async function readJson(path, fallback) {
   try {
@@ -168,6 +170,15 @@ function markUsageDirty() {
     void flushUsage();
   }, usageFlushDelayMs);
   usageFlushTimer.unref?.();
+}
+
+// Ce que l'agent reçoit réellement d'un serveur, après réduction du résultat :
+// c'est ce volume qui entre dans son contexte.
+function recordServerUsage(server, delivered) {
+  const entry = (usage.byServer[server] ??= { calls: 0, resultBytes: 0 });
+  entry.calls += 1;
+  entry.resultBytes += Buffer.byteLength(JSON.stringify(delivered) ?? '');
+  markUsageDirty();
 }
 
 function flushUsage() {
@@ -1376,7 +1387,9 @@ registerHubTool(
         visible: serverVisibility(projectConfig, working_dir),
         workingDirectory: working_dir
       });
-      return shapeChildResult(result, pickShaping(shaping), childServer).result;
+      const shaped = shapeChildResult(result, pickShaping(shaping), childServer).result;
+      recordServerUsage(childServer, shaped);
+      return shaped;
     } catch (error) {
       return errorToResult(error);
     }
@@ -1432,6 +1445,7 @@ registerHubTool(
           });
           const status = callStatus(result);
           const shaped = shapeChildResult(result, pickShaping(call), call.server);
+          recordServerUsage(call.server, shaped.value);
           return {
             id: call.id,
             ok: status === 'ok',
@@ -1618,6 +1632,7 @@ registerHubTool(
   async () => {
     try {
       const catalog = await readSchemaCatalog();
+      const { byServer: _detailedBelow, ...totalUsage } = usage;
       const catalogSaved = Math.max(
         0,
         catalog.cursorCatalogBytes - hubCatalog.fullBytes
@@ -1676,7 +1691,18 @@ registerHubTool(
           roundTripsSaved: Math.max(0, usage.runCalls - usage.runs),
           note: 'Each mcphub_run is one round trip, whatever the number of tool calls its script makes.'
         },
-        actualUsage: usage
+        perServer: {
+          servers: Object.entries(usage.byServer)
+            .map(([server, { calls, resultBytes }]) => ({
+              server,
+              calls,
+              resultBytes,
+              approximateTokens: Math.round(resultBytes / 4)
+            }))
+            .sort((left, right) => right.resultBytes - left.resultBytes),
+          note: 'Result bytes delivered to the agent by mcphub_call and mcphub_batch, after shaping, counted since this field was added. Calls made inside mcphub_run scripts are not attributed to a server. Bytes divided by four.'
+        },
+        actualUsage: totalUsage
       });
     } catch (error) {
       return textResult(errorMessage(error), true);

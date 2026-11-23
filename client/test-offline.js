@@ -290,7 +290,21 @@ try {
   assert.deepEqual(runs.at(-1).policy, { denied_servers: ['acme-crm'] });
 
   // Each run counts once, with the tool calls its script made: the round trips it saved.
-  const codeMode = JSON.parse(text(await client.callTool({ name: 'mcphub_savings', arguments: {} }))).codeMode;
+  const savingsReport = JSON.parse(text(await client.callTool({ name: 'mcphub_savings', arguments: {} })));
+  const codeMode = savingsReport.codeMode;
+
+  // Each server is listed with its calls and the bytes it sent to the agent, heaviest first.
+  const perServer = savingsReport.perServer.servers;
+  assert.ok(perServer.length > 0);
+  for (const entry of perServer) {
+    assert.ok(entry.calls > 0 && entry.resultBytes > 0, JSON.stringify(entry));
+    assert.equal(entry.approximateTokens, Math.round(entry.resultBytes / 4));
+  }
+  assert.deepEqual(perServer.map((entry) => entry.resultBytes), perServer.map((entry) => entry.resultBytes).sort((a, b) => b - a));
+  // A call refused before any result came back (bad shaping arguments) is counted in the total only.
+  const deliveredCalls = perServer.reduce((sum, entry) => sum + entry.calls, 0);
+  assert.ok(deliveredCalls > 0 && deliveredCalls <= savingsReport.actualUsage.calls);
+  assert.equal(savingsReport.actualUsage.byServer, undefined);
   assert.equal(codeMode.runs, 1);
   assert.equal(codeMode.callsInsideScripts, 2);
   assert.equal(codeMode.roundTripsSaved, 1);
