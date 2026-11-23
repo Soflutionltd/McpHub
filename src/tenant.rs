@@ -785,6 +785,14 @@ fn collect_refs(value: &Value, out: &mut BTreeSet<String>) {
     }
 }
 
+/// Variables `${NOM}` référencées par la config d'un serveur (env, args, url, en-têtes) : les
+/// noms que le coffre de McpHub doit fournir.
+pub fn referenced_vars(raw: &Value) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    collect_refs(raw, &mut out);
+    out
+}
+
 /// Variables qu'un serveur attend d'un tenant (noms seulement). `required` : les `${VAR}` de
 /// la config (args, url, en-têtes) et les clés d'env dont la valeur est un `${…}` ; `optional` :
 /// les autres clés d'env, écartées par la liste blanche sauf si le tenant les fournit (un
@@ -1132,7 +1140,7 @@ pub fn remove_tenant(json: &mut Value, id: &str) -> Result<String, String> {
         .and_then(|p| p.get_mut(&project))
         .and_then(|e| e.as_object_mut())
         .ok_or_else(|| format!("projet {} introuvable", project))?;
-    for key in ["tenant", "credentials", "keepEnv", "sharedServers"] {
+    for key in ["tenant", "credentials", "keepEnv", "sharedServers", "browser"] {
         entry.remove(key);
     }
     Ok(project)

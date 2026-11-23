@@ -567,7 +567,7 @@ fn ecran_client_accounts_par_http() {
     let snapshot: Value = serde_json::from_str(&text).unwrap();
     let acme = &snapshot["tenants"][0];
     assert_eq!(acme["id"], "acme");
-    assert_eq!(acme["servers"][0]["secrets"][0], json!({ "var": "TOKEN", "name": "ACME_TOKEN", "present": true }));
+    assert_eq!(acme["servers"][0]["secrets"][0], json!({ "var": "TOKEN", "name": "ACME_TOKEN", "present": true, "connector": null }));
     assert_eq!(acme["cf"]["projects"], json!([{ "name": "acme-site", "cf_project_name": "acme-pages", "type": "pages" }]));
     let svc = snapshot["available"].as_array().unwrap().iter().find(|a| a["name"] == "svc").unwrap();
     assert_eq!(svc["required"], json!(["TOKEN"]));
@@ -661,6 +661,93 @@ fn ecran_client_accounts_par_http() {
             assert!(text.contains("tenant.secret_set ACME_TOKEN"));
             assert!(text.contains("tenant.servers_set"));
             assert!(!text.contains("acme-rotated"));
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "audit incomplet : {}", text);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn connexion_des_services_par_http() {
+    let fx = Fixture::new("connect");
+    let daemon = Daemon::start(&fx);
+    let hub_secrets = fx.hub.join("secrets.env");
+    let projects_path = fx.hub.join("projects.json");
+
+    // Jeton du compte McpHub : seulement une variable attendue par un serveur de config.json.
+    let (status, _) = daemon.raw(
+        "PUT",
+        "/api/secrets/HUB_TOKEN",
+        Some(json!({ "value": "pirate" }).to_string()),
+        Some(&daemon.token),
+        Some("http://evil.example"),
+    );
+    assert_eq!(status, 403);
+    let (status, text) = daemon.call("PUT", "/api/secrets/HUB_TOKEN", Some(&json!({ "value": "hub-rotated" })));
+    assert_eq!(status, 200, "{}", text);
+    assert!(!text.contains("hub-rotated"));
+    let body: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["replaced"], true);
+    assert_eq!(body["written"], json!(["HUB_TOKEN"]));
+    assert!(std::fs::read_to_string(&hub_secrets).unwrap().contains("HUB_TOKEN=hub-rotated"));
+    for name in ["NOT_USED", "MCPHUB_OAUTH_SVC", "bad-name"] {
+        let (status, _) = daemon.call("PUT", &format!("/api/secrets/{}", name), Some(&json!({ "value": "x" })));
+        assert_eq!(status, 400, "{}", name);
+    }
+    let (status, _) = daemon.call("PUT", "/api/secrets/HUB_TOKEN", Some(&json!({ "value": "  " })));
+    assert_eq!(status, 400);
+
+    // Cartes des serveurs : états des jetons, jamais de valeur.
+    let (status, text) = daemon.call("GET", "/api/servers", None);
+    assert_eq!(status, 200);
+    assert!(!text.contains("hub-rotated") && !text.contains("hub-secret"));
+    let servers: Value = serde_json::from_str(&text).unwrap();
+    let svc = servers["servers"].as_array().unwrap().iter().find(|s| s["name"] == "svc").unwrap();
+    assert_eq!(svc["keys"], json!([{ "var": "HUB_TOKEN", "present": true, "connector": null }]));
+    assert_eq!(svc["oauth"]["capable"], false);
+
+    // Adresse de retour OAuth collée : inconnue ou illisible, refusée.
+    let (status, _) = daemon.call(
+        "POST",
+        "/api/oauth/manual",
+        Some(&json!({ "url": "http://localhost:24680/oauth/callback?code=a&state=inconnu" })),
+    );
+    assert_eq!(status, 400);
+    let (status, _) = daemon.call("POST", "/api/oauth/manual", Some(&json!({ "url": "pas une adresse" })));
+    assert_eq!(status, 400);
+
+    // Ouverture de page : HTTPS seulement.
+    let (status, _) = daemon.call("POST", "/api/open", Some(&json!({ "url": "file:///etc/passwd" })));
+    assert_eq!(status, 400);
+
+    // Code d'appareil : réservé aux jetons GitHub attendus par le coffre.
+    let (status, _) = daemon.call("POST", "/api/connect/device", Some(&json!({ "name": "ACME_TOKEN", "tenant": "acme" })));
+    assert_eq!(status, 400);
+    let (status, _) = daemon.call("GET", "/api/connect/device?id=inconnu", None);
+    assert_eq!(status, 404);
+
+    // Profil de navigateur du client : profil inconnu refusé, retour au navigateur par défaut.
+    let (_, snapshot) = daemon.json("GET", "/api/tenants", None);
+    assert_eq!(snapshot["tenants"][0]["browser"], Value::Null);
+    let version = snapshot["version"].as_str().unwrap().to_string();
+    let (status, _) = daemon.json(
+        "PUT",
+        "/api/tenants/acme/browser",
+        Some(&json!({ "app": "Nope", "profile": "X", "version": version })),
+    );
+    assert_eq!(status, 400);
+    let (status, body) = daemon.json("PUT", "/api/tenants/acme/browser", Some(&json!({ "version": version })));
+    assert_eq!(status, 200, "{}", body);
+    assert!(read_json(&projects_path)["projects"]["acme"].get("browser").is_none());
+
+    // Audit : le nom du secret, jamais la valeur.
+    let audit = fx.hub.join("audit.jsonl");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let text = std::fs::read_to_string(&audit).unwrap_or_default();
+        if text.contains("secret_set HUB_TOKEN") {
+            assert!(!text.contains("hub-rotated"));
             break;
         }
         assert!(std::time::Instant::now() < deadline, "audit incomplet : {}", text);

@@ -407,6 +407,8 @@ fn handle_get_servers() -> Vec<u8> {
     let mut result: Vec<Value> = Vec::new();
     let mut names: Vec<String> = servers_obj.keys().cloned().collect();
     names.sort();
+    // Noms seulement : connexions OAuth et jetons présents dans le coffre de McpHub.
+    let stored: std::collections::BTreeSet<String> = crate::vault::list_names().into_iter().collect();
 
     for name in &names {
         let srv = &servers_obj[name];
@@ -431,7 +433,21 @@ fn handle_get_servers() -> Vec<u8> {
             "url": srv.get("url").and_then(|v| v.as_str()).unwrap_or(""),
             "toolNames": tools,
             "status": if cached.is_some() { "cached" } else if !error_msg.is_empty() { "error" } else { "uncached" },
-            "error": error_msg
+            "error": error_msg,
+            "oauth": {
+                "capable": is_oauth_server(srv),
+                "connected": stored.contains(&crate::oauth::vault_name(name)),
+            },
+            "keys": crate::tenant::referenced_vars(srv)
+                .into_iter()
+                .map(|var| {
+                    json!({
+                        "present": stored.contains(&var) || std::env::var(&var).is_ok(),
+                        "connector": crate::connectors::describe(&var, None),
+                        "var": var,
+                    })
+                })
+                .collect::<Vec<_>>(),
         }));
     }
 
@@ -1156,7 +1172,14 @@ fn tenants_snapshot() -> Result<Value, String> {
                     "in_config": raw.is_some(),
                     "secrets": vars
                         .iter()
-                        .map(|(var, name)| json!({ "var": var, "name": name, "present": stored.contains(name) }))
+                        .map(|(var, name)| {
+                            json!({
+                                "var": var,
+                                "name": name,
+                                "present": stored.contains(name),
+                                "connector": crate::connectors::describe(var, Some(&t.id)),
+                            })
+                        })
                         .collect::<Vec<_>>(),
                     "oauth": {
                         "capable": raw.is_some_and(is_oauth_server),
@@ -1180,6 +1203,7 @@ fn tenants_snapshot() -> Result<Value, String> {
             "servers": servers,
             "shared_servers": t.shared_servers,
             "cf": cf,
+            "browser": tenant_browser_profile(&t.id).as_ref().map(profile_json),
         }));
     }
     Ok(json!({
@@ -1227,6 +1251,16 @@ async fn audit_tenant_action(
     action: String,
     result: &Result<(), String>,
 ) {
+    audit_dashboard_action(proxy, Some(tenant), action, result).await
+}
+
+/// Action du tableau de bord (compte McpHub ou tenant), notée au journal d'audit.
+async fn audit_dashboard_action(
+    proxy: &Option<Arc<ProxyServer>>,
+    tenant: Option<&str>,
+    action: String,
+    result: &Result<(), String>,
+) {
     let entry = crate::audit::AuditEntry {
         server: "mcphub".into(),
         tool: action,
@@ -1235,7 +1269,7 @@ async fn audit_tenant_action(
         policy: "dashboard".into(),
         status: if result.is_ok() { "ok" } else { "error" },
         error: result.as_ref().err().cloned(),
-        tenant: Some(tenant.to_string()),
+        tenant: tenant.map(String::from),
         ..Default::default()
     };
     match proxy {
@@ -1427,44 +1461,392 @@ fn declared_secret(id: &str, name: &str) -> Result<(), Vec<u8>> {
     }
 }
 
-/// `PUT /api/tenants/<id>/secrets/<NOM>` : {value}. Écriture seule : la valeur part vers le
-/// coffre du tenant et n'est jamais renvoyée ni journalisée.
+/// `PUT /api/tenants/<id>/secrets/<NOM>` : {value, verify?}. Écriture seule : la valeur part
+/// vers le coffre du tenant et n'est jamais renvoyée ni journalisée.
 async fn handle_set_tenant_secret(proxy: Option<Arc<ProxyServer>>, id: &str, name: &str, body: &str) -> Vec<u8> {
-    if body.len() > SECRET_BODY_MAX {
-        return json_err(413, "valeur trop longue (16 Ko au plus)");
-    }
-    let value = match serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|v| v.get("value").and_then(|x| x.as_str()).map(String::from))
-    {
-        Some(v) if !v.is_empty() => v,
-        _ => return json_err(400, "value requis (texte non vide)"),
-    };
-    if value.contains('\n') || value.contains('\r') {
-        return json_err(400, "valeur sur plusieurs lignes non prise en charge");
-    }
     if let Err(resp) = declared_secret(id, name) {
         return resp;
     }
-    let scope = crate::vault::Scope::Tenant(id.to_string());
-    let task_name = name.to_string();
+    key_response(store_key_from_body(proxy, KeyTarget::Tenant(id.to_string()), name, body).await)
+}
+
+// ─── Connexion des services : jeton collé, code d'appareil, profils ───
+
+/// Coffre qui reçoit un jeton : celui de McpHub (noms = variables) ou celui d'un tenant.
+#[derive(Clone, Debug)]
+enum KeyTarget {
+    Hub,
+    Tenant(String),
+}
+
+impl KeyTarget {
+    fn tenant(&self) -> Option<&str> {
+        match self {
+            KeyTarget::Hub => None,
+            KeyTarget::Tenant(id) => Some(id),
+        }
+    }
+}
+
+/// Emplacements d'un coffre (variable → noms) et noms déjà remplis.
+struct KeySlots {
+    slots: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    present: std::collections::BTreeSet<String>,
+}
+
+/// Lecture bloquante (fichiers, Trousseau). Compte McpHub : variables `${...}` référencées par
+/// les serveurs de config.json ; tenant : secrets déclarés dans projects.json.
+fn key_slots(target: &KeyTarget) -> Result<KeySlots, String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut slots: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    match target {
+        KeyTarget::Hub => {
+            for raw in crate::tenant::configured_servers()?.values() {
+                for var in crate::tenant::referenced_vars(raw) {
+                    slots.entry(var.clone()).or_default().insert(var);
+                }
+            }
+            let mut present: BTreeSet<String> = crate::vault::list_names().into_iter().collect();
+            present.extend(slots.keys().filter(|v| std::env::var(v.as_str()).is_ok()).cloned());
+            Ok(KeySlots { slots, present })
+        }
+        KeyTarget::Tenant(id) => {
+            let tenants = crate::tenant::load_from(&crate::tenant::projects_path())?;
+            let def = tenants.get(id).ok_or_else(|| format!("tenant {} inconnu", id))?;
+            for (var, name) in def.credentials.values().flatten() {
+                slots.entry(var.clone()).or_default().insert(name.clone());
+            }
+            let scope = crate::vault::Scope::Tenant(id.clone());
+            Ok(KeySlots { slots, present: crate::vault::list_names_in(&scope).into_iter().collect() })
+        }
+    }
+}
+
+/// Variable correspondant au nom visé, s'il est bien un emplacement du coffre.
+fn slot_var(slots: &KeySlots, name: &str) -> Option<String> {
+    if name.starts_with(crate::oauth::VAULT_PREFIX) || !crate::vault::is_valid_name(name) {
+        return None;
+    }
+    slots.slots.iter().find(|(_, names)| names.contains(name)).map(|(var, _)| var.clone())
+}
+
+/// Échec d'un enregistrement de jeton : statut HTTP, message, et vrai si le service était
+/// injoignable (le tableau de bord propose alors d'enregistrer sans vérifier).
+struct KeyError {
+    status: u16,
+    message: String,
+    unreachable: bool,
+}
+
+impl KeyError {
+    fn new(status: u16, message: impl Into<String>) -> Self {
+        Self { status, message: message.into(), unreachable: false }
+    }
+}
+
+fn key_response(result: Result<Value, KeyError>) -> Vec<u8> {
+    match result {
+        Ok(v) => json_ok(v),
+        Err(e) => {
+            let body = json!({ "error": e.message, "unreachable": e.unreachable }).to_string();
+            let reason = match e.status {
+                400 => "Bad Request",
+                404 => "Not Found",
+                413 => "Payload Too Large",
+                422 => "Unprocessable Entity",
+                502 => "Bad Gateway",
+                _ => "Internal Server Error",
+            };
+            http_response(e.status, reason, "application/json", &body)
+        }
+    }
+}
+
+async fn store_key_from_body(
+    proxy: Option<Arc<ProxyServer>>,
+    target: KeyTarget,
+    name: &str,
+    body: &str,
+) -> Result<Value, KeyError> {
+    if body.len() > SECRET_BODY_MAX {
+        return Err(KeyError::new(413, "valeur trop longue (16 Ko au plus)"));
+    }
+    let data = serde_json::from_str::<Value>(body).unwrap_or(Value::Null);
+    let value = match data.get("value").and_then(|x| x.as_str()) {
+        Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => return Err(KeyError::new(400, "value requis (texte non vide)")),
+    };
+    let verify = data.get("verify").and_then(|v| v.as_bool()).unwrap_or(true);
+    store_key(proxy, target, name, value, verify).await
+}
+
+/// Range un jeton (collé ou obtenu par code d'appareil) : contrôle de forme, vérification
+/// auprès du service, puis écriture du nom visé et des emplacements vides que le même jeton
+/// (ou l'Account ID Cloudflare retrouvé) peut remplir. Jamais de valeur dans un message.
+async fn store_key(
+    proxy: Option<Arc<ProxyServer>>,
+    target: KeyTarget,
+    name: &str,
+    value: String,
+    verify: bool,
+) -> Result<Value, KeyError> {
+    if value.contains('\n') || value.contains('\r') {
+        return Err(KeyError::new(400, "valeur sur plusieurs lignes non prise en charge"));
+    }
+    let task_target = target.clone();
+    let slots = tokio::task::spawn_blocking(move || key_slots(&task_target))
+        .await
+        .map_err(|e| KeyError::new(500, e.to_string()))?
+        .map_err(|e| KeyError::new(400, e))?;
+    let var = slot_var(&slots, name).ok_or_else(|| {
+        KeyError::new(
+            400,
+            match &target {
+                KeyTarget::Hub => format!("{} n'est attendu par aucun serveur de config.json", name),
+                KeyTarget::Tenant(id) => format!("{} n'est pas un secret declare par les serveurs du tenant {}", name, id),
+            },
+        )
+    })?;
+    let connector = crate::connectors::for_var(&var);
+    if let Some(c) = connector {
+        crate::connectors::check_format(c, &value).map_err(|e| KeyError::new(400, e))?;
+    }
+    let verified = match (connector, verify) {
+        (Some(c), true) => match crate::connectors::verify(c, &value).await {
+            Ok(v) => Some(v),
+            Err(crate::connectors::VerifyError::Refused(m)) => return Err(KeyError::new(422, m)),
+            Err(crate::connectors::VerifyError::Unreachable(m)) => {
+                return Err(KeyError { status: 502, message: m, unreachable: true })
+            }
+        },
+        _ => None,
+    };
+    let writes = crate::connectors::plan_writes(
+        name,
+        connector,
+        verified.as_ref().and_then(|v| v.account_id.as_deref()),
+        &slots.slots,
+        &slots.present,
+    );
+    let names: Vec<String> = writes.iter().map(|(n, _)| n.clone()).collect();
+    let replaced = slots.present.contains(name);
+    let task_target = target.clone();
     let written = tokio::task::spawn_blocking(move || {
-        let existed = crate::vault::list_names_in(&scope).contains(&task_name);
-        // Un message d'erreur ne doit jamais citer la valeur.
-        crate::vault::set_in(&scope, &task_name, &value)
-            .map(|_| existed)
-            .map_err(|e| e.replace(value.as_str(), "***"))
+        for (slot, fill) in &writes {
+            let content = match fill {
+                crate::connectors::Fill::Token => value.as_str(),
+                crate::connectors::Fill::AccountId(id) => id.as_str(),
+            };
+            let done = match &task_target {
+                KeyTarget::Tenant(id) => crate::vault::set_in(&crate::vault::Scope::Tenant(id.clone()), slot, content),
+                KeyTarget::Hub => crate::vault::set(slot, content).map(|_| {
+                    // Le démon résout ${NOM} depuis son environnement : la valeur sert dès maintenant.
+                    std::env::set_var(slot, content);
+                }),
+            };
+            done.map_err(|e| e.replace(value.as_str(), "***"))?;
+        }
+        Ok::<(), String>(())
     })
     .await
     .unwrap_or_else(|e| Err(e.to_string()));
-    let outcome = written.as_ref().map(|_| ()).map_err(Clone::clone);
-    audit_tenant_action(&proxy, id, format!("tenant.secret_set {}", name), &outcome).await;
-    match written {
-        Ok(replaced) => {
-            reset_tenant(&proxy, id).await;
-            json_ok(json!({ "ok": true, "replaced": replaced }))
+    audit_dashboard_action(&proxy, target.tenant(), format!(
+            "{} {}",
+            if target.tenant().is_some() { "tenant.secret_set" } else { "secret_set" },
+            names.join(",")
+        ), &written).await;
+    written.map_err(|e| KeyError::new(500, e))?;
+    match &target {
+        KeyTarget::Tenant(id) => reset_tenant(&proxy, id).await,
+        KeyTarget::Hub => {
+            if let Some(p) = &proxy {
+                p.reload_config_now().await;
+            }
         }
-        Err(e) => json_err(500, &e),
+    }
+    Ok(json!({
+        "ok": true,
+        "replaced": replaced,
+        "written": names,
+        "verified": verified.is_some(),
+        "detail": verified.map(|v| v.detail),
+    }))
+}
+
+/// `PUT /api/secrets/<NOM>` : {value, verify?}. Jeton du compte McpHub, pour une variable
+/// `${NOM}` attendue par un serveur de config.json.
+async fn handle_set_hub_secret(proxy: Option<Arc<ProxyServer>>, name: &str, body: &str) -> Vec<u8> {
+    key_response(store_key_from_body(proxy, KeyTarget::Hub, name, body).await)
+}
+
+/// Coffre visé par une requête : `tenant` absent = compte McpHub.
+fn key_target(data: &Value) -> Result<KeyTarget, Vec<u8>> {
+    match data.get("tenant").and_then(|t| t.as_str()) {
+        None => Ok(KeyTarget::Hub),
+        Some(t) if crate::tenant::is_valid_id(t) => Ok(KeyTarget::Tenant(t.to_string())),
+        Some(_) => Err(json_err(400, "id de tenant invalide")),
+    }
+}
+
+static DEVICE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// `POST /api/connect/device` : {name, tenant?}. Connexion GitHub par code d'appareil : le
+/// jeton obtenu est rangé comme un jeton collé, sous `name`.
+async fn handle_device_start(proxy: Option<Arc<ProxyServer>>, body: &str) -> Vec<u8> {
+    let data = serde_json::from_str::<Value>(body).unwrap_or(Value::Null);
+    let target = match key_target(&data) {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+    let Some(name) = data.get("name").and_then(|n| n.as_str()).map(String::from) else {
+        return json_err(400, "name requis");
+    };
+    let task_target = target.clone();
+    let slots = match tokio::task::spawn_blocking(move || key_slots(&task_target)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return json_err(400, &e),
+        Err(e) => return json_err(500, &e.to_string()),
+    };
+    let is_github = slot_var(&slots, &name)
+        .and_then(|var| crate::connectors::for_var(&var))
+        .is_some_and(|c| c.id == "github");
+    if !is_github {
+        return json_err(400, &format!("{} n'est pas un jeton GitHub attendu par ce coffre", name));
+    }
+    let Some(client_id) = crate::connectors::github_client_id() else {
+        return json_err(400, "aucune app GitHub configuree (settings.githubClientId) : utiliser le lien pre-rempli");
+    };
+    let start = match crate::connectors::github_device_start(&client_id).await {
+        Ok(s) => s,
+        Err(e) => return json_err(502, &e),
+    };
+    let id = format!("d{}", DEVICE_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
+    let reply = json!({
+        "ok": true,
+        "id": id,
+        "user_code": start.user_code,
+        "verification_uri": start.verification_uri,
+        "expires_in": start.expires_in,
+    });
+    crate::connectors::device_set(&id, crate::connectors::DeviceState::Pending);
+    tokio::spawn(async move {
+        let state = match crate::connectors::github_device_wait(start).await {
+            Ok(token) => match store_key(proxy, target, &name, token, true).await {
+                Ok(v) => crate::connectors::DeviceState::Done(
+                    v.get("detail").and_then(|d| d.as_str()).unwrap_or("connected").to_string(),
+                ),
+                Err(e) => crate::connectors::DeviceState::Failed(e.message),
+            },
+            Err(e) => crate::connectors::DeviceState::Failed(e),
+        };
+        crate::connectors::device_set(&id, state);
+    });
+    json_ok(reply)
+}
+
+/// `GET /api/connect/device?id=...` : état de la connexion par code d'appareil.
+fn handle_device_status(path: &str) -> Vec<u8> {
+    let Some(id) = query_param(path, "id") else {
+        return json_err(400, "id requis");
+    };
+    match crate::connectors::device_get(&id) {
+        None => json_err(404, "connexion inconnue"),
+        Some(crate::connectors::DeviceState::Pending) => json_ok(json!({ "state": "pending" })),
+        Some(crate::connectors::DeviceState::Done(detail)) => json_ok(json!({ "state": "done", "detail": detail })),
+        Some(crate::connectors::DeviceState::Failed(e)) => json_ok(json!({ "state": "failed", "error": e })),
+    }
+}
+
+/// Profil de navigateur choisi pour un tenant (lecture de projects.json).
+fn tenant_browser_profile(tenant: &str) -> Option<crate::connectors::BrowserProfile> {
+    let raw = fs::read_to_string(crate::tenant::projects_path()).ok()?;
+    let json: Value = serde_json::from_str(&raw).ok()?;
+    crate::connectors::tenant_browser(&json, tenant)
+}
+
+fn profile_json(p: &crate::connectors::BrowserProfile) -> Value {
+    json!({ "app": p.app, "dir": p.dir, "name": p.name })
+}
+
+/// `POST /api/open` : {url, tenant?}. Ouvre une page (création de jeton, autorisation) dans le
+/// profil de navigateur du tenant s'il en a un, sinon dans le navigateur par défaut.
+async fn handle_open(body: &str) -> Vec<u8> {
+    let data = serde_json::from_str::<Value>(body).unwrap_or(Value::Null);
+    let Some(url) = data.get("url").and_then(|u| u.as_str()).map(String::from) else {
+        return json_err(400, "url requis");
+    };
+    let target = match key_target(&data) {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+    let opened = tokio::task::spawn_blocking(move || {
+        let profile = target.tenant().and_then(tenant_browser_profile);
+        crate::connectors::open_url(&url, profile.as_ref()).map(|_| profile)
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()));
+    match opened {
+        Ok(profile) => json_ok(json!({ "ok": true, "profile": profile.as_ref().map(profile_json) })),
+        Err(e) => json_err(400, &e),
+    }
+}
+
+/// `GET /api/browsers` : profils de navigateur détectés sur ce Mac.
+async fn handle_browsers() -> Vec<u8> {
+    let profiles = tokio::task::spawn_blocking(crate::connectors::browser_profiles).await.unwrap_or_default();
+    json_ok(json!({ "profiles": profiles.iter().map(profile_json).collect::<Vec<_>>() }))
+}
+
+/// `PUT /api/tenants/<id>/browser` : {app?, profile?, version}. Sans app : navigateur par défaut.
+async fn handle_set_tenant_browser(proxy: Option<Arc<ProxyServer>>, id: &str, body: &str) -> Vec<u8> {
+    let data = serde_json::from_str::<Value>(body).unwrap_or(Value::Null);
+    let version = match required_str(&data, "version") {
+        Ok(v) => v.to_string(),
+        Err(resp) => return resp,
+    };
+    let app = data.get("app").and_then(|a| a.as_str()).map(String::from);
+    let dir = data.get("profile").and_then(|a| a.as_str()).map(String::from);
+    let task_id = id.to_string();
+    let saved = tokio::task::spawn_blocking(move || {
+        let profile = match (app, dir) {
+            (Some(app), Some(dir)) => Some(
+                crate::connectors::browser_profiles()
+                    .into_iter()
+                    .find(|p| p.app == app && p.dir == dir)
+                    .ok_or("profil de navigateur introuvable sur ce Mac")?,
+            ),
+            _ => None,
+        };
+        crate::tenant::edit_projects(&crate::tenant::projects_path(), &version, &format!("navigateur-{}", task_id), |json| {
+            crate::connectors::set_tenant_browser(json, &task_id, profile.as_ref())
+        })
+        .map(|_| ())
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()));
+    audit_tenant_action(&proxy, id, "tenant.browser_set".into(), &saved).await;
+    match saved {
+        Ok(()) => json_ok(json!({ "ok": true })),
+        Err(e) => projects_write_error(&e),
+    }
+}
+
+/// `POST /api/oauth/manual` : {url}. Adresse de retour recopiée depuis le navigateur d'un client
+/// à distance (le sien n'atteint pas localhost:24680).
+fn handle_oauth_manual(body: &str) -> Vec<u8> {
+    let data = serde_json::from_str::<Value>(body).unwrap_or(Value::Null);
+    let Some(url) = data.get("url").and_then(|u| u.as_str()) else {
+        return json_err(400, "url requis");
+    };
+    match crate::oauth::parse_pasted_callback(url) {
+        Err(e) => json_err(400, &e),
+        Ok((state, result)) => {
+            if crate::oauth::complete_callback(&state, result) {
+                json_ok(json!({ "ok": true }))
+            } else {
+                json_err(400, "connexion inconnue ou expiree : relancer Connect")
+            }
+        }
     }
 }
 
@@ -1526,8 +1908,9 @@ async fn route_tenant(req: &HttpRequest, rest: &str, proxy: Option<Arc<ProxyServ
         ("PUT", ["servers"]) => handle_set_tenant_servers(proxy, id, &req.body).await,
         ("POST", ["check"]) => handle_check_tenant(id).await,
         ("PUT", ["secrets", name]) => handle_set_tenant_secret(proxy, id, name, &req.body).await,
+        ("PUT", ["browser"]) => handle_set_tenant_browser(proxy, id, &req.body).await,
         ("DELETE", ["secrets", name]) => handle_delete_tenant_secret(proxy, id, name).await,
-        (_, [] | ["servers"] | ["check"] | ["secrets", _]) => json_err(405, "Method not allowed"),
+        (_, [] | ["servers"] | ["check"] | ["secrets", _] | ["browser"]) => json_err(405, "Method not allowed"),
         _ => json_err(404, "Not found"),
     }
 }
@@ -1626,6 +2009,10 @@ async fn route(
                 },
             }
         }
+        ("POST", "/api/oauth/manual") => handle_oauth_manual(&req.body),
+        ("POST", "/api/connect/device") => handle_device_start(proxy, &req.body).await,
+        ("POST", "/api/open") => handle_open(&req.body).await,
+        ("GET", "/api/browsers") => handle_browsers().await,
         ("GET", "/api/tenants") => handle_get_tenants(proxy).await,
         ("POST", "/api/tenants") => handle_add_tenant(proxy, &req.body).await,
         ("GET", "/login") => {
@@ -1722,6 +2109,15 @@ async fn route(
         _ => {
             if let Some(rest) = path.strip_prefix("/api/tenants/") {
                 return route_tenant(req, rest, proxy).await;
+            }
+            if path == "/api/connect/device" && req.method == "GET" {
+                return handle_device_status(&req.path);
+            }
+            if let Some(name) = path.strip_prefix("/api/secrets/") {
+                return match &req.method[..] {
+                    "PUT" => handle_set_hub_secret(proxy, &urldecode(name), &req.body).await,
+                    _ => json_err(405, "Method not allowed"),
+                };
             }
             if let Some(rest) = path.strip_prefix("/api/servers/") {
                 if (rest.ends_with("/toggle") || rest.ends_with("/repair")) && req.method != "POST" {

@@ -450,6 +450,15 @@ McpHub oauth logout sentry
 McpHub oauth migrate --apply   # convert "npx mcp-remote URL" entries, keeping their tokens
 ```
 
+### Connect a service without hunting for permissions
+
+On the dashboard, every server card (and every client account) shows what is missing:
+
+- **Connect** on a remote OAuth server opens the service's consent page; you click Authorize and the tokens land in the right Keychain. Known services get the scopes they need (Cloudflare `mcp.cloudflare.com` with write access to Workers, Pages, D1, KV, R2 and DNS, instead of the read-only default; Supabase `mcp.supabase.com` with project and database access).
+- **Connect Cloudflare / Supabase / GitHub** on a token variable opens the service's token page pre-filled with the right permissions, then takes the pasted token: it is checked with the service's API before saving (the Cloudflare account ID is filled in by itself), goes straight to the Keychain and is never shown again, sent back to the page or logged. One Cloudflare token also fills `CLOUDFLARE_MCP_TOKEN` and `CLOUDFLARE_API_TOKEN` when both are expected.
+- **Sign in with GitHub** (device code: no token to copy) appears once a GitHub App client ID is set in `settings.githubClientId` (public value, no secret).
+- For a client account, choose the client's browser profile on their card: consent and token pages open in that profile. A client on another computer approves from the link you send; their browser then shows a connection error whose address you paste back to finish.
+
 ---
 
 ## 📊 Dashboard

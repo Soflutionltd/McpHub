@@ -637,6 +637,23 @@ pub fn complete_callback(state: &str, result: CallbackResult) -> bool {
     }
 }
 
+/// Adresse de retour recopiée à la main (client à distance : son navigateur n'atteint pas
+/// localhost:24680 et affiche une erreur dont l'adresse contient le code). Renvoie l'état et
+/// le résultat à transmettre à `complete_callback`.
+pub fn parse_pasted_callback(raw: &str) -> Result<(String, CallbackResult), String> {
+    let u = Url::parse(raw.trim()).map_err(|_| "adresse illisible : coller l'adresse complete de la page".to_string())?;
+    if u.path() != CALLBACK_PATH {
+        return Err(format!("ce n'est pas une adresse de retour McpHub ({}...)", CALLBACK_PATH));
+    }
+    let param = |k: &str| u.query_pairs().find(|(key, _)| key == k).map(|(_, v)| v.into_owned());
+    let state = param("state").ok_or("adresse sans state")?;
+    match (param("code"), param("error")) {
+        (Some(code), _) => Ok((state, Ok(code))),
+        (None, Some(e)) => Ok((state, Err(e))),
+        (None, None) => Err("adresse sans code ni erreur".into()),
+    }
+}
+
 /// Connexion complète dans le navigateur. Bloque jusqu'au retour (5 minutes au plus).
 fn logins_in_progress() -> std::sync::MutexGuard<'static, std::collections::HashSet<String>> {
     static S: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
@@ -701,7 +718,8 @@ pub async fn prepare_login(server: &str, url: &str, www_authenticate: Option<&st
     if !secure_url(&meta.authorization_endpoint) {
         return Err("page de connexion non HTTPS refusee".into());
     }
-    let scope = scope.or(stored.scope);
+    // Scopes recommandés pour les services connus (Cloudflare n'annonce que la lecture).
+    let scope = crate::connectors::oauth_scope(url).map(String::from).or(scope).or(stored.scope);
     let mut auth = Url::parse(&meta.authorization_endpoint).map_err(|e| e.to_string())?;
     {
         let mut q = auth.query_pairs_mut();
@@ -1212,6 +1230,20 @@ mod tests {
         assert_eq!(client_auth_method(&meta), "client_secret_basic");
         meta.token_endpoint_auth_methods_supported = vec!["client_secret_post".into(), "none".into()];
         assert_eq!(client_auth_method(&meta), "none");
+    }
+
+    #[test]
+    fn adresse_de_retour_collee() {
+        let (state, result) =
+            parse_pasted_callback("http://localhost:24680/oauth/callback?code=abc&state=xyz").unwrap();
+        assert_eq!(state, "xyz");
+        assert_eq!(result, Ok("abc".to_string()));
+        let (_, refused) =
+            parse_pasted_callback(" http://localhost:24680/oauth/callback?error=access_denied&state=s ").unwrap();
+        assert_eq!(refused, Err("access_denied".to_string()));
+        assert!(parse_pasted_callback("https://exemple.fr/autre?code=a&state=b").is_err());
+        assert!(parse_pasted_callback("http://localhost:24680/oauth/callback?code=a").is_err());
+        assert!(parse_pasted_callback("pas une adresse").is_err());
     }
 
     #[test]

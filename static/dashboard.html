@@ -187,6 +187,14 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
 .cl-vars{display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:8px;font-size:12px}
 .cl-vars label{display:flex;align-items:center;gap:5px;font-family:'SF Mono',Monaco,monospace}
 .cl-url{width:100%;font-family:'SF Mono',Monaco,monospace;font-size:12px}
+.cn-line{display:flex;flex-wrap:wrap;gap:4px 10px;margin-top:6px;font-size:12px}
+.cn-steps{border:1px solid var(--border);border-radius:10px;padding:10px 12px;margin:12px 0;font-size:12px;color:var(--text-dim);line-height:1.5}
+.cn-steps .cl-actions{margin:8px 0}
+.cn-row{display:flex;gap:6px}
+.cn-row input{flex:1}
+.cn-code{font-family:'SF Mono',Monaco,monospace;font-size:28px;font-weight:700;letter-spacing:4px;text-align:center;padding:14px;margin:12px 0;border:1px dashed var(--border);border-radius:10px;color:var(--text)}
+.cn-error{color:var(--danger)}
+.cl-browser{margin-top:6px;font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:6px}
 </style>
 </head><body>
 <div class="container" id="main-content">
@@ -369,21 +377,33 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
       <div class="modal-actions"><button class="btn btn-ghost" onclick="clientHide('client-servers-modal')">Cancel</button><button class="btn btn-primary" onclick="clientServersSave()">Save</button></div>
     </div>
   </div>
-  <div class="overlay hidden" id="client-secret-modal" onclick="clientSecretClose()">
+  <div class="overlay hidden" id="key-modal" onclick="keyClose()">
     <div class="modal" onclick="event.stopPropagation()">
-      <div class="modal-head"><h2 class="modal-title" id="client-secret-title">Set secret</h2><button class="modal-close" aria-label="Close" onclick="clientSecretClose()">✕</button></div>
-      <div class="json-hint" id="client-secret-hint"></div>
-      <div class="lib-field"><label for="client-secret-value">Value</label><input id="client-secret-value" type="password" autocomplete="new-password" spellcheck="false" onkeydown="if(event.key==='Enter')clientSecretSubmit()"></div>
-      <div class="modal-actions"><button class="btn btn-ghost" onclick="clientSecretClose()">Cancel</button><button class="btn btn-primary" onclick="clientSecretSubmit()">Save to Keychain</button></div>
+      <div class="modal-head"><h2 class="modal-title" id="key-title">Set secret</h2><button class="modal-close" aria-label="Close" onclick="keyClose()">✕</button></div>
+      <div class="json-hint" id="key-hint"></div>
+      <div id="key-create"></div>
+      <div class="lib-field"><label for="key-value" id="key-label">Value</label><div class="cn-row"><input id="key-value" type="password" autocomplete="new-password" spellcheck="false" onkeydown="if(event.key==='Enter')keySubmit(true)"><button class="btn btn-ghost" onclick="keyPaste()">Paste</button></div></div>
+      <div class="json-hint" id="key-status"></div>
+      <div class="modal-actions"><button class="btn btn-ghost" onclick="keyClose()">Cancel</button><button class="btn btn-ghost hidden" id="key-force" onclick="keySubmit(false)">Save without checking</button><button class="btn btn-primary" onclick="keySubmit(true)">Save to Keychain</button></div>
+    </div>
+  </div>
+  <div class="overlay hidden" id="device-modal" onclick="deviceClose()">
+    <div class="modal" onclick="event.stopPropagation()">
+      <div class="modal-head"><h2 class="modal-title" id="device-title">Sign in with GitHub</h2><button class="modal-close" aria-label="Close" onclick="deviceClose()">✕</button></div>
+      <div class="json-hint">Copy this code, then approve McpHub on GitHub with the account that owns the repositories. The token goes straight to the Keychain.</div>
+      <div class="cn-code" id="device-code">-</div>
+      <div class="json-hint" id="device-status">Waiting for the approval on GitHub...</div>
+      <div class="modal-actions"><button class="btn btn-ghost" onclick="deviceClose()">Close</button><button class="btn btn-primary" onclick="deviceCopyOpen()">Copy code and open GitHub</button></div>
     </div>
   </div>
   <div class="overlay hidden" id="client-oauth-modal" onclick="clientOauthClose()">
     <div class="modal" onclick="event.stopPropagation()">
       <div class="modal-head"><h2 class="modal-title" id="client-oauth-title">Connect</h2><button class="modal-close" aria-label="Close" onclick="clientOauthClose()">✕</button></div>
-      <div class="info-box info-fail" style="margin-top:0"><div class="info-title">Open this address in the client's browser profile</div><div class="info-desc">Use a browser profile signed in to the client's account, not yours: the access is saved for whichever account approves it.</div></div>
+      <div class="info-box info-fail" style="margin-top:0"><div class="info-title">Approve with the client's account</div><div class="info-desc">The access is saved for whichever account approves it. Choose the client's browser profile on their card and McpHub opens the page there.</div></div>
       <div class="lib-field" style="margin-top:14px"><label for="client-oauth-url">Sign-in address</label><input id="client-oauth-url" class="cl-input cl-url" readonly onclick="this.select()"></div>
+      <div class="lib-field"><label for="client-oauth-return">Client on another computer?</label><div class="hint">Send them the address. After Authorize, their browser shows a connection error: they send you the address of that page, paste it here.</div><div class="cn-row"><input id="client-oauth-return" class="cl-input cl-url" autocomplete="off" spellcheck="false" placeholder="http://localhost:24680/oauth/callback?code=..."><button class="btn btn-ghost" onclick="clientOauthReturn()">Finish</button></div></div>
       <div class="json-hint" id="client-oauth-status">Waiting for the sign-in to complete...</div>
-      <div class="modal-actions"><button class="btn btn-ghost" onclick="clientOauthClose()">Close</button><button class="btn btn-primary" onclick="clientOauthCopy()">Copy address</button></div>
+      <div class="modal-actions"><button class="btn btn-ghost" onclick="clientOauthClose()">Close</button><button class="btn btn-ghost" onclick="clientOauthCopy()">Copy address</button><button class="btn btn-primary" id="client-oauth-open" onclick="clientOauthOpen()">Open</button></div>
     </div>
   </div>
   <div class="toast hidden" id="toast"></div>
@@ -545,6 +565,7 @@ function renderGrid(){
         ?`<span>${esc(s.tools)} tools</span>`
         :`<span style="color:var(--danger);font-size:12px">${esc(shortErr||'Not cached')}</span>`
       }</div>
+      ${connLine(s)}
       ${s.status!=='cached'&&!s.disabled?'<div style="font-size:12px;color:var(--accent);margin-top:4px;cursor:pointer">🔧 Click to diagnose</div>':''}
       <div class="card-cat">${cat(s.name)}</div>
     </div>`}).join('');
@@ -960,7 +981,7 @@ setTimeout(()=>document.body.classList.add('ready'),80);
 
 // ─── Client accounts (tenants) ───────────────────────────────
 // Écran en écriture seule pour les secrets : aucune valeur n'est jamais lue ici.
-let clients=null, clientChecks={}, srvEdit=null, srvTenant=null, secretTarget=null, oauthPoll=null;
+let clients=null, clientChecks={}, srvEdit=null, srvTenant=null, oauthPoll=null, oauthTarget=null, browsers=[];
 async function api(method,url,body){
   const opts={method,headers:{'Content-Type':'application/json'}};
   if(body!==undefined)opts.body=JSON.stringify(body);
@@ -975,7 +996,7 @@ function tenantUrl(t,suffix){return '/api/tenants/'+encodeURIComponent(t.id)+(su
 async function fetchClients(){
   const box=document.getElementById('clients-list');
   try{
-    clients=await api('GET','/api/tenants');
+    [clients,browsers]=await Promise.all([api('GET','/api/tenants'),api('GET','/api/browsers').then(d=>d.profiles).catch(()=>[])]);
     // Marques gauche-à-droite : le chemin reste lisible malgré l'ellipse à gauche (direction rtl).
     document.getElementById('clients-path').textContent=clients.projects_path?'\u200E'+clients.projects_path+'\u200E':'';
     renderClients();
@@ -999,7 +1020,7 @@ function clientServerRow(t,ti,s,si){
   const m=s.metrics?`<div class="cl-dim">${s.metrics.calls} calls, ${s.metrics.errors} errors</div>`:'';
   const lastErr=s.metrics&&s.metrics.last_error?`<div class="cl-err" title="${esc(s.metrics.last_error)}">${esc(s.metrics.last_error)}</div>`:'';
   const missingCfg=s.in_config?'':'<div class="cl-err">Not in config.json (or disabled)</div>';
-  const secrets=s.secrets.length?s.secrets.map((k,ki)=>`<div class="cl-secret"><span class="cl-name" title="${esc(k.var)}">${esc(k.name)}</span>${k.present?'<span class="cl-ok">present</span>':'<span class="cl-miss">missing</span>'}<button class="cl-link" onclick="clientSecretOpen(${ti},${si},${ki})">${k.present?'Replace':'Set'}</button>${k.present?`<button class="cl-link cl-link-danger" onclick="clientSecretDelete(${ti},${si},${ki})">Delete</button>`:''}</div>`).join(''):'<span class="cl-dim">none</span>';
+  const secrets=s.secrets.length?s.secrets.map((k,ki)=>`<div class="cl-secret"><span class="cl-name" title="${esc(k.var)}">${esc(k.name)}</span>${k.present?'<span class="cl-ok">present</span>':'<span class="cl-miss">missing</span>'}<button class="cl-link" onclick="clientSecretOpen(${ti},${si},${ki})">${k.present?'Replace':(k.connector?'Connect '+esc(k.connector.label):'Set')}</button>${k.present?`<button class="cl-link cl-link-danger" onclick="clientSecretDelete(${ti},${si},${ki})">Delete</button>`:''}</div>`).join(''):'<span class="cl-dim">none</span>';
   const o=s.oauth;
   let oauth='<span class="cl-dim">n/a</span>';
   if(o.connected)oauth=`<span class="cl-ok">connected</span><span class="cl-dim">${fmtExpiry(o.expires_at)}</span><div><button class="cl-link" onclick="clientOauthConnect(${ti},${si})">Reconnect</button> <button class="cl-link cl-link-danger" onclick="clientOauthLogout(${ti},${si})">Disconnect</button></div>`;
@@ -1024,7 +1045,7 @@ function clientCard(t,ti){
   const table=t.servers.length?`<div class="cl-table-wrap"><table class="cl-table"><thead><tr><th scope="col">Server</th><th scope="col">Instance</th><th scope="col">Secrets</th><th scope="col">OAuth</th><th scope="col">Check</th></tr></thead><tbody>${rows}</tbody></table></div>`:'<div class="cl-dim" style="font-size:12px">No server with this client\'s own tokens yet: choose them under Servers.</div>';
   const shared=t.shared_servers.length?t.shared_servers.map(s=>`<span class="cl-chip">${esc(s)}</span>`).join(''):'<span class="cl-dim" style="font-size:12px">none</span>';
   return `<div class="cl-card">
-    <div class="cl-head"><div><div class="cl-title">${esc(t.id)}</div><div class="cl-dim" style="font-size:12px">project ${esc(t.project)}</div></div>
+    <div class="cl-head"><div><div class="cl-title">${esc(t.id)}</div><div class="cl-dim" style="font-size:12px">project ${esc(t.project)}</div>${clientBrowserSelect(t,ti)}</div>
       <div class="cl-actions"><button class="btn btn-ghost" onclick="clientServersOpen(${ti})">Servers</button><button class="btn btn-ghost" onclick="clientCheck(${ti})">Check</button><button class="btn btn-danger" onclick="clientRemove(${ti})">Remove</button></div></div>
     <div class="cl-folders">${t.workspaces.map(esc).join('<br>')}</div>
     ${table}
@@ -1098,24 +1119,7 @@ async function clientServersSave(){
 }
 function clientSecretOpen(ti,si,ki){
   const t=clients.tenants[ti],k=t.servers[si].secrets[ki];
-  secretTarget={t,k};
-  document.getElementById('client-secret-title').textContent=(k.present?'Replace ':'Set ')+k.name;
-  document.getElementById('client-secret-hint').textContent='Client '+t.id+'. The value goes to this client\'s Keychain item. It is never shown again, never sent back to this page and never logged.';
-  const input=document.getElementById('client-secret-value');input.value='';
-  clientShow('client-secret-modal');input.focus();
-}
-function clientSecretClose(){document.getElementById('client-secret-value').value='';secretTarget=null;clientHide('client-secret-modal')}
-async function clientSecretSubmit(){
-  const input=document.getElementById('client-secret-value');
-  const value=input.value;
-  if(!secretTarget||!value){notify('Enter a value','danger');return}
-  const {t,k}=secretTarget;
-  if(k.present&&!confirm('Replace the existing '+k.name+' of client '+t.id+'? The old value is lost.'))return;
-  input.value='';
-  try{
-    await api('PUT',tenantUrl(t,'/secrets/'+encodeURIComponent(k.name)),{value});
-    clientSecretClose();notify(k.name+' saved for '+t.id);fetchClients();
-  }catch(e){notify(e.message,'danger')}
+  keyOpen({tenant:t.id,name:k.name,present:k.present,connector:k.connector});
 }
 async function clientSecretDelete(ti,si,ki){
   const t=clients.tenants[ti],k=t.servers[si].secrets[ki];
@@ -1128,6 +1132,9 @@ async function clientOauthConnect(ti,si){
     const d=await api('POST','/api/oauth/login',{server:s.server,tenant:t.id});
     document.getElementById('client-oauth-title').textContent='Connect '+s.server+' for '+t.id;
     document.getElementById('client-oauth-url').value=d.url;
+    oauthTarget={tenant:t.id,url:d.url};
+    document.getElementById('client-oauth-open').textContent=t.browser?'Open in '+t.browser.name:'Open in default browser';
+    if(t.browser)openPage(d.url,t.id);
     document.getElementById('client-oauth-status').textContent='Waiting for the sign-in to complete...';
     clientShow('client-oauth-modal');
     const started=Date.now();
@@ -1144,7 +1151,13 @@ async function clientOauthConnect(ti,si){
     },3000);
   }catch(e){notify(e.message,'danger')}
 }
-function clientOauthClose(){clearInterval(oauthPoll);oauthPoll=null;document.getElementById('client-oauth-url').value='';clientHide('client-oauth-modal')}
+function clientOauthClose(){clearInterval(oauthPoll);oauthPoll=null;oauthTarget=null;document.getElementById('client-oauth-url').value='';document.getElementById('client-oauth-return').value='';clientHide('client-oauth-modal')}
+function clientOauthOpen(){if(oauthTarget)openPage(oauthTarget.url,oauthTarget.tenant)}
+async function clientOauthReturn(){
+  const input=document.getElementById('client-oauth-return');
+  if(!input.value.trim()){notify('Paste the address of the client\'s page','danger');return}
+  try{await api('POST','/api/oauth/manual',{url:input.value.trim()});input.value='';document.getElementById('client-oauth-status').textContent='Sign-in received, saving the access...'}catch(e){notify(e.message,'danger')}
+}
 async function clientOauthCopy(){
   const input=document.getElementById('client-oauth-url');
   try{await navigator.clipboard.writeText(input.value);notify('Address copied')}catch(e){input.select();notify('Select the address and copy it','danger')}
@@ -1169,5 +1182,126 @@ async function clientRemove(ti){
   if(!confirm('Remove client account '+t.id+'? Its tokens are erased from the Keychain. You will confirm in a macOS dialog.'))return;
   notify('Confirm in the macOS dialog');
   try{await api('DELETE',tenantUrl(t,'?version='+encodeURIComponent(clients.version)));delete clientChecks[t.id];notify('Client account '+t.id+' removed');fetchClients()}catch(e){notify(e.message,'danger')}
+}
+
+// ─── Connexion des services (jeton collé, code d'appareil, profils) ───
+// Écriture seule : un jeton saisi part au Trousseau et n'est jamais relu par cette page.
+let keyTarget=null, deviceTarget=null, devicePoll=null, hubOauthPoll=null;
+async function openPage(url,tenant){
+  try{const d=await api('POST','/api/open',{url,tenant:tenant||undefined});notify(d.profile?'Opened in '+d.profile.name:'Opened in your browser')}
+  catch(e){notify(e.message,'danger')}
+}
+function keyOpen(target){
+  keyTarget=target;
+  const c=target.connector,who=target.tenant?'client '+target.tenant:'your McpHub account';
+  document.getElementById('key-title').textContent=(c&&!target.present?'Connect '+c.label:(target.present?'Replace ':'Set ')+target.name)+(target.tenant?' for '+target.tenant:'');
+  document.getElementById('key-hint').textContent='Saved as '+target.name+' in the Keychain of '+who+'. It is never shown again, never sent back to this page and never logged.';
+  document.getElementById('key-label').textContent=c?c.label+' token':'Value';
+  document.getElementById('key-create').innerHTML=c?`<div class="cn-steps"><b>1.</b> Create the token${target.tenant?' signed in as the client':''}.<div class="cl-actions"><button class="btn btn-ghost" onclick="keyOpenPage()">Open pre-filled ${esc(c.label)} page</button>${c.device?'<button class="btn btn-primary" onclick="deviceStart()">Sign in with GitHub instead</button>':''}</div>${esc(c.steps)}<br><b>2.</b> Copy the token, then paste it below. McpHub checks it with ${esc(c.label)} before saving${c.id==='cloudflare'?' and fills the account ID itself':''}.</div>`:'';
+  document.getElementById('key-status').textContent='';
+  document.getElementById('key-status').classList.remove('cn-error');
+  document.getElementById('key-force').classList.add('hidden');
+  const input=document.getElementById('key-value');input.value='';
+  clientShow('key-modal');input.focus();
+}
+function keyClose(){document.getElementById('key-value').value='';keyTarget=null;clientHide('key-modal')}
+function keyOpenPage(){if(keyTarget&&keyTarget.connector)openPage(keyTarget.connector.create_url,keyTarget.tenant)}
+async function keyPaste(){
+  try{document.getElementById('key-value').value=(await navigator.clipboard.readText()).trim()}
+  catch(e){notify('Clipboard not readable: paste with Cmd+V','danger')}
+}
+async function keySubmit(verify){
+  const input=document.getElementById('key-value'),status=document.getElementById('key-status');
+  const value=input.value.trim();
+  if(!keyTarget||!value){notify('Paste the token first','danger');return}
+  const t=keyTarget;
+  const url=t.tenant?'/api/tenants/'+encodeURIComponent(t.tenant)+'/secrets/'+encodeURIComponent(t.name):'/api/secrets/'+encodeURIComponent(t.name);
+  status.textContent=verify&&t.connector?'Checking with '+t.connector.label+'...':'Saving...';
+  let r,d={};
+  try{r=await fetch(url,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({value,verify})});try{d=await r.json()}catch(e){d={}}}
+  catch(e){status.textContent=e.message;return}
+  status.classList.toggle('cn-error',!r.ok);
+  if(!r.ok){
+    status.textContent=d.error||('HTTP '+r.status);
+    document.getElementById('key-force').classList.toggle('hidden',!d.unreachable);
+    return;
+  }
+  input.value='';
+  // Le jeton ne doit pas traîner dans le presse-papiers.
+  try{await navigator.clipboard.writeText('')}catch(e){}
+  notify('Saved: '+(d.written||[t.name]).join(', ')+(d.detail?' · '+d.detail:''));
+  keyClose();
+  if(t.tenant)fetchClients();else fetchServers();
+}
+async function deviceStart(){
+  if(!keyTarget)return;
+  const t=keyTarget;
+  try{
+    const d=await api('POST','/api/connect/device',{name:t.name,tenant:t.tenant||undefined});
+    keyClose();
+    deviceTarget={...t,id:d.id,code:d.user_code,uri:d.verification_uri};
+    document.getElementById('device-title').textContent='Sign in with GitHub'+(t.tenant?' for '+t.tenant:'');
+    document.getElementById('device-code').textContent=d.user_code;
+    document.getElementById('device-status').textContent='Waiting for the approval on GitHub...';
+    clientShow('device-modal');
+    clearInterval(devicePoll);
+    devicePoll=setInterval(async()=>{
+      try{
+        const st=await api('GET','/api/connect/device?id='+encodeURIComponent(d.id));
+        if(st.state==='pending')return;
+        clearInterval(devicePoll);devicePoll=null;
+        if(st.state==='done'){notify('GitHub connected · '+st.detail);deviceClose();if(t.tenant)fetchClients();else fetchServers()}
+        else document.getElementById('device-status').textContent=st.error;
+      }catch(e){document.getElementById('device-status').textContent=e.message}
+    },3000);
+  }catch(e){const st=document.getElementById('key-status');st.textContent=e.message;st.classList.add('cn-error')}
+}
+async function deviceCopyOpen(){
+  if(!deviceTarget)return;
+  try{await navigator.clipboard.writeText(deviceTarget.code)}catch(e){notify('Copy the code by hand','danger')}
+  openPage(deviceTarget.uri,deviceTarget.tenant);
+}
+function deviceClose(){clearInterval(devicePoll);devicePoll=null;deviceTarget=null;clientHide('device-modal')}
+function connLine(s){
+  if(s.disabled)return '';
+  const parts=[],n=esc(s.name);
+  if(s.oauth&&s.oauth.capable)parts.push(s.oauth.connected
+    ?`<span class="cl-ok">Connected</span><button class="cl-link" data-name="${n}" onclick="event.stopPropagation();hubOauth(this.dataset.name)">Reconnect</button>`
+    :`<button class="cl-link" data-name="${n}" onclick="event.stopPropagation();hubOauth(this.dataset.name)">Connect</button>`);
+  (s.keys||[]).forEach(k=>{
+    const v=esc(k.var),label=k.connector?esc(k.connector.label):v;
+    if(!k.present)parts.push(`<button class="cl-link cl-link-danger" data-name="${n}" data-var="${v}" onclick="event.stopPropagation();hubKeyOpen(this.dataset.name,this.dataset.var)">${k.connector?'Connect '+label:'Set '+v}</button>`);
+    else if(k.connector)parts.push(`<button class="cl-link" data-name="${n}" data-var="${v}" onclick="event.stopPropagation();hubKeyOpen(this.dataset.name,this.dataset.var)" title="${v}">Replace ${label} token</button>`);
+  });
+  return parts.length?`<div class="cn-line">${parts.join('')}</div>`:'';
+}
+function hubKeyOpen(name,v){
+  const s=servers.find(x=>x.name===name),k=s&&(s.keys||[]).find(x=>x.var===v);
+  if(k)keyOpen({tenant:null,name:k.var,present:k.present,connector:k.connector});
+}
+async function hubOauth(name){
+  try{await api('POST','/api/oauth/login',{server:name});notify('Sign-in page opened in your browser: approve, then come back')}
+  catch(e){notify(e.message,'danger');return}
+  const started=Date.now();
+  clearInterval(hubOauthPoll);
+  hubOauthPoll=setInterval(async()=>{
+    if(Date.now()-started>5*60*1000){clearInterval(hubOauthPoll);return}
+    try{
+      const d=await api('GET','/api/servers');
+      const s=(d.servers||[]).find(x=>x.name===name);
+      if(s&&s.oauth&&s.oauth.connected){clearInterval(hubOauthPoll);notify(name+' connected');fetchServers()}
+    }catch(e){clearInterval(hubOauthPoll)}
+  },3000);
+}
+function clientBrowserSelect(t,ti){
+  const cur=t.browser?t.browser.app+'|'+t.browser.dir:'';
+  const opts=browsers.map(p=>{const v=p.app+'|'+p.dir;return `<option value="${esc(v)}" ${v===cur?'selected':''}>${esc(p.app)}: ${esc(p.name)}</option>`}).join('');
+  return `<label class="cl-browser">Browser <select class="cl-input" onchange="clientBrowserSet(${ti},this.value)" aria-label="Browser profile for ${esc(t.id)}"><option value="">Default browser</option>${opts}</select></label>`;
+}
+async function clientBrowserSet(ti,value){
+  const t=clients.tenants[ti];
+  const [app,profile]=value?[value.slice(0,value.indexOf('|')),value.slice(value.indexOf('|')+1)]:[undefined,undefined];
+  try{await api('PUT',tenantUrl(t,'/browser'),{app,profile,version:clients.version});notify(value?'Client pages open in this profile':'Client pages open in the default browser');fetchClients()}
+  catch(e){notify(e.message,'danger');fetchClients()}
 }
 </script></body></html>

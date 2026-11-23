@@ -6,6 +6,7 @@ mod codemode;
 pub mod child;
 mod config;
 mod confirm_dialog;
+mod connectors;
 mod crawl;
 mod dashboard;
 mod description_compressor;
