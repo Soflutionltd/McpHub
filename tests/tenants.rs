@@ -289,6 +289,75 @@ fn une_confirmation_ne_vaut_que_pour_son_perimetre() {
 }
 
 #[test]
+fn gestion_des_serveurs_par_l_agent() {
+    let fx = Fixture::new("admin");
+    let path = fx.hub.join("config.json");
+    let mut config = read_json(&path);
+    config["settings"]["permissions"] = json!({ "confirmVia": "token" });
+    std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+    let projects_path = fx.hub.join("projects.json");
+    let mut projects = read_json(&projects_path);
+    projects["projects"]["acme"]["sharedServers"] = json!(["mcphub"]);
+    std::fs::write(&projects_path, serde_json::to_string_pretty(&projects).unwrap()).unwrap();
+    let mut hub = fx.start();
+    let admin = |hub: &mut Hub, tool: &str, arguments: Value, wd: Option<&Path>, token: Option<&str>| {
+        let mut args = json!({ "server": "mcphub", "tool": tool, "arguments": arguments });
+        if let Some(w) = wd {
+            args["_mcphub_context"] = json!({ "working_dir": w });
+        }
+        if let Some(t) = token {
+            args["confirmation_token"] = json!(t);
+        }
+        hub.request("tools/call", json!({ "name": "mcphub_call", "arguments": args }))
+    };
+    let text = |resp: &Value| -> Value {
+        serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap_or("null")).unwrap_or(Value::Null)
+    };
+
+    // Liste : le serveur utilisé par le tenant est signalé, la valeur du jeton n'apparaît pas.
+    let listed = admin(&mut hub, "servers_list", json!({}), None, None);
+    let listed_text = listed.to_string();
+    assert!(!listed_text.contains("hub-secret"), "{}", listed_text);
+    let rows = text(&listed);
+    let svc = rows["servers"].as_array().unwrap().iter().find(|r| r["name"] == "svc").unwrap().clone();
+    assert_eq!(svc["tenants"], json!(["acme"]));
+    let revision = rows["revision"].as_str().unwrap().to_string();
+
+    // Désactiver : sans confirmation, avec sauvegarde.
+    let off = admin(&mut hub, "server_disable", json!({ "name": "other", "revision": revision }), None, None);
+    assert_eq!(text(&off)["ok"], true, "{}", off);
+    assert_eq!(read_json(&path)["servers"]["other"]["disabled"], true);
+    assert!(std::fs::read_dir(fx.hub.join("backups")).unwrap().count() >= 1);
+
+    // Même avec "mcphub" partagé, aucune modification depuis le dossier du tenant.
+    let from_tenant = admin(&mut hub, "server_enable", json!({ "name": "other" }), Some(&fx.acme), None).to_string();
+    assert!(from_tenant.contains("toujours refuse"), "{}", from_tenant);
+    assert_eq!(read_json(&path)["servers"]["other"]["disabled"], true);
+    let list_from_tenant = admin(&mut hub, "servers_list", json!({}), Some(&fx.acme), None).to_string();
+    assert!(list_from_tenant.contains("toujours refuse"), "{}", list_from_tenant);
+
+    // Ajouter : confirmation obligatoire, puis ajout avec le jeton.
+    let add_args = json!({ "name": "extra", "command": "/bin/echo", "env": { "EXTRA_TOKEN": "${EXTRA_ABSENT_TOKEN}" } });
+    let asked = admin(&mut hub, "server_add", add_args.clone(), None, None);
+    assert_eq!(asked["result"]["_meta"]["mcphub"]["status"], "confirmation_required", "{}", asked);
+    assert!(read_json(&path)["servers"].get("extra").is_none());
+    let token = asked["result"]["_meta"]["mcphub"]["confirmation_token"].as_str().unwrap().to_string();
+    let added = text(&admin(&mut hub, "server_add", add_args, None, Some(&token)));
+    assert_eq!(added["ok"], true, "{}", added);
+    assert_eq!(added["missingVariables"], json!(["EXTRA_ABSENT_TOKEN"]));
+    assert_eq!(read_json(&path)["servers"]["extra"]["sandbox"], "shield");
+
+    // Secret en clair : refusé, même avec confirmation.
+    let leak = json!({ "name": "leak", "command": "/bin/echo", "env": { "API_KEY": "plain-value-123" } });
+    let asked = admin(&mut hub, "server_add", leak.clone(), None, None);
+    let token = asked["result"]["_meta"]["mcphub"]["confirmation_token"].as_str().unwrap().to_string();
+    let refused = admin(&mut hub, "server_add", leak, None, Some(&token));
+    assert_eq!(refused["result"]["isError"], true, "{}", refused);
+    assert!(read_json(&path)["servers"].get("leak").is_none());
+    hub.finish();
+}
+
+#[test]
 fn secret_absent_bloque_l_instance_sans_repli() {
     let fx = Fixture::new("manquant");
     std::fs::write(fx.hub.join("tenants").join("acme").join("secrets.env"), "").unwrap();

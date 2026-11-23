@@ -459,15 +459,28 @@ impl ProxyServer {
         arguments: &serde_json::Value,
         confirmation_token: Option<&str>,
     ) -> PolicyGate {
+        let default = crate::permissions::Decision {
+            action: Action::Confirm,
+            source: "mcphub:install".into(),
+            reason: Some("installe et lance un nouveau serveur MCP sur cette machine".into()),
+        };
+        self.hub_gate_with(id, "library", tool, arguments, confirmation_token, default).await
+    }
+
+    /// Contrôle d'un outil interne : une règle explicite `server: "mcphub"` l'emporte, sinon
+    /// la décision par défaut de l'outil.
+    async fn hub_gate_with(
+        &self,
+        id: &Option<serde_json::Value>,
+        mode: &'static str,
+        tool: &str,
+        arguments: &serde_json::Value,
+        confirmation_token: Option<&str>,
+        default: crate::permissions::Decision,
+    ) -> PolicyGate {
         let permissions = self.config.lock().await.permissions.clone();
-        let decision = permissions
-            .rule_for("mcphub", tool)
-            .unwrap_or_else(|| crate::permissions::Decision {
-                action: Action::Confirm,
-                source: "mcphub:install".into(),
-                reason: Some("installe et lance un nouveau serveur MCP sur cette machine".into()),
-            });
-        let target = GateTarget { mode: "library", server: "mcphub", instance: "mcphub", tool, arguments };
+        let decision = permissions.rule_for("mcphub", tool).unwrap_or(default);
+        let target = GateTarget { mode, server: "mcphub", instance: "mcphub", tool, arguments };
         self.permission_gate(id, target, confirmation_token, &permissions, decision)
             .await
     }
@@ -1189,7 +1202,7 @@ impl ProxyServer {
         let mut tools = serde_json::json!([
             {
                 "name": "mcphub_search",
-                "description": "Search MCP tools across all connected servers using BM25. Call FIRST to find the right tool, then use `mcphub_call`. Compact by default (no schemas) — set expand=true to get inputSchemas. Nothing fits? mcphub_call server=mcphub tool=registry_search finds installable MCP servers.",
+                "description": "Search MCP tools across all connected servers using BM25. Call FIRST to find the right tool, then use `mcphub_call`. Compact by default (no schemas) — set expand=true to get inputSchemas. Nothing fits? mcphub_call server=mcphub tool=registry_search finds installable MCP servers. Manage servers: server=mcphub tool=servers_list | server_add | server_remove | server_enable | server_disable.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1931,6 +1944,9 @@ impl ProxyServer {
         arguments: serde_json::Value,
         confirmation_token: Option<&str>,
     ) -> JsonRpcResponse {
+        if crate::server_admin::is_admin_tool(tool) {
+            return self.handle_admin_tool(id, tool, arguments, confirmation_token).await;
+        }
         if crate::registry::is_install_tool(tool) {
             if let PolicyGate::Respond(response) =
                 self.hub_tool_gate(&id, tool, &arguments, confirmation_token).await
@@ -1974,6 +1990,95 @@ impl ProxyServer {
             })
             .await;
         }
+        let (payload, is_error) = match outcome {
+            Ok(v) => (v, false),
+            Err(e) => (serde_json::json!({ "error": e }), true),
+        };
+        JsonRpcResponse::success(
+            id,
+            serde_json::json!({
+                "content": [{ "type": "text", "text": serde_json::to_string(&payload).unwrap_or_default() }],
+                "isError": is_error,
+            }),
+        )
+    }
+
+    /// Gestion des serveurs de config.json par l'agent (lister, ajouter, retirer, activer,
+    /// désactiver) : confirmation selon l'outil, écriture protégée, rechargement, audit.
+    async fn handle_admin_tool(
+        &self,
+        id: Option<serde_json::Value>,
+        tool: &str,
+        arguments: serde_json::Value,
+        confirmation_token: Option<&str>,
+    ) -> JsonRpcResponse {
+        let default = match crate::server_admin::default_confirmation(tool) {
+            Some(reason) => crate::permissions::Decision {
+                action: Action::Confirm,
+                source: "mcphub:servers".into(),
+                reason: Some(reason.into()),
+            },
+            None => crate::permissions::Decision {
+                action: Action::Allow,
+                source: "mcphub:servers".into(),
+                reason: None,
+            },
+        };
+        let (decision, policy) =
+            match self.hub_gate_with(&id, "admin", tool, &arguments, confirmation_token, default).await {
+                PolicyGate::Respond(response) => return response,
+                PolicyGate::Proceed { decision, policy } => (decision, policy),
+            };
+        let started = std::time::Instant::now();
+        let tenants = self.tenants.tenants();
+        let tool_owned = tool.to_string();
+        let args = arguments.clone();
+        let mut outcome = tokio::task::spawn_blocking(move || {
+            let tenants = tenants
+                .as_ref()
+                .as_ref()
+                .map_err(|e| format!("projects.json illisible, comptes clients inconnus : {}", e))?;
+            let config_path = crate::config::dedicated_config_path();
+            let servers_dir = crate::registry::servers_dir();
+            crate::server_admin::call(
+                &tool_owned,
+                &args,
+                &crate::server_admin::Env { config_path: &config_path, servers_dir: &servers_dir, tenants },
+            )
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("erreur interne : {}", e)));
+        if let Ok(v) = &mut outcome {
+            let changed = crate::server_admin::is_write_tool(tool) && v.get("unchanged") != Some(&serde_json::json!(true));
+            if changed {
+                self.reload_config_now().await;
+            }
+            if tool == "server_add" {
+                let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                let tools = if v.get("missingVariables").is_some() { Vec::new() } else { self.wait_for_tools(&name, 45).await };
+                v["tools"] = serde_json::json!(tools);
+                v["next"] = serde_json::json!(if !tools.is_empty() {
+                    format!("Ready: mcphub_call server={} tool=<one of tools>.", name)
+                } else if v.get("oauth").and_then(|o| o.as_bool()) == Some(true) {
+                    format!("Added. This remote server signs in with OAuth: ask the user to run `McpHub oauth login {}` or click Sign in in the dashboard.", name)
+                } else {
+                    format!("Added. Tools not indexed yet: mcphub_search with server={} in a few seconds, or servers_list to see its error.", name)
+                });
+            }
+        }
+        self.record_audit(AuditEntry {
+            server: "mcphub".into(),
+            tool: format!("admin/{}", tool),
+            mode: "admin",
+            decision,
+            policy,
+            status: if outcome.is_ok() { "ok" } else { "error" },
+            duration_ms: Some(started.elapsed().as_millis() as u64),
+            arguments: Some(crate::audit::safe_arguments(&arguments)),
+            error: outcome.as_ref().err().cloned(),
+            tenant: None,
+        })
+        .await;
         let (payload, is_error) = match outcome {
             Ok(v) => (v, false),
             Err(e) => (serde_json::json!({ "error": e }), true),
@@ -2098,6 +2203,14 @@ impl ProxyServer {
             // Outils internes (bibliothèque, installation dans la config McpHub) : pas depuis le
             // dossier d'un tenant, sauf "mcphub" dans ses sharedServers.
             if let Context::Tenant(t) = &ctx {
+                // Lister aussi : la liste nomme les serveurs et les comptes clients qui les utilisent.
+                if crate::server_admin::is_admin_tool(&tool) {
+                    let reason = format!(
+                        "gerer les serveurs McpHub est toujours refuse depuis le dossier du tenant {}",
+                        t.id
+                    );
+                    return self.refuse_for_tenant(id, Some(&ctx), &server, &tool, reason).await;
+                }
                 if !t.shared_servers.contains("mcphub") {
                     let reason = format!(
                         "outils internes McpHub refuses dans le dossier du tenant {} (ajouter \"mcphub\" a ses sharedServers pour les permettre)",

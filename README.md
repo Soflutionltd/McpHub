@@ -511,6 +511,25 @@ The server is installed with the same guards, its tools are indexed right away, 
 
 `agentInstall`: `"trusted"` (default, only servers whose trust score reaches `minTrust`), `"any"` or `"off"`.
 
+### Your agent manages your servers
+
+The agent can also list, add, remove, enable and disable servers in `~/.McpHub/config.json`, without you editing the file:
+
+```text
+mcphub_call  server=mcphub  tool=servers_list
+mcphub_call  server=mcphub  tool=server_disable  arguments={"name": "cloudflare", "revision": "<from servers_list>"}
+mcphub_call  server=mcphub  tool=server_add      arguments={"name": "weather", "command": "npx", "args": ["-y", "weather-mcp"], "env": {"WEATHER_TOKEN": "${WEATHER_TOKEN}"}}
+mcphub_call  server=mcphub  tool=server_add      arguments={"name": "linear", "url": "https://mcp.linear.app/mcp", "auth": "oauth"}
+mcphub_call  server=mcphub  tool=server_remove   arguments={"name": "weather"}
+```
+
+- **Confirmation**: `server_add`, `server_remove` and `server_enable` ask you first (native window, or token depending on `confirmVia`). `server_disable` and `servers_list` don't. A rule in `settings.permissions` with `"server": "mcphub"` overrides this.
+- **No secrets**: a value that looks like a secret is refused, and a secret field (`*_TOKEN`, `*_KEY`, `Authorization`, `--password`...) only accepts a `${NAME}` reference. You store the value with `McpHub vault set NAME`.
+- **Safe writes**: each change saves the previous file in `~/.McpHub/backups/` (last 20 kept). It is refused if the file changed since `servers_list` (`revision`) or during the write.
+- **Local commands** run in the `shield` sandbox by default, and an agent cannot turn the sandbox off.
+- **Client accounts**: always refused from a tenant folder. A server used by a client account can't be removed or disabled by an agent.
+- Every call is written to the audit log (`admin/<tool>`).
+
 ---
 
 ## 🐧 Linux servers and sync

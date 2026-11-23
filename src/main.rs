@@ -26,6 +26,7 @@ mod registry;
 mod remote;
 mod response_cache;
 mod sandbox;
+mod server_admin;
 mod search;
 mod sse;
 mod sync;
