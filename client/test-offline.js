@@ -289,6 +289,12 @@ try {
   assert.equal(JSON.parse(text(await run())).result, 42);
   assert.deepEqual(runs.at(-1).policy, { denied_servers: ['acme-crm'] });
 
+  // Each run counts once, with the tool calls its script made: the round trips it saved.
+  const codeMode = JSON.parse(text(await client.callTool({ name: 'mcphub_savings', arguments: {} }))).codeMode;
+  assert.equal(codeMode.runs, 1);
+  assert.equal(codeMode.callsInsideScripts, 2);
+  assert.equal(codeMode.roundTripsSaved, 1);
+
   // Inside a project the daemon receives the same rules mcphub_call enforces.
   assert.equal(JSON.parse(text(await run({ working_dir: acme }))).policy, 'enforced');
   assert.deepEqual(runs.at(-1).policy, {

@@ -101,10 +101,14 @@ let usage = await readJson(usagePath, {
   batches: 0,
   bootstrapCalls: 0,
   suggestionsServed: 0,
+  runs: 0,
+  runCalls: 0,
   childResultBytes: 0,
   startedAt: new Date().toISOString()
 });
 usage.suggestionsServed ??= 0;
+usage.runs ??= 0;
+usage.runCalls ??= 0;
 
 async function readJson(path, fallback) {
   try {
@@ -1188,7 +1192,7 @@ const server = new McpServer(
   },
   {
     instructions:
-      'On mcphub_call and on each call of mcphub_batch, pass fields (keys to keep in each row) and max_rows whenever you expect a list (rows, logs, issues, invoices): the result comes back several times smaller.'
+      'On mcphub_call and on each call of mcphub_batch, pass fields (keys to keep in each row) and max_rows whenever you expect a list (rows, logs, issues, invoices): the result comes back several times smaller. When a task needs three or more tool calls and you do not have to read a result to decide the next call (loops, filters, lookups feeding each other), send one mcphub_run script instead of separate calls: one round trip, and only its return value comes back.'
   }
 );
 
@@ -1482,7 +1486,7 @@ registerHubTool(
           true
         );
       }
-      usage.runs = (usage.runs ?? 0) + 1;
+      usage.runs += 1;
       markUsageDirty();
       await assertTenantSupport(working_dir);
       const result = await callHubTool('mcphub_run', {
@@ -1494,8 +1498,14 @@ registerHubTool(
       // Le texte d'un très gros résultat est coupé par le moteur et ne se parse plus :
       // la mention se lit alors dans le texte lui-même.
       const runText = extractText(result);
-      const policyConfirmed =
-        parseJsonContainer(runText)?.policy === 'enforced' || /"policy":\s*"enforced"/.test(runText);
+      const runPayload = parseJsonContainer(runText);
+      const policyConfirmed = runPayload?.policy === 'enforced' || /"policy":\s*"enforced"/.test(runText);
+      // Appels faits par le script : autant d'allers-retours que l'agent n'a pas eu à faire.
+      const scriptCalls = runPayload?.calls ?? Number(/"calls":\s*(\d+)/.exec(runText)?.[1] ?? 0);
+      if (!result.isError && Number.isInteger(scriptCalls)) {
+        usage.runCalls += scriptCalls;
+        markUsageDirty();
+      }
       if (policy && !result.isError && !policyConfirmed) {
         return textResult(
           'mcphub_run ran but the daemon did not confirm that the project rules were enforced: result withheld. Update McpHub.',
@@ -1659,6 +1669,12 @@ registerHubTool(
             hubConnection?.transport === 'daemon'
               ? 'Child servers are shared with every Cursor window through the McpHub daemon.'
               : 'Child servers are spawned per Cursor window. Start the daemon (McpHub install) to share them.'
+        },
+        codeMode: {
+          runs: usage.runs,
+          callsInsideScripts: usage.runCalls,
+          roundTripsSaved: Math.max(0, usage.runCalls - usage.runs),
+          note: 'Each mcphub_run is one round trip, whatever the number of tool calls its script makes.'
         },
         actualUsage: usage
       });
