@@ -30,6 +30,10 @@ pub struct AuthServerMeta {
     pub token_endpoint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration_endpoint: Option<String>,
+    /// Méthodes d'authentification du client acceptées par le serveur de jetons (vide = non
+    /// annoncé). Supabase refuse un client public (`none`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub token_endpoint_auth_methods_supported: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -392,6 +396,11 @@ pub async fn discover(url: &str, www_authenticate: Option<&str>) -> Result<(Auth
             let get = |k: &str| v.get(k).and_then(|x| x.as_str()).map(String::from);
             if let (Some(a), Some(t)) = (get("authorization_endpoint"), get("token_endpoint")) {
                 let reg = get("registration_endpoint");
+                let auth_methods: Vec<String> = v
+                    .get("token_endpoint_auth_methods_supported")
+                    .and_then(|m| m.as_array())
+                    .map(|m| m.iter().filter_map(|x| x.as_str()).map(String::from).collect())
+                    .unwrap_or_default();
                 if !secure_url(&a) || !secure_url(&t) || reg.as_deref().is_some_and(|r| !secure_url(r)) {
                     return Err("points d'acces OAuth non HTTPS refuses".into());
                 }
@@ -401,6 +410,7 @@ pub async fn discover(url: &str, www_authenticate: Option<&str>) -> Result<(Auth
                         authorization_endpoint: a,
                         token_endpoint: t,
                         registration_endpoint: reg,
+                        token_endpoint_auth_methods_supported: auth_methods,
                     },
                     resource,
                     scope,
@@ -415,10 +425,21 @@ pub async fn discover(url: &str, www_authenticate: Option<&str>) -> Result<(Auth
             authorization_endpoint: format!("{}/authorize", ibase),
             token_endpoint: format!("{}/token", ibase),
             registration_endpoint: Some(format!("{}/register", ibase)),
+            token_endpoint_auth_methods_supported: Vec::new(),
         },
         resource,
         scope,
     ))
+}
+
+/// Méthode d'authentification du client à demander : client public (`none`) si le serveur
+/// l'accepte ou ne dit rien, sinon la première méthode à secret qu'il accepte.
+fn client_auth_method(meta: &AuthServerMeta) -> &'static str {
+    let supported = &meta.token_endpoint_auth_methods_supported;
+    ["none", "client_secret_basic", "client_secret_post"]
+        .into_iter()
+        .find(|m| supported.is_empty() || supported.iter().any(|s| s == m))
+        .unwrap_or("none")
 }
 
 async fn register(meta: &AuthServerMeta) -> Result<ClientInfo, String> {
@@ -426,12 +447,13 @@ async fn register(meta: &AuthServerMeta) -> Result<ClientInfo, String> {
         .registration_endpoint
         .clone()
         .ok_or("le serveur n'accepte pas l'enregistrement dynamique de client")?;
+    let auth_method = client_auth_method(meta);
     let body = serde_json::json!({
         "client_name": "McpHub",
         "redirect_uris": [redirect_uri()],
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
-        "token_endpoint_auth_method": "none",
+        "token_endpoint_auth_method": auth_method,
     });
     let r = http()
         .post(&endpoint)
@@ -450,7 +472,8 @@ async fn register(meta: &AuthServerMeta) -> Result<ClientInfo, String> {
         token_endpoint_auth_method: v
             .get("token_endpoint_auth_method")
             .and_then(|x| x.as_str())
-            .map(String::from),
+            .map(String::from)
+            .or_else(|| (auth_method != "none").then(|| auth_method.to_string())),
         redirect_uri: Some(redirect_uri()),
     })
 }
@@ -1179,6 +1202,16 @@ mod tests {
             pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         );
+    }
+
+    #[test]
+    fn methode_d_authentification_du_client() {
+        let mut meta = AuthServerMeta::default();
+        assert_eq!(client_auth_method(&meta), "none");
+        meta.token_endpoint_auth_methods_supported = vec!["client_secret_basic".into(), "client_secret_post".into()];
+        assert_eq!(client_auth_method(&meta), "client_secret_basic");
+        meta.token_endpoint_auth_methods_supported = vec!["client_secret_post".into(), "none".into()];
+        assert_eq!(client_auth_method(&meta), "none");
     }
 
     #[test]
