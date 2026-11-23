@@ -194,6 +194,10 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
 .cn-row input{flex:1}
 .cn-code{font-family:'SF Mono',Monaco,monospace;font-size:28px;font-weight:700;letter-spacing:4px;text-align:center;padding:14px;margin:12px 0;border:1px dashed var(--border);border-radius:10px;color:var(--text)}
 .cn-error{color:var(--danger)}
+.ta-box{border:1px solid var(--border);border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:13px}
+.ta-box.ta-bad{border-color:var(--danger)}
+.ta-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:3px 0}
+.ta-row .ta-msg{flex:1;min-width:200px}
 .cl-browser{margin-top:6px;font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:6px}
 </style>
 </head><body>
@@ -219,6 +223,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
     <div class="stat"><div class="stat-val" id="stat-savings-pct">—</div><div class="stat-label">Context Saved</div></div>
   </div>
   <!-- Servers View -->
+  <div id="token-alerts"></div>
   <div id="view-servers">
     <div class="toolbar">
       <div class="search"><input id="search-input" placeholder="Search servers..." oninput="renderGrid()"><span class="search-clear hidden" id="search-clear" onclick="document.getElementById('search-input').value='';renderGrid()">✕</span></div>
@@ -383,6 +388,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
       <div class="json-hint" id="key-hint"></div>
       <div id="key-create"></div>
       <div class="lib-field"><label for="key-value" id="key-label">Value</label><div class="cn-row"><input id="key-value" type="password" autocomplete="new-password" spellcheck="false" onkeydown="if(event.key==='Enter')keySubmit(true)"><button class="btn btn-ghost" onclick="keyPaste()">Paste</button></div></div>
+      <div class="lib-field"><label for="key-expires">Expires on (optional)</label><div class="hint">For reminders 14 and 3 days before. Leave empty when the service reports it: Cloudflare and GitHub do.</div><input id="key-expires" type="date"></div>
       <div class="json-hint" id="key-status"></div>
       <div class="modal-actions"><button class="btn btn-ghost" onclick="keyClose()">Cancel</button><button class="btn btn-ghost hidden" id="key-force" onclick="keySubmit(false)">Save without checking</button><button class="btn btn-primary" onclick="keySubmit(true)">Save to Keychain</button></div>
     </div>
@@ -1201,6 +1207,7 @@ function keyOpen(target){
   document.getElementById('key-status').textContent='';
   document.getElementById('key-status').classList.remove('cn-error');
   document.getElementById('key-force').classList.add('hidden');
+  document.getElementById('key-expires').value='';
   const input=document.getElementById('key-value');input.value='';
   clientShow('key-modal');input.focus();
 }
@@ -1218,7 +1225,7 @@ async function keySubmit(verify){
   const url=t.tenant?'/api/tenants/'+encodeURIComponent(t.tenant)+'/secrets/'+encodeURIComponent(t.name):'/api/secrets/'+encodeURIComponent(t.name);
   status.textContent=verify&&t.connector?'Checking with '+t.connector.label+'...':'Saving...';
   let r,d={};
-  try{r=await fetch(url,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({value,verify})});try{d=await r.json()}catch(e){d={}}}
+  try{r=await fetch(url,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({value,verify,expires_on:document.getElementById('key-expires').value||undefined})});try{d=await r.json()}catch(e){d={}}}
   catch(e){status.textContent=e.message;return}
   status.classList.toggle('cn-error',!r.ok);
   if(!r.ok){
@@ -1229,8 +1236,9 @@ async function keySubmit(verify){
   input.value='';
   // Le jeton ne doit pas traîner dans le presse-papiers.
   try{await navigator.clipboard.writeText('')}catch(e){}
-  notify('Saved: '+(d.written||[t.name]).join(', ')+(d.detail?' · '+d.detail:''));
+  notify('Saved: '+(d.written||[t.name]).join(', ')+(d.detail?' · '+d.detail:'')+(d.expires_at?' · expires '+new Date(d.expires_at).toLocaleDateString():''));
   keyClose();
+  fetchTokenAlerts();
   if(t.tenant)fetchClients();else fetchServers();
 }
 async function deviceStart(){
@@ -1304,4 +1312,28 @@ async function clientBrowserSet(ti,value){
   try{await api('PUT',tenantUrl(t,'/browser'),{app,profile,version:clients.version});notify(value?'Client pages open in this profile':'Client pages open in the default browser');fetchClients()}
   catch(e){notify(e.message,'danger');fetchClients()}
 }
+
+// ─── Échéances des jetons ───
+let tokenAlerts=[];
+async function fetchTokenAlerts(){
+  try{tokenAlerts=(await api('GET','/api/token-alerts')).alerts||[]}catch(e){tokenAlerts=[]}
+  renderTokenAlerts();
+}
+function renderTokenAlerts(){
+  const box=document.getElementById('token-alerts');
+  if(!tokenAlerts.length){box.innerHTML='';return}
+  const bad=tokenAlerts.some(a=>a.level!=='soon');
+  box.innerHTML=`<div class="ta-box${bad?' ta-bad':''}" role="status">${tokenAlerts.map((a,i)=>`<div class="ta-row"><span class="${a.level==='soon'?'cl-dim':'cl-miss'}">${a.level==='soon'?'Expires soon':'Action needed'}</span><span class="ta-msg">${esc(a.message)}</span><button class="btn btn-ghost" onclick="tokenAlertRenew(${i})">${a.service==='oauth'?'Reconnect':'Renew'}</button></div>`).join('')}</div>`;
+}
+function tokenAlertRenew(i){
+  const a=tokenAlerts[i];if(!a)return;
+  if(a.service==='oauth'){
+    if(a.tenant){switchView('clients');notify('Reconnect '+a.var+' on the card of '+a.tenant)}
+    else hubOauth(a.var);
+    return;
+  }
+  keyOpen({tenant:a.tenant,name:a.name,present:true,connector:a.connector});
+}
+fetchTokenAlerts();
+setInterval(fetchTokenAlerts,5*60*1000);
 </script></body></html>

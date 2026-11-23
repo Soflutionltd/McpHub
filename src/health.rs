@@ -125,7 +125,7 @@ impl HealthMonitor {
 /// - macOS: display alert via osascript (no permission needed, always works)
 /// - Windows: Toast notification via notify-rust
 /// - Linux: D-Bus / libnotify via notify-rust
-fn send_notification(title: &str, body: &str) {
+pub fn send_notification(title: &str, body: &str) {
     // Always log to stderr (visible in Cursor MCP output)
     eprintln!("[McpHub][ALERT] {}: {}", title, body);
 

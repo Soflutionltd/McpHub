@@ -2487,14 +2487,31 @@ impl ProxyServer {
                         );
                     }
                 }
+                // Jeton expiré (échec) ou bientôt expiré : dit en clair à l'agent, hors cache.
+                let failed = normalized.get("isError").and_then(|v| v.as_bool()) == Some(true);
+                if let Some(note) = crate::token_watch::note_for(&process_key, failed) {
+                    if let Some(obj) = normalized.as_object_mut() {
+                        if let Some(content) = obj.get_mut("content").and_then(|c| c.as_array_mut()) {
+                            content.push(serde_json::json!({ "type": "text", "text": note }));
+                        }
+                        obj.insert("_token_alert".into(), serde_json::json!(note));
+                    }
+                }
                 JsonRpcResponse::success(id, normalized)
             }
-            Err(e) => {
+            Err(mut e) => {
                 let mut data = serde_json::json!({
                     "server": server,
                     "tool": tool,
                     "args_received": arguments,
                 });
+                // Le statut se lit en tête du message : l'avis va à la fin.
+                if let Some(note) = crate::token_watch::note_for(&process_key, true) {
+                    if !e.contains(&note) {
+                        e = format!("{}\n\n{}", e, note);
+                    }
+                    data["token_alert"] = serde_json::json!(note);
+                }
                 if failure_status(&e) == "error" {
                     if let Some(schema) = tool_schema {
                         data["inputSchema"] = schema;

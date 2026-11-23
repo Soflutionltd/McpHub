@@ -83,21 +83,10 @@ impl RemoteClient {
                     token = Some(t);
                     continue;
                 }
-                return Err(format!(
-                    "{} : connexion requise. Lancer : McpHub oauth login {}",
-                    self.server, self.server
-                ));
+                return Err(crate::token_watch::auth_failure_message(&self.server, true));
             }
             if resp.status().as_u16() == 401 {
-                return Err(format!(
-                    "{} : authentification refusee (401). {}",
-                    self.server,
-                    if self.oauth {
-                        format!("Lancer : McpHub oauth login {}", self.server)
-                    } else {
-                        "Verifier le jeton dans headers.".to_string()
-                    }
-                ));
+                return Err(crate::token_watch::auth_failure_message(&self.server, self.oauth));
             }
             if resp.status().as_u16() == 404 && self.session.lock().await.is_some() {
                 *self.session.lock().await = None;

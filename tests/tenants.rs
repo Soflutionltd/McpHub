@@ -741,6 +741,29 @@ fn connexion_des_services_par_http() {
     assert_eq!(status, 200, "{}", body);
     assert!(read_json(&projects_path)["projects"]["acme"].get("browser").is_none());
 
+    // Échéance saisie à l'enregistrement : fiche sans valeur, alerte dans le tableau de bord.
+    let (status, _) = daemon.call(
+        "PUT",
+        "/api/tenants/acme/secrets/ACME_TOKEN",
+        Some(&json!({ "value": "acme-rotated", "expires_on": "31/12/2020" })),
+    );
+    assert_eq!(status, 400);
+    let (status, text) = daemon.call(
+        "PUT",
+        "/api/tenants/acme/secrets/ACME_TOKEN",
+        Some(&json!({ "value": "acme-rotated", "expires_on": "2020-12-31" })),
+    );
+    assert_eq!(status, 200, "{}", text);
+    let meta = std::fs::read_to_string(fx.hub.join("tenants").join("acme").join("token-meta.json")).unwrap();
+    assert!(!meta.contains("acme-rotated"));
+    let (status, alerts) = daemon.json("GET", "/api/token-alerts", None);
+    assert_eq!(status, 200);
+    let alert = alerts["alerts"].as_array().unwrap().iter().find(|a| a["name"] == "ACME_TOKEN").expect("alerte");
+    assert_eq!(alert["tenant"], "acme");
+    assert_eq!(alert["level"], "expired");
+    assert_eq!(alert["servers"], json!(["svc"]));
+    assert!(alert["message"].as_str().unwrap().contains("expiré le 2020-12-31"));
+
     // Audit : le nom du secret, jamais la valeur.
     let audit = fx.hub.join("audit.jsonl");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -753,4 +776,37 @@ fn connexion_des_services_par_http() {
         assert!(std::time::Instant::now() < deadline, "audit incomplet : {}", text);
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+}
+
+#[test]
+fn un_agent_apprend_qu_un_jeton_va_expirer() {
+    let fx = Fixture::new("expiry");
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let meta = json!({ "ACME_TOKEN": {
+        "var": "TOKEN",
+        "service": "github",
+        "expires_at": now + 2 * 86_400_000 - 60_000,
+        "servers": ["svc"]
+    }});
+    std::fs::write(fx.hub.join("tenants").join("acme").join("token-meta.json"), meta.to_string()).unwrap();
+    let mut hub = fx.start();
+    let acme_src = fx.acme.join("site").join("src");
+    let call = |hub: &mut Hub, wd: Option<&Path>| {
+        let mut args = json!({ "server": "svc", "tool": "get_identity", "arguments": {} });
+        if let Some(w) = wd {
+            args["_mcphub_context"] = json!({ "working_dir": w });
+        }
+        hub.request("tools/call", json!({ "name": "mcphub_call", "arguments": args })).to_string()
+    };
+
+    // Le compte McpHub n'est pas concerné par le jeton du client.
+    assert!(!call(&mut hub, None).contains("expire dans"));
+    // Depuis le dossier du client : l'agent lit quel jeton, quel compte, et où le renouveler.
+    let first = call(&mut hub, Some(&acme_src));
+    assert!(first.contains("token=acme-secret"), "{}", first);
+    assert!(first.contains("GitHub ACME_TOKEN (client acme) : expire dans 2 jours"), "{}", first);
+    assert!(first.contains("Client accounts, acme, secret ACME_TOKEN"), "{}", first);
+    // Une fois par jour et par serveur, pas à chaque appel.
+    assert!(!call(&mut hub, Some(&acme_src)).contains("expire dans"));
+    hub.finish();
 }

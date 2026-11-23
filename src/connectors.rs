@@ -169,6 +169,8 @@ pub struct Verified {
     pub account_id: Option<String>,
     /// Ce que le jeton voit, pour le message de confirmation.
     pub detail: String,
+    /// Échéance donnée par le service (millisecondes), quand il la fournit.
+    pub expires_at: Option<u64>,
 }
 
 /// Échec de vérification : jeton refusé (rien n'est enregistré) ou service injoignable.
@@ -186,9 +188,16 @@ fn http() -> reqwest::Client {
         .unwrap_or_default()
 }
 
+/// Réponse d'une API de service : statut, corps JSON, échéance annoncée par GitHub.
+struct ApiReply {
+    status: u16,
+    body: Value,
+    github_expiration: Option<String>,
+}
+
 /// Lecture d'une réponse JSON de l'API officielle du service (adresse fixe, jamais fournie
 /// par l'appelant).
-async fn api_get(connector: &KeyConnector, url: &str, token: &str) -> Result<(u16, Value), VerifyError> {
+async fn api_get(connector: &KeyConnector, url: &str, token: &str) -> Result<ApiReply, VerifyError> {
     let r = http()
         .get(url)
         .bearer_auth(token)
@@ -197,8 +206,13 @@ async fn api_get(connector: &KeyConnector, url: &str, token: &str) -> Result<(u1
         .await
         .map_err(|e| VerifyError::Unreachable(format!("{} unreachable: {}", connector.label, e.without_url())))?;
     let status = r.status().as_u16();
+    let github_expiration = r
+        .headers()
+        .get("github-authentication-token-expiration")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
     let body = r.json::<Value>().await.unwrap_or(Value::Null);
-    Ok((status, body))
+    Ok(ApiReply { status, body, github_expiration })
 }
 
 /// Interprète la liste des comptes Cloudflare vus par le jeton.
@@ -224,12 +238,30 @@ fn cloudflare_accounts(status: u16, body: &Value) -> Result<Verified, VerifyErro
         [] => Err(VerifyError::Refused(
             "the token is valid but sees no account: add the Account Settings Read permission".into(),
         )),
-        [(id, name)] => Ok(Verified { account_id: Some(id.clone()), detail: format!("Cloudflare account {}", name) }),
+        [(id, name)] => Ok(Verified {
+            account_id: Some(id.clone()),
+            detail: format!("Cloudflare account {}", name),
+            expires_at: None,
+        }),
         many => Ok(Verified {
             account_id: None,
             detail: format!("{} Cloudflare accounts: set {} by hand", many.len(), CLOUDFLARE_ACCOUNT_VAR),
+            expires_at: None,
         }),
     }
+}
+
+/// Échéance d'un jeton Cloudflare (`/tokens/verify`) ; un jeton inactif est refusé.
+fn cloudflare_expiry(body: &Value) -> Result<Option<u64>, VerifyError> {
+    let result = body.get("result");
+    match result.and_then(|r| r.get("status")).and_then(|s| s.as_str()) {
+        Some("active") | None => {}
+        Some(other) => return Err(VerifyError::Refused(format!("Cloudflare reports this token as {}", other))),
+    }
+    Ok(result
+        .and_then(|r| r.get("expires_on"))
+        .and_then(|e| e.as_str())
+        .and_then(crate::token_watch::parse_datetime))
 }
 
 /// Vérifie le jeton auprès de l'API officielle du service.
@@ -240,22 +272,44 @@ pub async fn verify(connector: &KeyConnector, token: &str) -> Result<Verified, V
     };
     let out = match connector.id {
         "cloudflare" => {
-            let (status, body) = api_get(connector, "https://api.cloudflare.com/client/v4/accounts?per_page=50", token).await?;
-            cloudflare_accounts(status, &body)
+            let r = api_get(connector, "https://api.cloudflare.com/client/v4/accounts?per_page=50", token).await?;
+            let mut verified = cloudflare_accounts(r.status, &r.body)?;
+            // Échéance : route de vérification du jeton de compte, sinon celle du jeton d'utilisateur.
+            let mut urls = Vec::new();
+            if let Some(id) = &verified.account_id {
+                urls.push(format!("https://api.cloudflare.com/client/v4/accounts/{}/tokens/verify", id));
+            }
+            urls.push("https://api.cloudflare.com/client/v4/user/tokens/verify".to_string());
+            for url in urls {
+                // Le jeton est déjà reconnu : sans réponse ici, l'échéance reste simplement inconnue.
+                let Ok(r) = api_get(connector, &url, token).await else {
+                    break;
+                };
+                if r.status == 200 {
+                    verified.expires_at = cloudflare_expiry(&r.body)?;
+                    break;
+                }
+            }
+            Ok(verified)
         }
         "github" => {
-            let (status, body) = api_get(connector, "https://api.github.com/user", token).await?;
-            match body.get("login").and_then(|l| l.as_str()) {
-                Some(login) if status == 200 => Ok(Verified { account_id: None, detail: format!("GitHub account {}", login) }),
+            let r = api_get(connector, "https://api.github.com/user", token).await?;
+            match r.body.get("login").and_then(|l| l.as_str()) {
+                Some(login) if r.status == 200 => Ok(Verified {
+                    account_id: None,
+                    detail: format!("GitHub account {}", login),
+                    expires_at: r.github_expiration.as_deref().and_then(crate::token_watch::parse_datetime),
+                }),
                 _ => Err(VerifyError::Refused("GitHub refused this token".into())),
             }
         }
         _ => {
-            let (status, body) = api_get(connector, "https://api.supabase.com/v1/projects", token).await?;
-            match body.as_array() {
-                Some(projects) if status == 200 => Ok(Verified {
+            let r = api_get(connector, "https://api.supabase.com/v1/projects", token).await?;
+            match r.body.as_array() {
+                Some(projects) if r.status == 200 => Ok(Verified {
                     account_id: None,
                     detail: format!("{} Supabase project(s)", projects.len()),
+                    expires_at: None,
                 }),
                 _ => Err(VerifyError::Refused("Supabase refused this token".into())),
             }
@@ -650,6 +704,16 @@ mod tests {
         assert!(matches!(cloudflare_accounts(200, &none), Err(VerifyError::Refused(_))));
         let refused = json!({"success": false, "errors": [{"code": 1000}]});
         assert!(matches!(cloudflare_accounts(403, &refused), Err(VerifyError::Refused(_))));
+    }
+
+    #[test]
+    fn echeance_cloudflare() {
+        let active = json!({"success": true, "result": {"status": "active", "expires_on": "2027-01-01T00:00:00Z"}});
+        assert_eq!(cloudflare_expiry(&active), Ok(crate::token_watch::parse_datetime("2027-01-01T00:00:00Z")));
+        let forever = json!({"success": true, "result": {"status": "active"}});
+        assert_eq!(cloudflare_expiry(&forever), Ok(None));
+        let expired = json!({"success": true, "result": {"status": "expired"}});
+        assert!(matches!(cloudflare_expiry(&expired), Err(VerifyError::Refused(_))));
     }
 
     #[test]

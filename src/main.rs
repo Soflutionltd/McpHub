@@ -31,6 +31,7 @@ mod server_admin;
 mod search;
 mod sse;
 mod sync;
+mod token_watch;
 mod tenant;
 mod toolguard;
 mod untrusted;

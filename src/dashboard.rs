@@ -1492,6 +1492,8 @@ impl KeyTarget {
 struct KeySlots {
     slots: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
     present: std::collections::BTreeSet<String>,
+    /// Nom dans le coffre → serveurs qui le reçoivent (avis d'échéance aux agents).
+    servers: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
 }
 
 /// Lecture bloquante (fichiers, Trousseau). Compte McpHub : variables `${...}` référencées par
@@ -1499,25 +1501,30 @@ struct KeySlots {
 fn key_slots(target: &KeyTarget) -> Result<KeySlots, String> {
     use std::collections::{BTreeMap, BTreeSet};
     let mut slots: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut servers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     match target {
         KeyTarget::Hub => {
-            for raw in crate::tenant::configured_servers()?.values() {
-                for var in crate::tenant::referenced_vars(raw) {
+            for (server, raw) in crate::tenant::configured_servers()? {
+                for var in crate::tenant::referenced_vars(&raw) {
+                    servers.entry(var.clone()).or_default().insert(server.clone());
                     slots.entry(var.clone()).or_default().insert(var);
                 }
             }
             let mut present: BTreeSet<String> = crate::vault::list_names().into_iter().collect();
             present.extend(slots.keys().filter(|v| std::env::var(v.as_str()).is_ok()).cloned());
-            Ok(KeySlots { slots, present })
+            Ok(KeySlots { slots, present, servers })
         }
         KeyTarget::Tenant(id) => {
             let tenants = crate::tenant::load_from(&crate::tenant::projects_path())?;
             let def = tenants.get(id).ok_or_else(|| format!("tenant {} inconnu", id))?;
-            for (var, name) in def.credentials.values().flatten() {
-                slots.entry(var.clone()).or_default().insert(name.clone());
+            for (server, vars) in &def.credentials {
+                for (var, name) in vars {
+                    servers.entry(name.clone()).or_default().insert(server.clone());
+                    slots.entry(var.clone()).or_default().insert(name.clone());
+                }
             }
             let scope = crate::vault::Scope::Tenant(id.clone());
-            Ok(KeySlots { slots, present: crate::vault::list_names_in(&scope).into_iter().collect() })
+            Ok(KeySlots { slots, present: crate::vault::list_names_in(&scope).into_iter().collect(), servers })
         }
     }
 }
@@ -1577,7 +1584,14 @@ async fn store_key_from_body(
         _ => return Err(KeyError::new(400, "value requis (texte non vide)")),
     };
     let verify = data.get("verify").and_then(|v| v.as_bool()).unwrap_or(true);
-    store_key(proxy, target, name, value, verify).await
+    let manual_expiry = match data.get("expires_on").and_then(|v| v.as_str()).filter(|v| !v.is_empty()) {
+        None => None,
+        Some(date) => match crate::token_watch::parse_datetime(date) {
+            Some(ms) if date.len() == 10 => Some(ms),
+            _ => return Err(KeyError::new(400, "expires_on : date AAAA-MM-JJ attendue")),
+        },
+    };
+    store_key(proxy, target, name, value, verify, manual_expiry).await
 }
 
 /// Range un jeton (collé ou obtenu par code d'appareil) : contrôle de forme, vérification
@@ -1589,6 +1603,7 @@ async fn store_key(
     name: &str,
     value: String,
     verify: bool,
+    manual_expiry: Option<u64>,
 ) -> Result<Value, KeyError> {
     if value.contains('\n') || value.contains('\r') {
         return Err(KeyError::new(400, "valeur sur plusieurs lignes non prise en charge"));
@@ -1630,6 +1645,23 @@ async fn store_key(
     );
     let names: Vec<String> = writes.iter().map(|(n, _)| n.clone()).collect();
     let replaced = slots.present.contains(name);
+    // Fiches d'échéance des jetons écrits (l'Account ID n'expire pas).
+    let records: Vec<(String, String, Vec<String>)> = writes
+        .iter()
+        .filter(|(_, fill)| *fill == crate::connectors::Fill::Token)
+        .map(|(slot, _)| {
+            let slot_var = slots
+                .slots
+                .iter()
+                .find(|(_, names)| names.contains(slot))
+                .map(|(v, _)| v.clone())
+                .unwrap_or_else(|| var.clone());
+            let servers = slots.servers.get(slot).map(|s| s.iter().cloned().collect()).unwrap_or_default();
+            (slot.clone(), slot_var, servers)
+        })
+        .collect();
+    let service_expiry = verified.as_ref().and_then(|v| v.expires_at);
+    let is_verified = verified.is_some();
     let task_target = target.clone();
     let written = tokio::task::spawn_blocking(move || {
         for (slot, fill) in &writes {
@@ -1645,6 +1677,28 @@ async fn store_key(
                 }),
             };
             done.map_err(|e| e.replace(value.as_str(), "***"))?;
+        }
+        let scope = match &task_target {
+            KeyTarget::Hub => crate::vault::Scope::Hub,
+            KeyTarget::Tenant(id) => crate::vault::Scope::Tenant(id.clone()),
+        };
+        for (slot, slot_var, servers) in records {
+            let recorded = crate::token_watch::record(
+                &scope,
+                crate::token_watch::Recorded {
+                    name: &slot,
+                    var: &slot_var,
+                    service: crate::connectors::for_var(&slot_var).map(|c| c.id),
+                    servers,
+                    verified: is_verified,
+                    service_expiry,
+                    manual_expiry,
+                },
+            );
+            // Le jeton est rangé : une fiche non écrite ne fait que retarder l'alerte.
+            if let Err(e) = recorded {
+                eprintln!("[McpHub][TOKENS] fiche de {} non enregistree : {}", slot, e);
+            }
         }
         Ok::<(), String>(())
     })
@@ -1669,6 +1723,7 @@ async fn store_key(
         "replaced": replaced,
         "written": names,
         "verified": verified.is_some(),
+        "expires_at": service_expiry.or(manual_expiry),
         "detail": verified.map(|v| v.detail),
     }))
 }
@@ -1731,7 +1786,7 @@ async fn handle_device_start(proxy: Option<Arc<ProxyServer>>, body: &str) -> Vec
     crate::connectors::device_set(&id, crate::connectors::DeviceState::Pending);
     tokio::spawn(async move {
         let state = match crate::connectors::github_device_wait(start).await {
-            Ok(token) => match store_key(proxy, target, &name, token, true).await {
+            Ok(token) => match store_key(proxy, target, &name, token, true, None).await {
                 Ok(v) => crate::connectors::DeviceState::Done(
                     v.get("detail").and_then(|d| d.as_str()).unwrap_or("connected").to_string(),
                 ),
@@ -2013,6 +2068,10 @@ async fn route(
         ("POST", "/api/connect/device") => handle_device_start(proxy, &req.body).await,
         ("POST", "/api/open") => handle_open(&req.body).await,
         ("GET", "/api/browsers") => handle_browsers().await,
+        ("GET", "/api/token-alerts") => {
+            let alerts = tokio::task::spawn_blocking(crate::token_watch::alerts).await.unwrap_or_default();
+            json_ok(json!({ "alerts": alerts.iter().map(|a| a.to_json()).collect::<Vec<_>>() }))
+        }
         ("GET", "/api/tenants") => handle_get_tenants(proxy).await,
         ("POST", "/api/tenants") => handle_add_tenant(proxy, &req.body).await,
         ("GET", "/login") => {
@@ -2193,6 +2252,7 @@ fn open_login_page() {
 
 /// Start full server: dashboard + SSE transport. For `McpHub serve` and default mode.
 pub async fn start_server(proxy: Arc<ProxyServer>) {
+    tokio::spawn(crate::token_watch::run_loop());
     start_http(Some(proxy), Some(Arc::new(SseManager::new())), false).await;
 }
 

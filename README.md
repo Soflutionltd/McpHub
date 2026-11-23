@@ -459,6 +459,13 @@ On the dashboard, every server card (and every client account) shows what is mis
 - **Sign in with GitHub** (device code: no token to copy) appears once a GitHub App client ID is set in `settings.githubClientId` (public value, no secret).
 - For a client account, choose the client's browser profile on their card: consent and token pages open in that profile. A client on another computer approves from the link you send; their browser then shows a connection error whose address you paste back to finish.
 
+### Token expiry: you and your agents are told in time
+
+McpHub keeps, for every token of your account and of each client account, its expiry date (reported by Cloudflare and GitHub, or typed when you save it) in `token-meta.json`, never the value. The daemon re-checks each token with its service every 12 hours, so a revoked token is caught even without a date.
+
+- 14 days, 3 days before, then on the day: a macOS notification and a banner on the dashboard, with a Renew button.
+- Agents read it in the MCP response: when a call fails because a token expired or was refused, the answer names the token, the account (yours or the client's) and where to renew it, instead of an opaque 401. When a token expires soon, the first answer of the day from that server says so.
+
 ---
 
 ## 📊 Dashboard
