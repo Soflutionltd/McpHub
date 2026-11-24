@@ -5,7 +5,7 @@
 /// requêtes HTTP en parallèle, un processus local multiplexe les siennes par identifiant
 /// JSON-RPC (une tâche lectrice par processus, écritures sur stdin sérialisées par un verrou
 /// tenu le temps d'une ligne).
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -605,6 +605,29 @@ pub struct ChildManager {
     /// Augmente à chaque serveur perdu, relancé ou arrêté : les réponses mises en cache avant
     /// ne sont plus servies (l'état du serveur a pu changer).
     epoch: AtomicU64,
+    /// Serveurs préchauffés, épargnés par l'arrêt d'inactivité (voir `set_keep_warm`).
+    keep_warm: std::sync::RwLock<HashSet<String>>,
+}
+
+/// Erreur de démarrage qui ne disparaît pas en réessayant : authentification refusée ou à
+/// refaire, programme introuvable ou non exécutable. Tout le reste (connexion coupée, délai
+/// dépassé, serveur occupé) peut passer au second essai et reste réessayé.
+pub fn is_permanent_start_error(error: &str) -> bool {
+    let e = error.to_lowercase();
+    const AUTH: [&str; 9] = [
+        "authentification refusee",
+        "jeton refuse",
+        "invalid_grant",
+        "invalid_client",
+        "connexion requise",
+        "not authenticated",
+        "unauthorized",
+        "(401)",
+        "(403)",
+    ];
+    AUTH.iter().any(|needle| e.contains(needle))
+        || (e.contains("failed to spawn")
+            && (e.contains("os error 2") || e.contains("os error 13")))
 }
 
 impl ChildManager {
@@ -620,6 +643,7 @@ impl ChildManager {
             idle_timeout_ms,
             request_timeout_secs: request_timeout_secs.max(1),
             epoch: AtomicU64::new(0),
+            keep_warm: std::sync::RwLock::new(HashSet::new()),
         }
     }
 
@@ -802,6 +826,17 @@ impl ChildManager {
                 }
                 Err(e) => {
                     last_error = e;
+                    // Un refus d'authentification ou un programme introuvable ne se repare pas en
+                    // reessayant : l'agent a la reponse tout de suite au lieu d'attendre 3,5 s.
+                    if is_permanent_start_error(&last_error) {
+                        eprintln!(
+                            "[McpHub][WARN] {} failed: {} (not retried: needs a fix, not time)",
+                            name, last_error
+                        );
+                        let error = format!("{} (not retried)", last_error);
+                        *last_failure = Some((Instant::now(), error.clone()));
+                        return Err(error);
+                    }
                     if attempt < MAX_RETRIES - 1 {
                         eprintln!(
                             "[McpHub][WARN] {} failed: {} — retrying...",
@@ -1058,12 +1093,22 @@ impl ChildManager {
         results
     }
 
+    /// Serveurs à ne jamais arrêter pour inactivité : ceux que l'utilisateur a demandé de
+    /// préchauffer. Les arrêter après une pause les ferait redémarrer à froid à l'appel suivant.
+    pub fn set_keep_warm(&self, names: impl IntoIterator<Item = String>) {
+        *self.keep_warm.write().unwrap_or_else(|e| e.into_inner()) = names.into_iter().collect();
+    }
+
+    fn kept_warm(&self, name: &str) -> bool {
+        self.keep_warm.read().unwrap_or_else(|e| e.into_inner()).contains(name)
+    }
+
     /// Arrête les serveurs inactifs. Un serveur occupé (appel plus long que le délai
-    /// d'inactivité) n'est jamais considéré comme inactif.
+    /// d'inactivité) n'est jamais considéré comme inactif, un serveur gardé au chaud non plus.
     pub async fn reap_idle(&self) {
         let timeout = Duration::from_millis(self.idle_timeout_ms);
         for (name, pool) in self.snapshot().await {
-            if pool.idle_for() <= timeout || pool.busy() {
+            if pool.idle_for() <= timeout || pool.busy() || self.kept_warm(&name) {
                 continue;
             }
             if self.remove_if_same(&name, &pool).await {
@@ -1594,6 +1639,67 @@ done
             .unwrap();
         assert_eq!(ok["content"][0]["text"], "x");
         assert_eq!(lines(&dir.join("mutations")).len(), 1);
+        manager.stop_all().await;
+    }
+
+    #[test]
+    fn erreurs_definitives_reconnues() {
+        for e in [
+            "aqara : authentification refusee (401). Verifier le jeton dans headers.",
+            r#"jeton refuse (400 Bad Request) : {"error":"invalid_grant","error_description":"refresh token expired"}"#,
+            "docix : connexion requise. Lancer : McpHub oauth login docix",
+            r#"MCP error: {"code":-32001,"message":"Not authenticated - your API key is missing"}"#,
+            "Failed to spawn desktop-commander: No such file or directory (os error 2)",
+            "Failed to spawn outil: Permission denied (os error 13)",
+        ] {
+            assert!(is_permanent_start_error(e), "{}", e);
+        }
+        for e in [
+            "Server closed connection",
+            "Timeout: server did not respond within 30s",
+            "Failed to spawn outil: Resource temporarily unavailable (os error 35)",
+            "HTTP 503 Service Unavailable",
+            "connection reset by peer",
+        ] {
+            assert!(!is_permanent_start_error(e), "{}", e);
+        }
+    }
+
+    #[tokio::test]
+    async fn programme_introuvable_pas_reessaye() {
+        let dir = fake_dir("absent");
+        let mut config = fake_config(&dir, &[], 10);
+        config.command = "/nonexistent/mcphub-test-binary".into();
+        let mut configs = HashMap::new();
+        configs.insert("absent".to_string(), config);
+        let manager = ChildManager::new(configs, 300_000, 10);
+        let began = Instant::now();
+        let error = manager.start_server("absent").await.unwrap_err();
+        // Trois essais auraient attendu 500 + 1000 + 2000 ms.
+        assert!(began.elapsed() < Duration::from_millis(400), "{:?}", began.elapsed());
+        assert!(error.contains("not retried"), "{}", error);
+    }
+
+    #[tokio::test]
+    async fn serveur_garde_au_chaud_pas_arrete() {
+        let dir_warm = fake_dir("warm");
+        let dir_cold = fake_dir("cold");
+        let mut configs = HashMap::new();
+        configs.insert("warm".to_string(), fake_config(&dir_warm, &[], 10));
+        configs.insert("cold".to_string(), fake_config(&dir_cold, &[], 10));
+        // Délai d'inactivité de 1 ms : tout serveur au repos est arrêtable.
+        let manager = ChildManager::new(configs, 1, 10);
+        manager.set_keep_warm(["warm".to_string()]);
+        manager.start_server("warm").await.unwrap();
+        manager.start_server("cold").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        manager.reap_idle().await;
+        assert!(manager.pool("warm").await.is_some(), "le serveur garde au chaud a ete arrete");
+        assert!(manager.pool("cold").await.is_none(), "le serveur ordinaire devait etre arrete");
+        // Retiré de la liste, il redevient arrêtable.
+        manager.set_keep_warm(Vec::<String>::new());
+        manager.reap_idle().await;
+        assert!(manager.pool("warm").await.is_none());
         manager.stop_all().await;
     }
 

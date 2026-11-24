@@ -50,6 +50,8 @@ pub struct ProxyConfig {
     pub preload: Preload,
     /// Nombre de serveurs préchauffés par `preload: "auto"`.
     pub preload_auto_count: usize,
+    /// Les serveurs préchauffés ne sont jamais arrêtés pour inactivité (`keepPreloadedWarm`).
+    pub keep_preloaded_warm: bool,
     pub media_profile: MediaProfile,
     pub idle_timeout_ms: u64,
     pub preload_delay_ms: u64,
@@ -78,6 +80,7 @@ impl Default for ProxyConfig {
             // part, l'activer par défaut lancerait tous les serveurs à chaque démarrage.
             preload: Preload::None,
             preload_auto_count: 5,
+            keep_preloaded_warm: true,
             media_profile: MediaProfile::Safe,
             idle_timeout_ms: 5 * 60 * 1000,
             preload_delay_ms: 200,
@@ -623,6 +626,9 @@ fn config_from_json(json: &Value, source_path: Option<&Path>) -> Result<ProxyCon
                 }
                 _ => config.preload.clone(),
             };
+        }
+        if let Some(keep) = settings.get("keepPreloadedWarm").and_then(|v| v.as_bool()) {
+            config.keep_preloaded_warm = keep;
         }
         if let Some(count) = settings.get("preloadAutoCount").and_then(|v| v.as_u64()) {
             config.preload_auto_count = count as usize;

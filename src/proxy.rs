@@ -852,10 +852,16 @@ impl ProxyServer {
         }
 
         let preload_delay_ms = config.preload_delay_ms;
+        let keep_preloaded_warm = config.keep_preloaded_warm;
         drop(config);
 
         // 5. Préchauffage en tâche de fond : ni le démarrage ni l'écoute HTTP ne l'attendent.
         let preload_names = self.preload_targets().await;
+        // Préchauffer pour arrêter trente minutes plus tard ne sert qu'au premier appel : ces
+        // serveurs restent en vie, sauf réglage contraire.
+        if keep_preloaded_warm {
+            self.child_manager.set_keep_warm(preload_names.iter().cloned());
+        }
         if !preload_names.is_empty() {
             tokio::spawn(preload_servers(
                 self.child_manager.clone(),

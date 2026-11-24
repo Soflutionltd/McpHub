@@ -588,6 +588,8 @@ Everything lives in `~/.McpHub/config.json` and is hot-reloaded while the daemon
 }
 ```
 
+Servers named in `settings.preload` (`"auto"`, `"all"` or a list) are started with the daemon and are not stopped when idle, so their next call never waits for a cold start; set `"keepPreloadedWarm": false` to let `idleTimeout` stop them too. A start that fails for a reason time does not fix (refused or expired sign-in, program not found) is reported at once instead of being tried three times.
+
 ### Per-server options
 
 | Option | Effect |
