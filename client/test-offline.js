@@ -270,6 +270,62 @@ try {
   assert.equal(inside.isError, true);
   assert.match(text(inside), /inside a character/);
 
+  // Terminal noise goes: colour codes, a progress bar redrawn in place, the same line many times.
+  const noisy = [
+    '\u001b[32mPASS\u001b[0m suite one',
+    'downloading 10%\rdownloading 55%\rdownloading 100%',
+    ...Array.from({ length: 7 }, () => 'warning: deprecated call'),
+    'done',
+  ].join('\n');
+  const quiet = await fixed(noisy);
+  assert.equal(text(quiet), 'PASS suite one\ndownloading 100%\nwarning: deprecated call\n[McpHub: the line above came 7 times in a row]\ndone');
+  assert.match(quiet.content[1].text, /Terminal noise removed/);
+  assert.equal(text(await fixed(noisy, { raw: true })), noisy);
+  // An ordinary text, a source file with a few equal lines, Windows line endings: untouched.
+  for (const plain of ['one\ntwo\n\n\nthree', 'if (a) {\n}\n}\n}\n}\nend', 'line one\r\nline two\r\n', 'a,b\n1,2']) {
+    const same = await fixed(plain);
+    assert.equal(text(same), plain);
+    assert.equal(same.content.length, 1, plain);
+  }
+
+  // csv: one header line and one line per row, cells quoted only when needed.
+  const people = [{ id: 1, name: 'Ann, Lee', tags: ['a', 'b'] }, { id: 2, name: 'Bob "B"', city: 'Paris' }];
+  assert.equal(text(await fixed(JSON.stringify(people), { format: 'csv' })), 'id,name,tags,city\n1,"Ann, Lee","[""a"",""b""]",\n2,"Bob ""B""",,Paris');
+  assert.equal(
+    text(await fixed(JSON.stringify({ total: 2, rows: [{ id: 1 }, { id: 2 }] }), { format: 'csv', fields: ['id'] })),
+    '# total: 2\n# rows:\nid\n1\n2'
+  );
+  const notRows = await fixed('{"a":{"b":1}}', { format: 'csv' });
+  assert.equal(text(notRows), '{"a":{"b":1}}');
+  assert.match(notRows.content[1].text, /csv needs a list of rows/);
+
+  // A cut result can be searched instead of read through: the passages that hold the words, with their place.
+  const haystack = `${'filler '.repeat(300)}first needle here ${'filler '.repeat(300)}the needle and the thread together ${'filler '.repeat(300)}`;
+  const cutHay = await fixed(haystack, { max_chars: 1000 });
+  const hayHandle = /"handle":"(r\d+)","query"/.exec(cutHay.content[1].text)?.[1];
+  assert.ok(hayHandle, cutHay.content[1].text);
+  const searchLocal = (args) =>
+    client.callTool({ name: 'mcphub_call', arguments: { server: 'mcphub', tool: 'search_result', arguments: args } });
+  const found = await searchLocal({ handle: hayHandle, query: 'Needle thread', context: 40 });
+  assert.equal(found.content.length, 3);
+  assert.match(found.content[0].text, /^\[chars \d+ to \d+\]\n.*first needle here/s);
+  assert.match(found.content[1].text, /the needle and the thread together/);
+  assert.match(found.content[2].text, /2 of 2 passages shown, 3 matches in \d+ chars\./);
+  assert.ok(found.content.map((item) => item.text).join('').length < 600, 'a search answers in a few hundred chars');
+  // The offset it gives is the one read_result takes.
+  const at = Number(/^\[chars (\d+) to/.exec(found.content[1].text)[1]);
+  assert.equal(text(await readLocal({ handle: hayHandle, offset: at, length: 30 })), haystack.slice(at, at + 30));
+  // The passage holding both words comes first when only one is asked for.
+  const best = await searchLocal({ handle: hayHandle, query: 'needle thread', context: 40, max_matches: 1 });
+  assert.match(best.content[0].text, /thread together/);
+  const none = await searchLocal({ handle: hayHandle, query: 'absent', context: 40 });
+  assert.match(text(none), /No match for "absent"/);
+  const partly = await searchLocal({ handle: hayHandle, query: 'needle absent', context: 40 });
+  assert.match(partly.content.at(-1).text, /Never found: "absent"\./);
+  assert.equal((await searchLocal({ handle: 'r999', query: 'x' })).isError, true);
+  assert.equal((await searchLocal({ handle: hayHandle, query: '  ' })).isError, true);
+  assert.equal((await searchLocal({ handle: hayHandle, query: 'x', context: 5 })).isError, true);
+
   // A large list answered without fields or max_rows reminds the agent of them; a shaped one does not.
   const manyRows = JSON.stringify({ rows: Array.from({ length: 200 }, (_, id) => ({ id, label: 'x'.repeat(40) })) });
   const hinted = await fixed(manyRows);

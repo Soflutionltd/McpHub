@@ -333,9 +333,9 @@ const shapingFields = {
     .optional()
     .describe('Cut the result text beyond this size; the rest stays readable by handle.'),
   format: z
-    .enum(['json', 'toon'])
+    .enum(['json', 'toon', 'csv'])
     .optional()
-    .describe('toon writes a JSON result as TOON: each list of rows as one header line plus one line per row.'),
+    .describe('toon writes a JSON result as TOON: each list of rows as one header line plus one line per row. csv is the most compact for a plain list of rows: one header line, one line per row.'),
   raw: z
     .boolean()
     .optional()
@@ -486,6 +486,20 @@ function shapeText(text, shaping, notes, server) {
     if (shaping.format === 'toon') {
       shaped = encodeToon(json);
       json = undefined;
+    } else if (shaping.format === 'csv') {
+      const csv = encodeCsv(json);
+      if (csv === undefined) {
+        notes.push('csv needs a list of rows (or an object holding one): sent as JSON.');
+      } else {
+        shaped = csv;
+        json = undefined;
+      }
+    }
+  } else {
+    const quiet = removeTerminalNoise(text);
+    if (quiet.length < text.length) {
+      notes.push(`Terminal noise removed (${text.length - quiet.length} chars: colour codes, progress redraws, repeated lines). raw: true gives the original.`);
+      shaped = quiet;
     }
   }
   const limit = shaping.max_chars ?? defaultResultMaxChars;
@@ -494,9 +508,85 @@ function shapeText(text, shaping, notes, server) {
   const handle = storeFullResult(shaped, server);
   const head = sliceText(shaped, 0, limit);
   notes.push(
-    `Result cut at ${head.length} of ${shaped.length} chars. Read the rest with mcphub_call server "mcphub", tool "read_result", arguments {"handle":"${handle}","offset":${head.length}}.`
+    `Result cut at ${head.length} of ${shaped.length} chars. To find something in the rest without reading it all: mcphub_call server "mcphub", tool "search_result", arguments {"handle":"${handle}","query":"words to find"}. To read on: tool "read_result", arguments {"handle":"${handle}","offset":${head.length}}.`
   );
   return { text: head, json: undefined };
+}
+
+// ---------------------------------------------------------------------------
+// CSV : pour une liste de lignes, une ligne d'en-tête puis une ligne par
+// enregistrement. Accepte un tableau de lignes, ou un objet qui en contient un
+// seul (ses autres champs passent en tête, un par ligne "# clé: valeur").
+// ---------------------------------------------------------------------------
+
+function csvCell(value) {
+  if (value === undefined || value === null) return '';
+  const text = typeof value === 'object' ? JSON.stringify(value) : String(value);
+  return /[",\n\r]/.test(text) || text !== text.trim() ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function encodeCsv(json) {
+  let rows = json;
+  const head = [];
+  if (!Array.isArray(json)) {
+    if (!isRow(json)) return undefined;
+    const lists = Object.entries(json).filter(([, value]) => Array.isArray(value) && value.some(isRow));
+    if (lists.length !== 1) return undefined;
+    rows = lists[0][1];
+    for (const [key, value] of Object.entries(json)) {
+      if (key !== lists[0][0]) head.push(`# ${key}: ${typeof value === 'object' ? JSON.stringify(value) : value}`);
+    }
+    head.push(`# ${lists[0][0]}:`);
+  }
+  if (!rows.length || !rows.every(isRow)) return undefined;
+  const columns = [];
+  const known = new Set();
+  for (const row of rows) {
+    for (const key of Object.keys(row)) {
+      if (!known.has(key)) {
+        known.add(key);
+        columns.push(key);
+      }
+    }
+  }
+  return [...head, columns.map(csvCell).join(','), ...rows.map((row) => columns.map((key) => csvCell(row[key])).join(','))].join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Bruit de terminal : ce qu'un écran efface et qu'un journal garde. Codes de
+// couleur, barres de progression redessinées sur place (retour chariot), et
+// la même ligne répétée cinq fois ou plus. Rien d'autre n'est touché : un
+// fichier source ou un texte ordinaire ressort identique.
+// ---------------------------------------------------------------------------
+
+const ansiSequence = /\u001b\[[0-9;?]*[ -/]*[@-~]|\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g;
+const repeatedLineMin = 5;
+
+function removeTerminalNoise(text) {
+  if (!/[\u001b\r]/.test(text) && !/\n/.test(text)) return text;
+  const out = [];
+  let run = 0;
+  const flush = () => {
+    if (run >= repeatedLineMin) {
+      out.length -= run - 1;
+      out.push(`[McpHub: the line above came ${run} times in a row]`);
+    }
+    run = 0;
+  };
+  for (const rawLine of text.replace(ansiSequence, '').split('\n')) {
+    // Une barre de progression réécrit sa ligne : seul le dernier état compte.
+    // Une fin de ligne Windows (un seul retour chariot final) n'en est pas une : elle reste.
+    const body = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+    const line = body.includes('\r') ? body.split('\r').pop() : rawLine;
+    if (run > 0 && line === out[out.length - 1] && line.trim() !== '') run += 1;
+    else {
+      flush();
+      run = 1;
+    }
+    out.push(line);
+  }
+  flush();
+  return out.join('\n');
 }
 
 // Renvoie le résultat allégé et, pour mcphub_batch, la valeur à insérer telle
@@ -554,6 +644,63 @@ function readStoredResult({ handle, offset = 0, length }, workingDirectory) {
       }
     ]
   };
+}
+
+// Cherche dans un résultat gardé sans le relire en entier : les passages où les mots de la
+// requête apparaissent, les plus complets d'abord, chacun avec sa position pour read_result.
+function searchStoredResult({ handle, query, context = 200, max_matches = 8 }, workingDirectory) {
+  const stored = typeof handle === 'string' ? storedResults.get(handle) : undefined;
+  const full = stored && ownerAllows(stored.server, workingDirectory) ? stored.text : undefined;
+  if (full === undefined) {
+    return textResult(
+      `Unknown result handle "${handle}": handles live in this McpHub client process and only the last ${storedResultLimit} cut results are kept. Call the tool again.`,
+      true
+    );
+  }
+  const terms = typeof query === 'string' ? [...new Set(query.toLowerCase().split(/\s+/).filter(Boolean))].slice(0, 12) : [];
+  if (!terms.length) return textResult('query must be one or more words to find.', true);
+  if (!Number.isInteger(context) || context < 20 || context > 2000) return textResult('context must be an integer between 20 and 2000.', true);
+  if (!Number.isInteger(max_matches) || max_matches < 1 || max_matches > 50) return textResult('max_matches must be an integer between 1 and 50.', true);
+
+  const lower = full.toLowerCase();
+  const hits = [];
+  const hitLimit = 20_000;
+  terms.forEach((term, index) => {
+    for (let at = lower.indexOf(term); at !== -1 && hits.length < hitLimit; at = lower.indexOf(term, at + term.length)) {
+      hits.push({ at, end: at + term.length, index });
+    }
+  });
+  if (!hits.length) {
+    return textResult(`[McpHub] No match for ${terms.map((term) => JSON.stringify(term)).join(', ')} in the ${full.length} chars of ${handle}.`);
+  }
+  hits.sort((a, b) => a.at - b.at);
+  // Les occurrences proches forment un passage ; un passage qui réunit plus de mots passe devant.
+  const passages = [];
+  for (const hit of hits) {
+    const last = passages[passages.length - 1];
+    if (last && hit.at - last.end <= context && hit.end - last.start <= context * 6) {
+      last.end = Math.max(last.end, hit.end);
+      last.terms.add(hit.index);
+      last.count += 1;
+    } else passages.push({ start: hit.at, end: hit.end, terms: new Set([hit.index]), count: 1 });
+  }
+  const kept = [...passages]
+    .sort((a, b) => b.terms.size - a.terms.size || a.start - b.start)
+    .slice(0, max_matches)
+    .sort((a, b) => a.start - b.start);
+  const content = kept.map((passage) => {
+    const from = Math.max(0, passage.start - context);
+    const excerpt = sliceText(full, from, passage.end - from + context);
+    return { type: 'text', text: `[chars ${from} to ${from + excerpt.length}]\n${excerpt}` };
+  });
+  const missing = terms.filter((_, index) => !hits.some((hit) => hit.index === index));
+  content.push({
+    type: 'text',
+    text: `[McpHub] ${kept.length} of ${passages.length} passages shown, ${hits.length}${hits.length >= hitLimit ? '+' : ''} matches in ${full.length} chars.` +
+      (missing.length ? ` Never found: ${missing.map((term) => JSON.stringify(term)).join(', ')}.` : '') +
+      ' Read around one with read_result and its offset.'
+  });
+  return { content };
 }
 
 // ---------------------------------------------------------------------------
@@ -1449,6 +1596,7 @@ registerHubTool(
   }) => {
     try {
       if (childServer === hubLocalServer && tool === 'read_result') return readStoredResult(args, working_dir);
+      if (childServer === hubLocalServer && tool === 'search_result') return searchStoredResult(args, working_dir);
       const [projectName, projectConfig] = resolveProject(project, working_dir);
       const securedArgs = enforceProjectPolicy({
         projectName,
