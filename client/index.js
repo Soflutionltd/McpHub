@@ -495,10 +495,16 @@ function shapeText(text, shaping, notes, server) {
         json = undefined;
       }
     }
+  } else if (/^\s*[{[]/.test(text)) {
+    // Du JSON que McpHub ne réécrit pas (nombre de 16 chiffres ou plus, texte coupé ou invalide) :
+    // il ressort tel quel, donc sans nettoyage non plus.
+    if (shaping.format && shaping.format !== 'json') {
+      notes.push(`format ${shaping.format} not applied: this JSON holds a number too large to rewrite safely, or is not complete.`);
+    }
   } else {
     const quiet = removeTerminalNoise(text);
     if (quiet.length < text.length) {
-      notes.push(`Terminal noise removed (${text.length - quiet.length} chars: colour codes, progress redraws, repeated lines). raw: true gives the original.`);
+      notes.push(`Terminal noise removed (${text.length - quiet.length} chars: colour codes, progress redraws, long lines repeated in a row). raw: true gives the original.`);
       shaped = quiet;
     }
   }
@@ -534,7 +540,8 @@ function encodeCsv(json) {
     if (lists.length !== 1) return undefined;
     rows = lists[0][1];
     for (const [key, value] of Object.entries(json)) {
-      if (key !== lists[0][0]) head.push(`# ${key}: ${typeof value === 'object' ? JSON.stringify(value) : value}`);
+      // Une valeur sur plusieurs lignes passerait pour des lignes de données : elle est écrite en JSON.
+      if (key !== lists[0][0]) head.push(`# ${key}: ${typeof value === 'object' || /[\n\r]/.test(String(value)) ? JSON.stringify(value) : value}`);
     }
     head.push(`# ${lists[0][0]}:`);
   }
@@ -549,18 +556,21 @@ function encodeCsv(json) {
       }
     }
   }
+  if (!columns.length) return undefined;
   return [...head, columns.map(csvCell).join(','), ...rows.map((row) => columns.map((key) => csvCell(row[key])).join(','))].join('\n');
 }
 
 // ---------------------------------------------------------------------------
 // Bruit de terminal : ce qu'un écran efface et qu'un journal garde. Codes de
 // couleur, barres de progression redessinées sur place (retour chariot), et
-// la même ligne répétée cinq fois ou plus. Rien d'autre n'est touché : un
-// fichier source ou un texte ordinaire ressort identique.
+// la même longue ligne répétée cinq fois ou plus. Une ligne courte répétée
+// ("0", "}", "---") est une donnée, pas du bruit : elle reste. Rien d'autre
+// n'est touché : un fichier source ou un texte ordinaire ressort identique.
 // ---------------------------------------------------------------------------
 
 const ansiSequence = /\u001b\[[0-9;?]*[ -/]*[@-~]|\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g;
 const repeatedLineMin = 5;
+const repeatedLineMinChars = 20;
 
 function removeTerminalNoise(text) {
   if (!/[\u001b\r]/.test(text) && !/\n/.test(text)) return text;
@@ -576,9 +586,9 @@ function removeTerminalNoise(text) {
   for (const rawLine of text.replace(ansiSequence, '').split('\n')) {
     // Une barre de progression réécrit sa ligne : seul le dernier état compte.
     // Une fin de ligne Windows (un seul retour chariot final) n'en est pas une : elle reste.
-    const body = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+    const body = rawLine.replace(/\r+$/, '');
     const line = body.includes('\r') ? body.split('\r').pop() : rawLine;
-    if (run > 0 && line === out[out.length - 1] && line.trim() !== '') run += 1;
+    if (run > 0 && line === out[out.length - 1] && line.trim().length >= repeatedLineMinChars) run += 1;
     else {
       flush();
       run = 1;
@@ -662,12 +672,23 @@ function searchStoredResult({ handle, query, context = 200, max_matches = 8 }, w
   if (!Number.isInteger(context) || context < 20 || context > 2000) return textResult('context must be an integer between 20 and 2000.', true);
   if (!Number.isInteger(max_matches) || max_matches < 1 || max_matches > 50) return textResult('max_matches must be an integer between 1 and 50.', true);
 
-  const lower = full.toLowerCase();
+  // Recherche sans tenir compte de la casse directement dans le texte : passer le texte en
+  // minuscules changerait sa longueur pour certaines lettres et fausserait toutes les positions.
+  // Chaque mot a son propre plafond : un mot très fréquent ne cache pas les autres.
   const hits = [];
-  const hitLimit = 20_000;
+  const hitLimitPerTerm = 5_000;
+  let capped = false;
+  const found = terms.map(() => false);
   terms.forEach((term, index) => {
-    for (let at = lower.indexOf(term); at !== -1 && hits.length < hitLimit; at = lower.indexOf(term, at + term.length)) {
-      hits.push({ at, end: at + term.length, index });
+    const pattern = new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+    let count = 0;
+    for (let match = pattern.exec(full); match; match = pattern.exec(full)) {
+      found[index] = true;
+      if (++count > hitLimitPerTerm) {
+        capped = true;
+        break;
+      }
+      hits.push({ at: match.index, end: match.index + match[0].length, index });
     }
   });
   if (!hits.length) {
@@ -684,19 +705,34 @@ function searchStoredResult({ handle, query, context = 200, max_matches = 8 }, w
       last.count += 1;
     } else passages.push({ start: hit.at, end: hit.end, terms: new Set([hit.index]), count: 1 });
   }
-  const kept = [...passages]
-    .sort((a, b) => b.terms.size - a.terms.size || a.start - b.start)
-    .slice(0, max_matches)
-    .sort((a, b) => a.start - b.start);
-  const content = kept.map((passage) => {
-    const from = Math.max(0, passage.start - context);
+  // Un mot rare pèse plus qu'un mot présent partout : le passage qui tient « error » passe
+  // devant les milliers de passages qui ne tiennent que « the ».
+  const frequency = terms.map((_, index) => hits.reduce((count, hit) => count + (hit.index === index ? 1 : 0), 0));
+  const weight = (passage) => [...passage.terms].reduce((sum, index) => sum + 1 / frequency[index], 0);
+  const ranked = [...passages]
+    .map((passage) => ({ ...passage, weight: weight(passage) }))
+    .sort((a, b) => b.terms.size - a.terms.size || b.weight - a.weight || a.start - b.start)
+    .slice(0, max_matches);
+  // La réponse reste petite : les meilleurs passages d'abord, jusqu'au budget ; les autres sont
+  // seulement comptés. Ils sont ensuite rendus dans l'ordre du texte.
+  const budget = 20_000;
+  const chosen = [];
+  let used = 0;
+  for (const passage of ranked) {
+    let from = Math.max(0, passage.start - context);
+    if (from > 0 && isLowSurrogate(full.charCodeAt(from)) && isHighSurrogate(full.charCodeAt(from - 1))) from -= 1;
     const excerpt = sliceText(full, from, passage.end - from + context);
-    return { type: 'text', text: `[chars ${from} to ${from + excerpt.length}]\n${excerpt}` };
-  });
-  const missing = terms.filter((_, index) => !hits.some((hit) => hit.index === index));
+    if (chosen.length && used + excerpt.length > budget) continue;
+    used += excerpt.length;
+    chosen.push({ from, excerpt });
+  }
+  const content = chosen
+    .sort((a, b) => a.from - b.from)
+    .map(({ from, excerpt }) => ({ type: 'text', text: `[chars ${from} to ${from + excerpt.length}]\n${excerpt}` }));
+  const missing = terms.filter((_, index) => !found[index]);
   content.push({
     type: 'text',
-    text: `[McpHub] ${kept.length} of ${passages.length} passages shown, ${hits.length}${hits.length >= hitLimit ? '+' : ''} matches in ${full.length} chars.` +
+    text: `[McpHub] ${content.length} of ${passages.length} passages shown, ${hits.length}${capped ? '+' : ''} matches in ${full.length} chars.` +
       (missing.length ? ` Never found: ${missing.map((term) => JSON.stringify(term)).join(', ')}.` : '') +
       ' Read around one with read_result and its offset.'
   });

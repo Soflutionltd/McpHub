@@ -288,6 +288,19 @@ try {
     assert.equal(same.content.length, 1, plain);
   }
 
+  // Short lines repeated in a row are data, not noise; an odd line ending loses nothing.
+  for (const data of ['0\n0\n0\n0\n0\n0', 'a\n}\n}\n}\n}\n}\n}', '---\n---\n---\n---\n---', 'x\r\r\ny']) {
+    const same = await fixed(data);
+    assert.equal(text(same), data);
+    assert.equal(same.content.length, 1, JSON.stringify(data));
+  }
+  // JSON that McpHub does not rewrite (a 16-digit number) is not cleaned either, and says why a format was skipped.
+  const bigNumber = `[\n{"id":12345678901234567},\n${Array.from({ length: 6 }, () => '{"status":"pending","count":0},').join('\n')}\n{"id":2}\n]`;
+  assert.equal(text(await fixed(bigNumber)), bigNumber);
+  const skipped = await fixed(bigNumber, { format: 'csv' });
+  assert.equal(text(skipped), bigNumber);
+  assert.match(skipped.content[1].text, /format csv not applied/);
+
   // csv: one header line and one line per row, cells quoted only when needed.
   const people = [{ id: 1, name: 'Ann, Lee', tags: ['a', 'b'] }, { id: 2, name: 'Bob "B"', city: 'Paris' }];
   assert.equal(text(await fixed(JSON.stringify(people), { format: 'csv' })), 'id,name,tags,city\n1,"Ann, Lee","[""a"",""b""]",\n2,"Bob ""B""",,Paris');
@@ -295,6 +308,11 @@ try {
     text(await fixed(JSON.stringify({ total: 2, rows: [{ id: 1 }, { id: 2 }] }), { format: 'csv', fields: ['id'] })),
     '# total: 2\n# rows:\nid\n1\n2'
   );
+  assert.equal(
+    text(await fixed(JSON.stringify({ note: 'two\nlines', rows: [{ id: 1 }] }), { format: 'csv' })),
+    '# note: "two\\nlines"\n# rows:\nid\n1'
+  );
+  assert.match((await fixed('[{},{}]', { format: 'csv' })).content[1].text, /csv needs a list of rows/);
   const notRows = await fixed('{"a":{"b":1}}', { format: 'csv' });
   assert.equal(text(notRows), '{"a":{"b":1}}');
   assert.match(notRows.content[1].text, /csv needs a list of rows/);
@@ -322,6 +340,25 @@ try {
   assert.match(text(none), /No match for "absent"/);
   const partly = await searchLocal({ handle: hayHandle, query: 'needle absent', context: 40 });
   assert.match(partly.content.at(-1).text, /Never found: "absent"\./);
+  // Letters whose lower case is longer, and characters made of two units: the places given stay right.
+  const tricky = `${'İ'.repeat(40)} ${'😀'.repeat(60)}needle ${'z'.repeat(1200)}`;
+  const trickyCut = await fixed(tricky, { max_chars: 1000 });
+  const trickyHandle = /"handle":"(r\d+)","query"/.exec(trickyCut.content[1].text)?.[1];
+  const inTricky = await searchLocal({ handle: trickyHandle, query: 'NEEDLE', context: 21 });
+  const trickyFrom = Number(/^\[chars (\d+) to/.exec(inTricky.content[0].text)[1]);
+  assert.match(inTricky.content[0].text, /needle/);
+  const reread = await readLocal({ handle: trickyHandle, offset: trickyFrom, length: 60 });
+  assert.notEqual(reread.isError, true, text(reread));
+  assert.ok(text(reread).includes('needle'));
+  // A very common word does not hide a rare one, and the answer stays small whatever is asked.
+  const log = `${'the quick line\n'.repeat(9000)}one error at the end\n`;
+  const logCut = await fixed(log, { max_chars: 1000 });
+  const logHandle = /"handle":"(r\d+)","query"/.exec(logCut.content[1].text)?.[1];
+  const rare = await searchLocal({ handle: logHandle, query: 'the error', context: 2000, max_matches: 50 });
+  assert.doesNotMatch(rare.content.at(-1).text, /Never found/);
+  assert.match(rare.content.at(-1).text, /5001\+ matches|\d+\+ matches/);
+  assert.ok(rare.content.some((item) => item.text.includes('one error at the end')), 'the passage with both words is shown');
+  assert.ok(rare.content.map((item) => item.text).join('').length < 40_000, 'bounded answer');
   assert.equal((await searchLocal({ handle: 'r999', query: 'x' })).isError, true);
   assert.equal((await searchLocal({ handle: hayHandle, query: '  ' })).isError, true);
   assert.equal((await searchLocal({ handle: hayHandle, query: 'x', context: 5 })).isError, true);

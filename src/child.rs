@@ -614,20 +614,23 @@ pub struct ChildManager {
 /// dépassé, serveur occupé) peut passer au second essai et reste réessayé.
 pub fn is_permanent_start_error(error: &str) -> bool {
     let e = error.to_lowercase();
-    const AUTH: [&str; 9] = [
-        "authentification refusee",
-        "jeton refuse",
+    // « jeton refuse (503 ...) » ou (429) est un incident du serveur d'autorisation, passager :
+    // seuls les refus du jeton lui-même (400, 401, invalid_grant) sont définitifs.
+    const AUTH: [&str; 8] = [
+        "authentification refusee (401)",
+        "jeton refuse (400",
+        "jeton refuse (401",
         "invalid_grant",
         "invalid_client",
         "connexion requise",
         "not authenticated",
-        "unauthorized",
-        "(401)",
-        "(403)",
+        "api key is missing",
     ];
     AUTH.iter().any(|needle| e.contains(needle))
+        // Avec la parenthèse : « os error 2 » est aussi le début de 23, 24 (trop de fichiers
+        // ouverts) et 28 (disque plein), qui passent d'eux-mêmes.
         || (e.contains("failed to spawn")
-            && (e.contains("os error 2") || e.contains("os error 13")))
+            && (e.contains("(os error 2)") || e.contains("(os error 13)")))
 }
 
 impl ChildManager {
@@ -1097,6 +1100,11 @@ impl ChildManager {
     /// préchauffer. Les arrêter après une pause les ferait redémarrer à froid à l'appel suivant.
     pub fn set_keep_warm(&self, names: impl IntoIterator<Item = String>) {
         *self.keep_warm.write().unwrap_or_else(|e| e.into_inner()) = names.into_iter().collect();
+    }
+
+    /// Après un rechargement de configuration : oublie les serveurs qui n'existent plus.
+    pub fn retain_keep_warm(&self, keep: impl Fn(&str) -> bool) {
+        self.keep_warm.write().unwrap_or_else(|e| e.into_inner()).retain(|name| keep(name));
     }
 
     fn kept_warm(&self, name: &str) -> bool {
@@ -1658,6 +1666,13 @@ done
             "Server closed connection",
             "Timeout: server did not respond within 30s",
             "Failed to spawn outil: Resource temporarily unavailable (os error 35)",
+            "Failed to spawn outil: Too many open files (os error 24)",
+            "Failed to spawn outil: No space left on device (os error 28)",
+            "jeton refuse (503 Service Unavailable) : upstream",
+            "jeton refuse (429 Too Many Requests) : slow down",
+            r#"MCP error: {"code":-32000,"message":"upstream Unauthorized, retry later"}"#,
+            "HTTP 403 Forbidden",
+            "HTTP 401 on a proxy in front (401) of the server",
             "HTTP 503 Service Unavailable",
             "connection reset by peer",
         ] {

@@ -3230,6 +3230,8 @@ async fn apply_config_change(
     }
 
     crate::toolguard::configure(new_config.guard.clone());
+    let keep_preloaded_warm = new_config.keep_preloaded_warm;
+    let new_preload = new_config.preload.clone();
     {
         let mut cfg = config_store.lock().await;
         *cfg = new_config;
@@ -3240,7 +3242,33 @@ async fn apply_config_change(
         engine.lock().await.build_index(all_tools);
     }
 
+    // La liste des serveurs gardés au chaud suit la configuration rechargée. En mode "auto" elle
+    // vient des statistiques d'usage lues au démarrage : on garde ce choix, moins les serveurs
+    // retirés.
+    let warm_names: Option<Vec<String>> = if !keep_preloaded_warm {
+        Some(Vec::new())
+    } else {
+        match new_preload {
+            crate::config::Preload::None => Some(Vec::new()),
+            crate::config::Preload::All => Some(new_servers.keys().cloned().collect()),
+            crate::config::Preload::Some(names) => Some(names),
+            crate::config::Preload::Auto => None,
+        }
+    };
+    let known: std::collections::HashSet<String> = new_servers.keys().cloned().collect();
     child_manager.update_configs(new_servers).await;
+    match warm_names {
+        Some(names) => {
+            let mut resolved = Vec::new();
+            for name in names {
+                if let Some(key) = child_manager.resolve_name(&name).await {
+                    resolved.push(key);
+                }
+            }
+            child_manager.set_keep_warm(resolved);
+        }
+        None => child_manager.retain_keep_warm(|name| known.contains(name)),
+    }
     eprintln!("[McpHub][INFO] Config hot-reloaded");
 
     let delay_ms = {
