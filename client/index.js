@@ -87,8 +87,12 @@ const hookInjectionsPath = process.env.MEMORYPILOT_DB
 // Au-delà, la session a pu être compactée ou reprise ailleurs : recall complet.
 const hookInjectionMaxAgeMs = 10 * 60_000;
 
-const projectsConfig = await readProjects(projectsPath);
-const serverOwners = buildServerOwners(projectsConfig.projects);
+// projects.json est relu dès qu'il change (date et taille) : une règle ajoutée ou
+// corrigée s'applique à l'appel suivant, sans relancer le client.
+let projectsConfig = { projects: {} };
+let serverOwners = new Map();
+let projectsFingerprint;
+await refreshProjects();
 
 /** @type {{ client: Client, transport: 'daemon' | 'stdio' } | undefined} */
 let hubConnection;
@@ -159,6 +163,28 @@ async function readProjects(path) {
     if (error.code === 'ENOENT') return { projects: {} };
     throw new Error(`Invalid McpHub projects file ${path}: ${error.message}`);
   }
+}
+
+async function readProjectsFingerprint() {
+  try {
+    const { mtimeMs, size } = await stat(projectsPath);
+    return `${mtimeMs}:${size}`;
+  } catch (error) {
+    if (error.code === 'ENOENT') return 'absent';
+    throw new Error(`Invalid McpHub projects file ${projectsPath}: ${error.message}`);
+  }
+}
+
+// Un fichier devenu invalide fait échouer chaque appel jusqu'à sa correction :
+// garder l'ancienne politique masquerait l'erreur.
+async function refreshProjects() {
+  const fingerprint = await readProjectsFingerprint();
+  if (fingerprint === projectsFingerprint) return;
+  const config = await readProjects(projectsPath);
+  const owners = buildServerOwners(config.projects);
+  projectsConfig = config;
+  serverOwners = owners;
+  projectsFingerprint = fingerprint;
 }
 
 // Un serveur rattaché à un client (ownedServers) n'appartient qu'à un projet :
@@ -1008,7 +1034,9 @@ function enforceProjectPolicy({ projectName, projectConfig, server, tool, args, 
     securedArgs.project_id !== aliases.supabaseProjectId
   ) {
     throw new Error(
-      `Supabase project mismatch for ${projectName}: expected ${aliases.supabaseProjectId}.`
+      aliases.supabaseProjectId
+        ? `Supabase project mismatch for ${projectName}: expected ${aliases.supabaseProjectId}.`
+        : `No Supabase project is declared for ${projectName}: add aliases.supabaseProjectId to this project in ${projectsPath} (read again on the next call).`
     );
   }
 
@@ -1477,7 +1505,10 @@ const server = new McpServer(
 const hubTools = new Map();
 function registerHubTool(name, config, handler) {
   hubTools.set(name, config);
-  return server.registerTool(name, config, handler);
+  return server.registerTool(name, config, async (...handlerArgs) => {
+    await refreshProjects();
+    return handler(...handlerArgs);
+  });
 }
 
 const projectFields = {

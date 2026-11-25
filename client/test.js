@@ -3,7 +3,7 @@
 // policy under test is a throwaway file, never the user's own projects.json.
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -108,6 +108,38 @@ try {
   });
   assert.equal(guarded.isError, true);
   assert.match(text(guarded), /project mismatch/);
+
+  // projects.json edited while the client runs: the next call applies it.
+  const initialProjects = await readFile(projectsPath, 'utf8');
+  const editedProjects = JSON.parse(initialProjects);
+  delete editedProjects.projects.demo.aliases.supabaseProjectId;
+  await writeFile(projectsPath, JSON.stringify(editedProjects));
+  const undeclared = await client.callTool({
+    name: 'mcphub_call',
+    arguments: {
+      working_dir: demoWorkspace,
+      server: 'supabase',
+      tool: 'get_project',
+      arguments: { id: 'wrong-project', project_id: 'wrong-project' }
+    }
+  });
+  assert.equal(undeclared.isError, true);
+  assert.match(text(undeclared), /No Supabase project is declared for demo/);
+
+  editedProjects.projects.demo.aliases.supabaseProjectId = 'another-project-ref';
+  await writeFile(projectsPath, JSON.stringify(editedProjects));
+  const reloaded = await client.callTool({
+    name: 'mcphub_call',
+    arguments: {
+      working_dir: demoWorkspace,
+      server: 'supabase',
+      tool: 'get_project',
+      arguments: { id: 'wrong-project', project_id: 'wrong-project' }
+    }
+  });
+  assert.equal(reloaded.isError, true);
+  assert.match(text(reloaded), /expected another-project-ref/);
+  await writeFile(projectsPath, initialProjects);
 
   const unknownTool = await client.callTool({
     name: 'mcphub_call',
