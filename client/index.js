@@ -863,9 +863,16 @@ async function resetHubConnection() {
 // échec métier) est une réponse valide : on ne doit ni reconnecter ni rejouer.
 function isTransportFailure(error) {
   if (!(error instanceof McpError)) return true;
+  return error.code === ErrorCode.ConnectionClosed || isLocalTimeout(error);
+}
+
+// Le démon répond aussi -32001 pour ses refus (« Bloque par McpHub », serveur hors
+// profil) : ce sont des réponses, pas des coupures. Seul le délai levé ici par le SDK,
+// reconnaissable aux données qu'il joint, laisse l'issue de l'appel inconnue.
+function isLocalTimeout(error) {
   return (
-    error.code === ErrorCode.ConnectionClosed ||
-    error.code === ErrorCode.RequestTimeout
+    error.code === ErrorCode.RequestTimeout &&
+    (error.data?.timeout !== undefined || error.data?.maxTotalTimeout !== undefined)
   );
 }
 
