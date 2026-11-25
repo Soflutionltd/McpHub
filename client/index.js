@@ -52,8 +52,13 @@ const daemonApiUrl = new URL('/api/servers', daemonBaseUrl);
 const childCallTimeoutMs = Number(process.env.MCPHUB_CALL_TIMEOUT_MS ?? 600_000);
 const daemonProbeTimeoutMs = 1_500;
 // Délai au-delà duquel un appel reçoit une réponse d'attente au lieu de laisser le
-// client MCP le couper, et nombre d'appels gardés en attente de lecture.
+// client MCP le couper, et nombre de résultats terminés gardés en attente de lecture.
 const answerBeforeMs = Number(process.env.MCPHUB_ANSWER_BEFORE_MS ?? 50_000);
+if (!Number.isFinite(answerBeforeMs) || answerBeforeMs < 100) {
+  throw new Error(
+    `Invalid MCPHUB_ANSWER_BEFORE_MS "${process.env.MCPHUB_ANSWER_BEFORE_MS}": expected a number of milliseconds, 100 or more.`
+  );
+}
 const pendingCallLimit = 20;
 const daemonRetryIntervalMs = Number(process.env.MCPHUB_DAEMON_RETRY_MS ?? 60_000);
 const usageFlushDelayMs = 2_000;
@@ -1560,18 +1565,25 @@ function pendingNotice(handle, { name, startedAt }) {
 async function answerInTime(name, work) {
   const startedAt = Date.now();
   // Jamais de rejet non géré quand l'appel se termine après la réponse d'attente.
-  const outcome = Promise.resolve(work).then(
-    (value) => ({ value }),
-    (error) => ({ error })
-  );
-  const settled = await waitFor(outcome, answerBeforeMs);
+  const pending = { name, startedAt, finished: false };
+  pending.outcome = Promise.resolve(work)
+    .then(
+      (value) => ({ value }),
+      (error) => ({ error })
+    )
+    .finally(() => {
+      pending.finished = true;
+    });
+  const settled = await waitFor(pending.outcome, answerBeforeMs);
   if (settled) return deliver(settled);
   pendingCallCount += 1;
   const handle = `c${pendingCallCount}`;
-  const pending = { name, startedAt, outcome };
   pendingCalls.set(handle, pending);
-  while (pendingCalls.size > pendingCallLimit) {
-    pendingCalls.delete(pendingCalls.keys().next().value);
+  // Seuls des résultats terminés et jamais lus sont oubliés : un appel encore en
+  // cours garde sa poignée.
+  for (const [oldHandle, oldCall] of pendingCalls) {
+    if (pendingCalls.size <= pendingCallLimit) break;
+    if (oldCall.finished) pendingCalls.delete(oldHandle);
   }
   return pendingNotice(handle, pending);
 }

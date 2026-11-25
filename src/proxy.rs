@@ -2355,7 +2355,7 @@ impl ProxyServer {
                     policy: "schema".into(),
                     status: "blocked",
                     duration_ms: Some(0),
-                    arguments: Some(arguments.clone()),
+                    arguments: Some(crate::audit::safe_arguments(&arguments)),
                     error: Some(message.clone()),
                     ..Default::default()
                 })
