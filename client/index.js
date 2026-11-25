@@ -16,6 +16,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
 import { encode as encodeToon } from '@toon-format/toon';
 import { z } from 'zod';
+import { resultTokens } from './tokens.js';
 
 // Instance nommée (un McpHub par client) : mêmes règles que le moteur Rust.
 const instanceName = process.env.MCPHUB_INSTANCE || undefined;
@@ -135,6 +136,11 @@ function emptyUsage() {
 
 const countOf = (value) => (Number.isFinite(value) && value > 0 ? value : 0);
 
+/** Les jetons d'un serveur : ceux comptés image comprise, plus octets / 4 pour les appels plus anciens. */
+function approximateTokens(resultBytes, tokens, tokenBytes) {
+  return Math.round(countOf(tokens) + Math.max(0, countOf(resultBytes) - countOf(tokenBytes)) / 4);
+}
+
 /** Gain de la réduction des résultats ; vide tant qu'aucune taille brute n'a été comptée. */
 function shapingSavings(rawBytes, deliveredBytes) {
   if (!countOf(rawBytes)) return {};
@@ -156,6 +162,9 @@ function addUsage(target, added) {
     // Comptés ensemble, appel par appel : le gain ne mélange pas d'anciens appels sans taille brute.
     total.rawBytes = countOf(total.rawBytes) + countOf(entry?.rawBytes);
     total.measuredBytes = countOf(total.measuredBytes) + countOf(entry?.measuredBytes);
+    // Jetons comptés image comprise, et les octets des appels qu'ils couvrent ; les plus anciens restent à octets / 4.
+    total.tokens = countOf(total.tokens) + countOf(entry?.tokens);
+    total.tokenBytes = countOf(total.tokenBytes) + countOf(entry?.tokenBytes);
   }
   return target;
 }
@@ -257,10 +266,19 @@ function markUsageDirty() {
 function recordServerUsage(server, raw, delivered) {
   // Un nom de serveur inconnu (faute de frappe) n'est pas un serveur : rien à attribuer.
   if (raw?.isError && unknownServerPattern.test(extractText(raw))) return;
-  const entry = (usage.byServer[server] ??= { calls: 0, resultBytes: 0, rawBytes: 0, measuredBytes: 0 });
+  const entry = (usage.byServer[server] ??= {
+    calls: 0,
+    resultBytes: 0,
+    rawBytes: 0,
+    measuredBytes: 0,
+    tokens: 0,
+    tokenBytes: 0
+  });
   const deliveredBytes = Buffer.byteLength(JSON.stringify(delivered) ?? '');
   entry.calls += 1;
   entry.resultBytes += deliveredBytes;
+  entry.tokens = countOf(entry.tokens) + resultTokens(delivered);
+  entry.tokenBytes = countOf(entry.tokenBytes) + deliveredBytes;
   entry.rawBytes += Buffer.byteLength(JSON.stringify(raw) ?? '');
   entry.measuredBytes += deliveredBytes;
   markUsageDirty();
@@ -2104,19 +2122,19 @@ registerHubTool(
         },
         perServer: {
           servers: Object.entries(serverUsage)
-            .map(([server, { calls, resultBytes, rawBytes, measuredBytes }]) => ({
+            .map(([server, { calls, resultBytes, rawBytes, measuredBytes, tokens, tokenBytes }]) => ({
               server,
               calls,
               resultBytes,
-              approximateTokens: Math.round(resultBytes / 4),
+              approximateTokens: approximateTokens(resultBytes, tokens, tokenBytes),
               ...shapingSavings(rawBytes, measuredBytes)
             }))
-            .sort((left, right) => right.resultBytes - left.resultBytes),
+            .sort((left, right) => right.approximateTokens - left.approximateTokens),
           shaping: shapingSavings(
             Object.values(serverUsage).reduce((sum, entry) => sum + countOf(entry.rawBytes), 0),
             Object.values(serverUsage).reduce((sum, entry) => sum + countOf(entry.measuredBytes), 0)
           ),
-          note: 'Result bytes delivered to the agent by mcphub_call and mcphub_batch, after shaping, counted since this field was added. rawBytes is what the child server returned before shaping, counted since it was added (calls recorded earlier have no raw size and are left out of the savings). Calls made inside mcphub_run scripts are not attributed to a server. Bytes divided by four.'
+          note: 'Result bytes delivered to the agent by mcphub_call and mcphub_batch, after shaping, counted since this field was added. rawBytes is what the child server returned before shaping, counted since it was added (calls recorded earlier have no raw size and are left out of the savings). Calls made inside mcphub_run scripts are not attributed to a server. approximateTokens counts text at four bytes a token and each image by its pixels, as Claude bills it (ceil(width/28) x ceil(height/28), after downscaling to 2576 px and 4784 tokens); calls recorded before images were counted that way stay at bytes divided by four.'
         },
         actualUsage: totalUsage
       });

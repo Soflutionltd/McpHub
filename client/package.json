@@ -8,6 +8,7 @@
     "check": "node --check index.js",
     "test": "node test.js",
     "test:offline": "node test-offline.js",
+    "test:tokens": "node test-tokens.js",
     "bundle": "esbuild index.js --bundle --platform=node --target=node20 --format=esm --banner:js=\"import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);\" --outfile=dist/mcphub-client.mjs"
   },
   "keywords": [],
