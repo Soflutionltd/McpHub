@@ -137,11 +137,16 @@ fn enc(s: &str) -> String {
 // ─── Lecture du registre ─────────────────────────────────────
 
 fn meta<'a>(entry: &'a Value, key: &str) -> Option<&'a Value> {
-    entry.get("_meta").and_then(|m| m.get(OFFICIAL)).and_then(|o| o.get(key))
+    entry
+        .get("_meta")
+        .and_then(|m| m.get(OFFICIAL))
+        .and_then(|o| o.get(key))
 }
 
 fn status(entry: &Value) -> &str {
-    meta(entry, "status").and_then(|v| v.as_str()).unwrap_or("active")
+    meta(entry, "status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("active")
 }
 
 fn s<'a>(v: &'a Value, key: &str) -> &'a str {
@@ -208,32 +213,51 @@ pub fn sync_status() -> Value {
 /// Lance la synchronisation en arrière-plan si le catalogue manque ou date de plus d'un jour.
 pub fn ensure_sync() {
     let st = load_state();
-    let complete = st.get("complete").and_then(|v| v.as_bool()).unwrap_or(false);
-    let age = now_secs().saturating_sub(st.get("syncedEpoch").and_then(|v| v.as_u64()).unwrap_or(0));
-    let popular_age = now_secs().saturating_sub(st.get("popularEpoch").and_then(|v| v.as_u64()).unwrap_or(0));
+    let complete = st
+        .get("complete")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let age =
+        now_secs().saturating_sub(st.get("syncedEpoch").and_then(|v| v.as_u64()).unwrap_or(0));
+    let popular_age =
+        now_secs().saturating_sub(st.get("popularEpoch").and_then(|v| v.as_u64()).unwrap_or(0));
     if complete && age < SYNC_EVERY_SECS && popular_age < SYNC_EVERY_SECS {
         return;
     }
     if SYNC_RUNNING
-        .compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
         .is_err()
     {
         return;
     }
     let run = async {
         if let Err(e) = sync_popular().await {
-            eprintln!("[McpHub][LIBRARY] Registre MCP de GitHub indisponible : {}", e);
+            eprintln!(
+                "[McpHub][LIBRARY] Registre MCP de GitHub indisponible : {}",
+                e
+            );
         }
         let res = sync_catalog().await;
         let mut st = load_state();
         match res {
             Ok(n) => {
                 st["error"] = Value::Null;
-                eprintln!("[McpHub][LIBRARY] Catalogue du registre a jour ({} serveurs)", n);
+                eprintln!(
+                    "[McpHub][LIBRARY] Catalogue du registre a jour ({} serveurs)",
+                    n
+                );
             }
             Err(e) => {
                 st["error"] = json!(e);
-                eprintln!("[McpHub][LIBRARY] Synchronisation du catalogue interrompue : {}", e);
+                eprintln!(
+                    "[McpHub][LIBRARY] Synchronisation du catalogue interrompue : {}",
+                    e
+                );
             }
         }
         save_state(&st);
@@ -250,9 +274,14 @@ pub fn ensure_sync() {
 async fn fetch_page(url: &str) -> Result<Value, String> {
     let mut last = String::new();
     for attempt in 0..4u64 {
-        let req = http().get(url).header("Accept", "application/json").timeout(Duration::from_secs(90));
+        let req = http()
+            .get(url)
+            .header("Accept", "application/json")
+            .timeout(Duration::from_secs(90));
         match req.send().await {
-            Ok(r) if r.status().is_success() => return r.json::<Value>().await.map_err(|e| e.to_string()),
+            Ok(r) if r.status().is_success() => {
+                return r.json::<Value>().await.map_err(|e| e.to_string())
+            }
             Ok(r) => last = format!("HTTP {}", r.status().as_u16()),
             Err(e) => last = e.to_string(),
         }
@@ -262,7 +291,9 @@ async fn fetch_page(url: &str) -> Result<Value, String> {
 }
 
 fn entry_name(e: &Value) -> &str {
-    e.pointer("/server/name").and_then(|v| v.as_str()).unwrap_or("")
+    e.pointer("/server/name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
 }
 
 /// Allège une fiche du Registre MCP de GitHub : sans le README (90 % du poids).
@@ -274,7 +305,16 @@ fn slim_github_entry(e: &mut Value) {
         .and_then(|p| p.get_mut("github"))
         .and_then(|g| g.as_object_mut())
     {
-        let keep = ["stargazerCount", "pushedAt", "license", "ownerAvatarUrl", "nameWithOwner", "topics", "isInOrganization", "displayName"];
+        let keep = [
+            "stargazerCount",
+            "pushedAt",
+            "license",
+            "ownerAvatarUrl",
+            "nameWithOwner",
+            "topics",
+            "isInOrganization",
+            "displayName",
+        ];
         g.retain(|k, _| keep.contains(&k.as_str()));
     }
 }
@@ -282,7 +322,8 @@ fn slim_github_entry(e: &mut Value) {
 /// Serveurs populaires du Registre MCP de GitHub (quelques centaines, quelques secondes).
 async fn sync_popular() -> Result<usize, String> {
     let st = load_state();
-    let age = now_secs().saturating_sub(st.get("popularEpoch").and_then(|v| v.as_u64()).unwrap_or(0));
+    let age =
+        now_secs().saturating_sub(st.get("popularEpoch").and_then(|v| v.as_u64()).unwrap_or(0));
     if age < SYNC_EVERY_SECS && popular_path().exists() {
         return Ok(st.get("popularCount").and_then(|v| v.as_u64()).unwrap_or(0) as usize);
     }
@@ -295,7 +336,12 @@ async fn sync_popular() -> Result<usize, String> {
             url.push_str(&format!("&cursor={}", enc(c)));
         }
         let page = fetch_page(&url).await?;
-        for e in page.get("servers").and_then(|v| v.as_array()).into_iter().flatten() {
+        for e in page
+            .get("servers")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
             if status(e) == "deleted" || entry_name(e).is_empty() {
                 continue;
             }
@@ -305,7 +351,10 @@ async fn sync_popular() -> Result<usize, String> {
             out.push('\n');
             n += 1;
         }
-        cursor = page.pointer("/metadata/nextCursor").and_then(|v| v.as_str()).map(String::from);
+        cursor = page
+            .pointer("/metadata/nextCursor")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         if cursor.is_none() {
             break;
         }
@@ -328,7 +377,11 @@ async fn sync_catalog() -> Result<usize, String> {
     let mut st = load_state();
     let started_iso = crate::audit::iso_utc_now();
     let started = now_secs();
-    let complete = st.get("complete").and_then(|v| v.as_bool()).unwrap_or(false) && catalog_path().exists();
+    let complete = st
+        .get("complete")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        && catalog_path().exists();
     SYNC_DONE.store(0, std::sync::atomic::Ordering::SeqCst);
 
     if !complete {
@@ -343,7 +396,9 @@ async fn sync_catalog() -> Result<usize, String> {
             .append(true)
             .open(partial_path())
             .map_err(|e| e.to_string())?;
-        let mut done = std::fs::read_to_string(partial_path()).map(|c| c.lines().count()).unwrap_or(0);
+        let mut done = std::fs::read_to_string(partial_path())
+            .map(|c| c.lines().count())
+            .unwrap_or(0);
         SYNC_DONE.store(done, std::sync::atomic::Ordering::SeqCst);
         loop {
             let mut url = format!("{}?version=latest&limit=100", API);
@@ -352,7 +407,12 @@ async fn sync_catalog() -> Result<usize, String> {
             }
             let page = fetch_page(&url).await?;
             let mut lines = String::new();
-            for e in page.get("servers").and_then(|v| v.as_array()).into_iter().flatten() {
+            for e in page
+                .get("servers")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+            {
                 if status(e) != "deleted" && !entry_name(e).is_empty() {
                     lines.push_str(&e.to_string());
                     lines.push('\n');
@@ -361,7 +421,10 @@ async fn sync_catalog() -> Result<usize, String> {
             }
             out.write_all(lines.as_bytes()).map_err(|e| e.to_string())?;
             SYNC_DONE.store(done, std::sync::atomic::Ordering::SeqCst);
-            cursor = page.pointer("/metadata/nextCursor").and_then(|v| v.as_str()).map(String::from);
+            cursor = page
+                .pointer("/metadata/nextCursor")
+                .and_then(|v| v.as_str())
+                .map(String::from);
             st["cursor"] = cursor.clone().map(Value::String).unwrap_or(Value::Null);
             st["count"] = json!(done);
             save_state(&st);
@@ -375,7 +438,9 @@ async fn sync_catalog() -> Result<usize, String> {
         let mut seen = std::collections::HashSet::new();
         let mut unique: Vec<&str> = Vec::new();
         for line in text.lines().rev() {
-            let name = serde_json::from_str::<Slim>(line).map(|x| x.server.name).unwrap_or_default();
+            let name = serde_json::from_str::<Slim>(line)
+                .map(|x| x.server.name)
+                .unwrap_or_default();
             if !name.is_empty() && seen.insert(name) {
                 unique.push(line);
             }
@@ -387,15 +452,25 @@ async fn sync_catalog() -> Result<usize, String> {
         st["count"] = json!(done);
         // Les fiches modifiées pendant le téléchargement seront reprises à la prochaine mise à jour.
         st["complete"] = json!(true);
-        st["syncedAt"] = st.get("fullStartedAt").cloned().unwrap_or(json!(started_iso));
-        st["syncedEpoch"] = st.get("fullStartedEpoch").cloned().unwrap_or(json!(started));
+        st["syncedAt"] = st
+            .get("fullStartedAt")
+            .cloned()
+            .unwrap_or(json!(started_iso));
+        st["syncedEpoch"] = st
+            .get("fullStartedEpoch")
+            .cloned()
+            .unwrap_or(json!(started));
         st["cursor"] = Value::Null;
         save_state(&st);
         return Ok(done);
     }
 
     // Mise à jour : seulement les fiches publiées ou modifiées depuis la dernière synchronisation.
-    let since = st.get("syncedAt").and_then(|v| v.as_str()).unwrap_or("1970-01-01T00:00:00Z").to_string();
+    let since = st
+        .get("syncedAt")
+        .and_then(|v| v.as_str())
+        .unwrap_or("1970-01-01T00:00:00Z")
+        .to_string();
     let mut changed: HashMap<String, Value> = HashMap::new();
     let mut cursor: Option<String> = None;
     loop {
@@ -404,14 +479,24 @@ async fn sync_catalog() -> Result<usize, String> {
             url.push_str(&format!("&cursor={}", enc(c)));
         }
         let page = fetch_page(&url).await?;
-        for e in page.get("servers").and_then(|v| v.as_array()).into_iter().flatten() {
-            let latest = meta(e, "isLatest").and_then(|v| v.as_bool()).unwrap_or(true);
+        for e in page
+            .get("servers")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let latest = meta(e, "isLatest")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
             if latest || status(e) == "deleted" {
                 changed.insert(entry_name(e).to_string(), e.clone());
             }
         }
         SYNC_DONE.store(changed.len(), std::sync::atomic::Ordering::SeqCst);
-        cursor = page.pointer("/metadata/nextCursor").and_then(|v| v.as_str()).map(String::from);
+        cursor = page
+            .pointer("/metadata/nextCursor")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         if cursor.is_none() {
             break;
         }
@@ -420,7 +505,9 @@ async fn sync_catalog() -> Result<usize, String> {
     let mut out = String::with_capacity(old.len() + changed.len() * 2048);
     let mut count = 0;
     for line in old.lines() {
-        let name = serde_json::from_str::<Slim>(line).map(|x| x.server.name).unwrap_or_default();
+        let name = serde_json::from_str::<Slim>(line)
+            .map(|x| x.server.name)
+            .unwrap_or_default();
         if name.is_empty() || changed.contains_key(&name) {
             continue;
         }
@@ -465,7 +552,10 @@ struct SlimPublisher {
 
 #[derive(serde::Deserialize, Default)]
 struct SlimServerMeta {
-    #[serde(default, rename = "io.modelcontextprotocol.registry/publisher-provided")]
+    #[serde(
+        default,
+        rename = "io.modelcontextprotocol.registry/publisher-provided"
+    )]
     publisher: SlimPublisher,
 }
 
@@ -551,21 +641,41 @@ fn relevance(x: &SlimServer, words: &[String]) -> Option<u32> {
 }
 
 fn local_search(text: &str, query: &str, offset: usize, limit: usize) -> (Vec<Value>, usize) {
-    let words: Vec<String> = query.to_lowercase().split_whitespace().map(String::from).collect();
+    let words: Vec<String> = query
+        .to_lowercase()
+        .split_whitespace()
+        .map(String::from)
+        .collect();
     let lines: Vec<&str> = text.lines().collect();
     let mut hits: Vec<(u32, String, usize)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for (i, line) in lines.iter().enumerate() {
-        let Ok(x) = serde_json::from_str::<Slim>(line) else { continue };
+        let Ok(x) = serde_json::from_str::<Slim>(line) else {
+            continue;
+        };
         if x.meta.official.status == "deleted" {
             continue;
         }
         // Même serveur listé par les deux registres : une seule carte (la plus riche, la première).
-        let repo_key = format!("{}#{}", x.server.repository.url.to_lowercase().trim_end_matches(".git"), short_name(&x.server.name).to_lowercase());
-        if !seen.insert(x.server.name.clone()) || (!x.server.repository.url.is_empty() && !seen.insert(repo_key)) {
+        let repo_key = format!(
+            "{}#{}",
+            x.server
+                .repository
+                .url
+                .to_lowercase()
+                .trim_end_matches(".git"),
+            short_name(&x.server.name).to_lowercase()
+        );
+        if !seen.insert(x.server.name.clone())
+            || (!x.server.repository.url.is_empty() && !seen.insert(repo_key))
+        {
             continue;
         }
-        let score = if words.is_empty() { Some(0) } else { relevance(&x.server, &words) };
+        let score = if words.is_empty() {
+            Some(0)
+        } else {
+            relevance(&x.server, &words)
+        };
         if let Some(sc) = score {
             // Popularité : 100 étoiles +24, 1000 +36, 100 000 +60 (un serveur reconnu passe devant les homonymes).
             let boost = ((x.server.meta.publisher.github.stars as f64 + 1.0).log10() * 12.0) as u32;
@@ -599,7 +709,10 @@ pub async fn search(query: &str, cursor: Option<&str>, limit: usize) -> Result<V
     let limit = limit.clamp(1, 100);
     ensure_sync();
     let installed = installed_index();
-    let complete = load_state().get("complete").and_then(|v| v.as_bool()).unwrap_or(false);
+    let complete = load_state()
+        .get("complete")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if let Some(text) = catalog_text() {
         let offset: usize = cursor.and_then(|c| c.parse().ok()).unwrap_or(0);
         let (page, total) = local_search(&text, query, offset, limit);
@@ -621,11 +734,20 @@ pub async fn search(query: &str, cursor: Option<&str>, limit: usize) -> Result<V
     live_search_page(query, cursor, limit, &installed).await
 }
 
-async fn live_search(query: &str, limit: usize, installed: &HashMap<String, String>) -> Result<Value, String> {
+async fn live_search(
+    query: &str,
+    limit: usize,
+    installed: &HashMap<String, String>,
+) -> Result<Value, String> {
     live_search_page(query, None, limit, installed).await
 }
 
-async fn live_search_page(query: &str, cursor: Option<&str>, limit: usize, installed: &HashMap<String, String>) -> Result<Value, String> {
+async fn live_search_page(
+    query: &str,
+    cursor: Option<&str>,
+    limit: usize,
+    installed: &HashMap<String, String>,
+) -> Result<Value, String> {
     let mut url = format!("{}?version=latest&limit={}", API, limit);
     if !query.trim().is_empty() {
         url.push_str(&format!("&search={}", enc(query.trim())));
@@ -635,7 +757,12 @@ async fn live_search_page(query: &str, cursor: Option<&str>, limit: usize, insta
     }
     let (data, stale) = cached_json("list", &url, LIST_TTL_SECS, &[]).await?;
     // Chaque fiche reçue sert aussi de cache pour `entry` : ouvrir la fiche ensuite est immédiat.
-    for e in data.get("servers").and_then(|s| s.as_array()).into_iter().flatten() {
+    for e in data
+        .get("servers")
+        .and_then(|s| s.as_array())
+        .into_iter()
+        .flatten()
+    {
         if !entry_name(e).is_empty() {
             cache_put(&cache_file("entry", &entry_url(entry_name(e))), e);
         }
@@ -643,7 +770,12 @@ async fn live_search_page(query: &str, cursor: Option<&str>, limit: usize, insta
     let servers: Vec<Value> = data
         .get("servers")
         .and_then(|s| s.as_array())
-        .map(|a| a.iter().filter(|e| status(e) != "deleted").map(|e| summary(e, installed)).collect())
+        .map(|a| {
+            a.iter()
+                .filter(|e| status(e) != "deleted")
+                .map(|e| summary(e, installed))
+                .collect()
+        })
         .unwrap_or_default();
     Ok(json!({
         "servers": servers,
@@ -678,11 +810,17 @@ fn short_name(name: &str) -> &str {
 
 /// Métadonnées GitHub fournies par le Registre MCP de GitHub (étoiles, activité, licence).
 fn gh_meta(server: &Value) -> Option<&Value> {
-    server.get("_meta").and_then(|m| m.get(PUBLISHER)).and_then(|p| p.get("github"))
+    server
+        .get("_meta")
+        .and_then(|m| m.get(PUBLISHER))
+        .and_then(|p| p.get("github"))
 }
 
 fn icon(server: &Value) -> Value {
-    if let Some(a) = gh_meta(server).and_then(|g| g.get("ownerAvatarUrl")).and_then(|v| v.as_str()) {
+    if let Some(a) = gh_meta(server)
+        .and_then(|g| g.get("ownerAvatarUrl"))
+        .and_then(|v| v.as_str())
+    {
         if a.starts_with("https://") && server.get("icons").is_none() {
             return json!(a);
         }
@@ -701,10 +839,19 @@ fn icon(server: &Value) -> Value {
 
 fn kinds(server: &Value) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    if server.get("remotes").and_then(|r| r.as_array()).is_some_and(|a| !a.is_empty()) {
+    if server
+        .get("remotes")
+        .and_then(|r| r.as_array())
+        .is_some_and(|a| !a.is_empty())
+    {
         out.push("remote".into());
     }
-    for p in server.get("packages").and_then(|p| p.as_array()).into_iter().flatten() {
+    for p in server
+        .get("packages")
+        .and_then(|p| p.as_array())
+        .into_iter()
+        .flatten()
+    {
         let k = s(p, "registryType").to_string();
         if !k.is_empty() && !out.contains(&k) {
             out.push(k);
@@ -777,7 +924,9 @@ pub async fn repo_stats(repo_url: &str) -> Option<Value> {
     {
         headers.push(("Authorization", format!("Bearer {}", t)));
     }
-    let (v, _) = cached_json("repo", &api, REPO_TTL_SECS, &headers).await.ok()?;
+    let (v, _) = cached_json("repo", &api, REPO_TTL_SECS, &headers)
+        .await
+        .ok()?;
     Some(json!({
         "stars": v.get("stargazers_count").cloned().unwrap_or(Value::Null),
         "forks": v.get("forks_count").cloned().unwrap_or(Value::Null),
@@ -828,13 +977,47 @@ const DANGEROUS_DOCKER: &[(&str, &str)] = &[
 ];
 
 const CAPABILITIES: &[(&[&str], &str)] = &[
-    (&["shell", "terminal", "command", "exec", "bash", "ssh"], "Can run commands"),
-    (&["filesystem", "file system", "files", "directory", "folder"], "Reads or writes files"),
-    (&["browser", "chrome", "playwright", "puppeteer", "selenium"], "Controls a browser"),
-    (&["email", "gmail", "slack", "discord", "telegram", "sms", "whatsapp"], "Can send messages"),
-    (&["payment", "stripe", "bank", "wallet", "invoice", "crypto", "trading"], "Touches money or payments"),
-    (&["database", "sql", "postgres", "mysql", "mongodb", "supabase", "redis"], "Database access"),
-    (&["deploy", "kubernetes", "aws", "cloud", "terraform", "docker"], "Manages infrastructure"),
+    (
+        &["shell", "terminal", "command", "exec", "bash", "ssh"],
+        "Can run commands",
+    ),
+    (
+        &["filesystem", "file system", "files", "directory", "folder"],
+        "Reads or writes files",
+    ),
+    (
+        &["browser", "chrome", "playwright", "puppeteer", "selenium"],
+        "Controls a browser",
+    ),
+    (
+        &[
+            "email", "gmail", "slack", "discord", "telegram", "sms", "whatsapp",
+        ],
+        "Can send messages",
+    ),
+    (
+        &[
+            "payment", "stripe", "bank", "wallet", "invoice", "crypto", "trading",
+        ],
+        "Touches money or payments",
+    ),
+    (
+        &[
+            "database", "sql", "postgres", "mysql", "mongodb", "supabase", "redis",
+        ],
+        "Database access",
+    ),
+    (
+        &[
+            "deploy",
+            "kubernetes",
+            "aws",
+            "cloud",
+            "terraform",
+            "docker",
+        ],
+        "Manages infrastructure",
+    ),
 ];
 
 /// Score de confiance (0-100) avec le détail de chaque signal. `repo` = statistiques GitHub
@@ -851,7 +1034,11 @@ pub fn trust(entry: &Value, repo: Option<&Value>) -> Value {
     };
 
     match status(entry) {
-        "active" => point("Active in the official MCP Registry".into(), 10, &mut signals),
+        "active" => point(
+            "Active in the official MCP Registry".into(),
+            10,
+            &mut signals,
+        ),
         "deprecated" => {
             point("Deprecated by its publisher".into(), -30, &mut signals);
             warnings.push("Deprecated: the publisher recommends another server".into());
@@ -860,13 +1047,19 @@ pub fn trust(entry: &Value, repo: Option<&Value>) -> Value {
     }
 
     // Éditeur : l'espace de noms est vérifié par le registre (compte GitHub ou domaine DNS).
-    let repo_url = server.pointer("/repository/url").and_then(|v| v.as_str()).unwrap_or("");
+    let repo_url = server
+        .pointer("/repository/url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let repo_owner = github_repo(repo_url).map(|(o, _)| o);
     let ns = name.split('/').next().unwrap_or("");
     if let Some(gh) = ns.strip_prefix("io.github.") {
         match &repo_owner {
             Some(o) if o.eq_ignore_ascii_case(gh) => point(
-                format!("Verified publisher: GitHub account {} publishes its own code", gh),
+                format!(
+                    "Verified publisher: GitHub account {} publishes its own code",
+                    gh
+                ),
                 30,
                 &mut signals,
             ),
@@ -889,7 +1082,11 @@ pub fn trust(entry: &Value, repo: Option<&Value>) -> Value {
                 25,
                 &mut signals,
             ),
-            Some(o) => point(format!("Verified domain {} (code hosted by {})", domain, o), 15, &mut signals),
+            Some(o) => point(
+                format!("Verified domain {} (code hosted by {})", domain, o),
+                15,
+                &mut signals,
+            ),
             None => point(format!("Verified domain {}", domain), 12, &mut signals),
         }
     }
@@ -901,7 +1098,9 @@ pub fn trust(entry: &Value, repo: Option<&Value>) -> Value {
     }
 
     // Popularité et activité du dépôt.
-    let mut latest_days = meta(entry, "updatedAt").and_then(|v| v.as_str()).and_then(days_since);
+    let mut latest_days = meta(entry, "updatedAt")
+        .and_then(|v| v.as_str())
+        .and_then(days_since);
     // Sans appel à l'API GitHub : les étoiles et l'activité fournies par le Registre MCP de GitHub.
     let from_gh = gh_meta(server).map(|g| {
         json!({
@@ -926,7 +1125,11 @@ pub fn trust(entry: &Value, repo: Option<&Value>) -> Value {
             point("Repository archived".into(), -25, &mut signals);
             warnings.push("The repository is archived: no more fixes".into());
         }
-        if let Some(d) = r.get("pushedAt").and_then(|v| v.as_str()).and_then(days_since) {
+        if let Some(d) = r
+            .get("pushedAt")
+            .and_then(|v| v.as_str())
+            .and_then(days_since)
+        {
             latest_days = Some(latest_days.map_or(d, |l| l.min(d)));
         }
     }
@@ -941,20 +1144,38 @@ pub fn trust(entry: &Value, repo: Option<&Value>) -> Value {
     }
 
     // Analyse statique de ce que le serveur demande.
-    let remotes: Vec<&Value> = server.get("remotes").and_then(|r| r.as_array()).map(|a| a.iter().collect()).unwrap_or_default();
-    let packages: Vec<&Value> = server.get("packages").and_then(|p| p.as_array()).map(|a| a.iter().collect()).unwrap_or_default();
+    let remotes: Vec<&Value> = server
+        .get("remotes")
+        .and_then(|r| r.as_array())
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    let packages: Vec<&Value> = server
+        .get("packages")
+        .and_then(|p| p.as_array())
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
     if !remotes.is_empty() {
         if remotes.iter().all(|r| s(r, "url").starts_with("https://")) {
-            point("Runs remotely over HTTPS: no code on this machine".into(), 10, &mut signals);
+            point(
+                "Runs remotely over HTTPS: no code on this machine".into(),
+                10,
+                &mut signals,
+            );
         } else {
             point("Unencrypted HTTP endpoint".into(), -15, &mut signals);
             warnings.push("A remote endpoint is plain HTTP".into());
         }
     } else if let Some(p) = packages.first() {
         match s(p, "registryType") {
-            "mcpb" if !s(p, "fileSha256").is_empty() => point("Bundle with an integrity hash (SHA-256)".into(), 10, &mut signals),
+            "mcpb" if !s(p, "fileSha256").is_empty() => point(
+                "Bundle with an integrity hash (SHA-256)".into(),
+                10,
+                &mut signals,
+            ),
             "mcpb" => point("Bundle without an integrity hash".into(), -10, &mut signals),
-            _ if !s(p, "version").is_empty() => point("Pinned package version".into(), 5, &mut signals),
+            _ if !s(p, "version").is_empty() => {
+                point("Pinned package version".into(), 5, &mut signals)
+            }
             _ => point("Unpinned package version".into(), -5, &mut signals),
         }
     }
@@ -973,9 +1194,20 @@ pub fn trust(entry: &Value, repo: Option<&Value>) -> Value {
     let mut capabilities: Vec<String> = Vec::new();
     let secrets = secret_names(server);
     if !secrets.is_empty() {
-        capabilities.push(format!("Asks for {} secret{}: {}", secrets.len(), if secrets.len() > 1 { "s" } else { "" }, secrets.join(", ")));
+        capabilities.push(format!(
+            "Asks for {} secret{}: {}",
+            secrets.len(),
+            if secrets.len() > 1 { "s" } else { "" },
+            secrets.join(", ")
+        ));
     }
-    let text = format!("{} {} {}", name, s(server, "title"), s(server, "description")).to_lowercase();
+    let text = format!(
+        "{} {} {}",
+        name,
+        s(server, "title"),
+        s(server, "description")
+    )
+    .to_lowercase();
     for (words, label) in CAPABILITIES {
         if words.iter().any(|w| text.contains(w)) {
             capabilities.push(label.to_string());
@@ -983,7 +1215,13 @@ pub fn trust(entry: &Value, repo: Option<&Value>) -> Value {
     }
 
     let score = score.clamp(0, 100);
-    let level = if score >= 75 { "high" } else if score >= 50 { "medium" } else { "low" };
+    let level = if score >= 75 {
+        "high"
+    } else if score >= 50 {
+        "medium"
+    } else {
+        "low"
+    };
     json!({
         "score": score,
         "level": level,
@@ -1014,20 +1252,45 @@ fn secret_names(server: &Value) -> Vec<String> {
             out.push(n.to_string());
         }
     };
-    for p in server.get("packages").and_then(|p| p.as_array()).into_iter().flatten() {
-        for e in p.get("environmentVariables").and_then(|e| e.as_array()).into_iter().flatten() {
+    for p in server
+        .get("packages")
+        .and_then(|p| p.as_array())
+        .into_iter()
+        .flatten()
+    {
+        for e in p
+            .get("environmentVariables")
+            .and_then(|e| e.as_array())
+            .into_iter()
+            .flatten()
+        {
             if e.get("isSecret").and_then(|v| v.as_bool()).unwrap_or(false) {
                 push(s(e, "name"));
             }
-            for (k, v) in e.get("variables").and_then(|v| v.as_object()).into_iter().flatten() {
+            for (k, v) in e
+                .get("variables")
+                .and_then(|v| v.as_object())
+                .into_iter()
+                .flatten()
+            {
                 if v.get("isSecret").and_then(|x| x.as_bool()).unwrap_or(false) {
                     push(k);
                 }
             }
         }
     }
-    for r in server.get("remotes").and_then(|r| r.as_array()).into_iter().flatten() {
-        for h in r.get("headers").and_then(|h| h.as_array()).into_iter().flatten() {
+    for r in server
+        .get("remotes")
+        .and_then(|r| r.as_array())
+        .into_iter()
+        .flatten()
+    {
+        for h in r
+            .get("headers")
+            .and_then(|h| h.as_array())
+            .into_iter()
+            .flatten()
+        {
             if h.get("isSecret").and_then(|v| v.as_bool()).unwrap_or(false) {
                 for v in placeholders(s(h, "value")) {
                     push(&v);
@@ -1050,7 +1313,11 @@ fn placeholders(template: &str) -> Vec<String> {
         match after.find('}') {
             Some(end) => {
                 let name = &after[..end];
-                if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.') {
+                if !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+                {
                     out.push(name.to_string());
                 }
                 rest = &after[end + 1..];
@@ -1064,14 +1331,20 @@ fn placeholders(template: &str) -> Vec<String> {
 /// Fiche + statistiques du dépôt + score complet + options d'installation, pour le tableau de bord.
 pub async fn details(name: &str) -> Result<Value, String> {
     let e = entry(name).await?;
-    let repo_url = e.pointer("/server/repository/url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let repo_url = e
+        .pointer("/server/repository/url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let stats = if repo_url.is_empty() || gh_meta(&e["server"]).is_some() {
-        gh_meta(&e["server"]).map(|g| json!({
-            "stars": g.get("stargazerCount").cloned().unwrap_or(Value::Null),
-            "pushedAt": g.get("pushedAt").cloned().unwrap_or(Value::Null),
-            "archived": false,
-            "license": g.get("license").cloned().unwrap_or(Value::Null),
-        }))
+        gh_meta(&e["server"]).map(|g| {
+            json!({
+                "stars": g.get("stargazerCount").cloned().unwrap_or(Value::Null),
+                "pushedAt": g.get("pushedAt").cloned().unwrap_or(Value::Null),
+                "archived": false,
+                "license": g.get("license").cloned().unwrap_or(Value::Null),
+            })
+        })
     } else {
         repo_stats(&repo_url).await
     };
@@ -1087,7 +1360,11 @@ pub async fn details(name: &str) -> Result<Value, String> {
 
 fn exe_names(name: &str) -> Vec<String> {
     if cfg!(windows) {
-        vec![format!("{}.exe", name), format!("{}.cmd", name), name.to_string()]
+        vec![
+            format!("{}.exe", name),
+            format!("{}.cmd", name),
+            name.to_string(),
+        ]
     } else {
         vec![name.to_string()]
     }
@@ -1157,7 +1434,13 @@ fn env_var_name(slug: &str, label: &str) -> String {
     let raw = format!("{}_{}", slug, label.trim_start_matches('-'));
     let mut out: String = raw
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
         .collect();
     while out.contains("__") {
         out = out.replace("__", "_");
@@ -1199,11 +1482,22 @@ impl<'a> Builder<'a> {
     }
 
     /// Valeur d'une entrée : littérale, ou `${VAR}` pour un secret (rangé au Trousseau).
-    fn input(&mut self, key: &str, label: &str, spec: &Value, env_name: Option<&str>) -> Option<String> {
+    fn input(
+        &mut self,
+        key: &str,
+        label: &str,
+        spec: &Value,
+        env_name: Option<&str>,
+    ) -> Option<String> {
         let secret = flag(spec, "isSecret");
         let required = flag(spec, "isRequired");
-        let default = spec.get("default").and_then(|v| v.as_str()).filter(|v| !v.is_empty());
-        let var = env_name.map(String::from).unwrap_or_else(|| env_var_name(&self.slug, label));
+        let default = spec
+            .get("default")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty());
+        let var = env_name
+            .map(String::from)
+            .unwrap_or_else(|| env_var_name(&self.slug, label));
         let provided = self
             .values
             .get(key)
@@ -1228,7 +1522,9 @@ impl<'a> Builder<'a> {
             if let Some(v) = provided {
                 // Une valeur différente d'un secret déjà connu ne l'écrase jamais : elle prend
                 // un nom propre à ce serveur.
-                let target = if self.known_secret(&var) && std::env::var(&var).ok().as_deref() != Some(v.as_str()) {
+                let target = if self.known_secret(&var)
+                    && std::env::var(&var).ok().as_deref() != Some(v.as_str())
+                {
                     env_var_name(&self.slug, label)
                 } else {
                     var.clone()
@@ -1276,9 +1572,17 @@ impl<'a> Builder<'a> {
         complete.then_some(out)
     }
 
-    fn value_of(&mut self, key: &str, label: &str, spec: &Value, env_name: Option<&str>) -> Option<String> {
+    fn value_of(
+        &mut self,
+        key: &str,
+        label: &str,
+        spec: &Value,
+        env_name: Option<&str>,
+    ) -> Option<String> {
         match spec.get("value").and_then(|v| v.as_str()) {
-            Some(tpl) if !placeholders(tpl).is_empty() => self.template(tpl, spec.get("variables"), spec),
+            Some(tpl) if !placeholders(tpl).is_empty() => {
+                self.template(tpl, spec.get("variables"), spec)
+            }
             Some(fixed) => Some(fixed.to_string()),
             None => self.input(key, label, spec, env_name),
         }
@@ -1286,7 +1590,12 @@ impl<'a> Builder<'a> {
 
     fn args(&mut self, list: Option<&Value>, prefix: &str) -> Vec<String> {
         let mut out = Vec::new();
-        for (i, a) in list.and_then(|l| l.as_array()).into_iter().flatten().enumerate() {
+        for (i, a) in list
+            .and_then(|l| l.as_array())
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
             let name = s(a, "name");
             let label = if !name.is_empty() {
                 name.to_string()
@@ -1325,9 +1634,15 @@ impl<'a> Builder<'a> {
     }
 
     fn package(&mut self, p: &Value) -> Result<Value, String> {
-        let transport = p.pointer("/transport/type").and_then(|v| v.as_str()).unwrap_or("stdio");
+        let transport = p
+            .pointer("/transport/type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("stdio");
         if transport != "stdio" {
-            return Err(format!("local {} transport is not supported, only stdio", transport));
+            return Err(format!(
+                "local {} transport is not supported, only stdio",
+                transport
+            ));
         }
         let id = s(p, "identifier");
         let ver = s(p, "version");
@@ -1335,20 +1650,45 @@ impl<'a> Builder<'a> {
         let runtime = self.args(p.get("runtimeArguments"), "runtime");
         let pkg = self.args(p.get("packageArguments"), "arg");
         let hint = s(p, "runtimeHint");
-        let pick = |default: &str| if hint.is_empty() { default.to_string() } else { hint.to_string() };
+        let pick = |default: &str| {
+            if hint.is_empty() {
+                default.to_string()
+            } else {
+                hint.to_string()
+            }
+        };
         let (cmd, mut args) = match s(p, "registryType") {
             "npm" => {
-                let mut a = if runtime.is_empty() { vec!["-y".to_string()] } else { runtime };
-                a.push(if ver.is_empty() { id.to_string() } else { format!("{}@{}", id, ver) });
+                let mut a = if runtime.is_empty() {
+                    vec!["-y".to_string()]
+                } else {
+                    runtime
+                };
+                a.push(if ver.is_empty() {
+                    id.to_string()
+                } else {
+                    format!("{}@{}", id, ver)
+                });
                 (pick("npx"), a)
             }
             "pypi" => {
                 let mut a = runtime;
-                a.push(if ver.is_empty() { id.to_string() } else { format!("{}=={}", id, ver) });
+                a.push(if ver.is_empty() {
+                    id.to_string()
+                } else {
+                    format!("{}=={}", id, ver)
+                });
                 (pick("uvx"), a)
             }
             "nuget" => {
-                let mut a = vec![if ver.is_empty() { id.to_string() } else { format!("{}@{}", id, ver) }, "--yes".to_string()];
+                let mut a = vec![
+                    if ver.is_empty() {
+                        id.to_string()
+                    } else {
+                        format!("{}@{}", id, ver)
+                    },
+                    "--yes".to_string(),
+                ];
                 a.extend(runtime);
                 if !pkg.is_empty() {
                     a.push("--".into());
@@ -1377,20 +1717,32 @@ impl<'a> Builder<'a> {
 
     fn remote(&mut self, r: &Value) -> Result<Value, String> {
         if s(r, "type") != "streamable-http" {
-            return Err(format!("{} remotes are not supported, only streamable-http", s(r, "type")));
+            return Err(format!(
+                "{} remotes are not supported, only streamable-http",
+                s(r, "type")
+            ));
         }
         let mut url = s(r, "url").to_string();
         if !placeholders(&url).is_empty() {
-            url = self.template(&url, r.get("variables"), &json!({"isRequired": true})).unwrap_or(url);
+            url = self
+                .template(&url, r.get("variables"), &json!({"isRequired": true}))
+                .unwrap_or(url);
         }
         let mut headers = Map::new();
-        for h in r.get("headers").and_then(|h| h.as_array()).into_iter().flatten() {
+        for h in r
+            .get("headers")
+            .and_then(|h| h.as_array())
+            .into_iter()
+            .flatten()
+        {
             let name = s(h, "name");
             if let Some(v) = self.value_of(&format!("header:{}", name), name, h, None) {
                 headers.insert(name.to_string(), json!(v));
             }
         }
-        let has_auth = headers.keys().any(|k| k.eq_ignore_ascii_case("authorization"));
+        let has_auth = headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("authorization"));
         let mut cfg = json!({"url": url});
         if !headers.is_empty() {
             cfg["headers"] = Value::Object(headers);
@@ -1401,9 +1753,17 @@ impl<'a> Builder<'a> {
 
     /// Bundle .mcpb déjà extrait : commande du manifeste pour ce système, ${user_config.X} résolus.
     fn bundle(&mut self, dir: &Path, manifest: &Value) -> Result<Value, String> {
-        let server = manifest.get("server").ok_or("manifest.json sans section server")?;
-        let mcp = server.get("mcp_config").cloned().unwrap_or_else(|| json!({}));
-        let over = mcp.pointer(&format!("/platform_overrides/{}", os_key())).cloned().unwrap_or_else(|| json!({}));
+        let server = manifest
+            .get("server")
+            .ok_or("manifest.json sans section server")?;
+        let mcp = server
+            .get("mcp_config")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let over = mcp
+            .pointer(&format!("/platform_overrides/{}", os_key()))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
         let entry_point = s(server, "entry_point");
         let mut command = over
             .get("command")
@@ -1419,17 +1779,31 @@ impl<'a> Builder<'a> {
             .get("args")
             .or_else(|| mcp.get("args"))
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_else(|| match s(server, "type") {
                 "node" | "python" => vec![format!("${{__dirname}}/{}", entry_point)],
                 _ => Vec::new(),
             });
-        let mut env: Map<String, Value> = mcp.get("env").and_then(|e| e.as_object()).cloned().unwrap_or_default();
+        let mut env: Map<String, Value> = mcp
+            .get("env")
+            .and_then(|e| e.as_object())
+            .cloned()
+            .unwrap_or_default();
         if let Some(o) = over.get("env").and_then(|e| e.as_object()) {
             env.extend(o.clone());
         }
-        let user_config = manifest.get("user_config").cloned().unwrap_or_else(|| json!({}));
-        let home = dirs::home_dir().unwrap_or_default().to_string_lossy().to_string();
+        let user_config = manifest
+            .get("user_config")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let home = dirs::home_dir()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         let sep = if cfg!(windows) { "\\" } else { "/" };
         let dirname = dir.to_string_lossy().to_string();
         let subst = |b: &mut Self, raw: &str| -> String {
@@ -1439,7 +1813,9 @@ impl<'a> Builder<'a> {
                 .replace("${pathSeparator}", sep)
                 .replace("${/}", sep);
             while let Some(start) = out.find("${user_config.") {
-                let Some(end_rel) = out[start..].find('}') else { break };
+                let Some(end_rel) = out[start..].find('}') else {
+                    break;
+                };
                 let key = out[start + 14..start + end_rel].to_string();
                 let uc = user_config.get(&key).cloned().unwrap_or_else(|| json!({}));
                 let spec = json!({
@@ -1448,8 +1824,14 @@ impl<'a> Builder<'a> {
                     "default": uc.get("default").map(|d| match d { Value::String(s) => json!(s), other => json!(other.to_string()) }).unwrap_or(Value::Null),
                     "description": uc.get("description").or_else(|| uc.get("title")).cloned().unwrap_or(Value::Null),
                 });
-                let label = uc.get("title").and_then(|t| t.as_str()).unwrap_or(&key).to_string();
-                let v = b.input(&format!("user:{}", key), &label, &spec, None).unwrap_or_default();
+                let label = uc
+                    .get("title")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or(&key)
+                    .to_string();
+                let v = b
+                    .input(&format!("user:{}", key), &label, &spec, None)
+                    .unwrap_or_default();
                 out.replace_range(start..start + end_rel + 1, &v);
             }
             out
@@ -1476,7 +1858,10 @@ impl<'a> Builder<'a> {
 // ─── Options d'installation ──────────────────────────────────
 
 fn kind_rank(kind: &str) -> usize {
-    ["remote", "mcpb", "npm", "pypi", "oci", "nuget"].iter().position(|k| *k == kind).unwrap_or(9)
+    ["remote", "mcpb", "npm", "pypi", "oci", "nuget"]
+        .iter()
+        .position(|k| *k == kind)
+        .unwrap_or(9)
 }
 
 fn runtime_for(kind: &str, hint: &str) -> Option<&'static str> {
@@ -1502,7 +1887,13 @@ fn runtime_for(kind: &str, hint: &str) -> Option<&'static str> {
 pub fn options(server: &Value) -> Vec<Value> {
     let empty = Map::new();
     let mut out: Vec<Value> = Vec::new();
-    for (i, r) in server.get("remotes").and_then(|r| r.as_array()).into_iter().flatten().enumerate() {
+    for (i, r) in server
+        .get("remotes")
+        .and_then(|r| r.as_array())
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
         let mut b = Builder::new("x", &empty);
         let res = b.remote(r);
         let host = s(r, "url").split('/').nth(2).unwrap_or("").to_string();
@@ -1515,7 +1906,13 @@ pub fn options(server: &Value) -> Vec<Value> {
             "inputs": b.inputs,
         }));
     }
-    for (i, p) in server.get("packages").and_then(|p| p.as_array()).into_iter().flatten().enumerate() {
+    for (i, p) in server
+        .get("packages")
+        .and_then(|p| p.as_array())
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
         let kind = s(p, "registryType");
         let mut reason: Option<String> = None;
         let mut inputs: Vec<Value> = Vec::new();
@@ -1559,7 +1956,12 @@ pub fn options(server: &Value) -> Vec<Value> {
             "inputs": inputs,
         }));
     }
-    out.sort_by_key(|o| (!o["available"].as_bool().unwrap_or(false), kind_rank(o["kind"].as_str().unwrap_or(""))));
+    out.sort_by_key(|o| {
+        (
+            !o["available"].as_bool().unwrap_or(false),
+            kind_rank(o["kind"].as_str().unwrap_or("")),
+        )
+    });
     out
 }
 
@@ -1590,8 +1992,12 @@ async fn prepare_bundle(p: &Value, slug: &str) -> Result<(PathBuf, Value), Strin
     std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
     let file = base.join("bundle.mcpb");
     let current = base.join("current");
-    let have = std::fs::read(&file).ok().map(|b| format!("{:x}", Sha256::digest(&b)));
-    let reuse = !expected.is_empty() && have.as_deref() == Some(expected.as_str()) && current.join("manifest.json").exists();
+    let have = std::fs::read(&file)
+        .ok()
+        .map(|b| format!("{:x}", Sha256::digest(&b)));
+    let reuse = !expected.is_empty()
+        && have.as_deref() == Some(expected.as_str())
+        && current.join("manifest.json").exists();
     if !reuse {
         let resp = http()
             .get(url)
@@ -1602,13 +2008,19 @@ async fn prepare_bundle(p: &Value, slug: &str) -> Result<(PathBuf, Value), Strin
         if !resp.status().is_success() {
             return Err(format!("download failed: HTTP {}", resp.status().as_u16()));
         }
-        let bytes = resp.bytes().await.map_err(|e| format!("download failed: {}", e))?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("download failed: {}", e))?;
         if bytes.len() > MAX_BUNDLE_BYTES {
             return Err("bundle larger than 300 MB".into());
         }
         let got = format!("{:x}", Sha256::digest(&bytes));
         if !expected.is_empty() && got != expected {
-            return Err(format!("integrity check failed: SHA-256 {} instead of {}", got, expected));
+            return Err(format!(
+                "integrity check failed: SHA-256 {} instead of {}",
+                got, expected
+            ));
         }
         let tmp = base.join("bundle.mcpb.part");
         std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
@@ -1617,9 +2029,20 @@ async fn prepare_bundle(p: &Value, slug: &str) -> Result<(PathBuf, Value), Strin
         let _ = std::fs::remove_dir_all(&staging);
         std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
         let status = if cfg!(windows) {
-            std::process::Command::new("tar").arg("-xf").arg(&file).arg("-C").arg(&staging).status()
+            std::process::Command::new("tar")
+                .arg("-xf")
+                .arg(&file)
+                .arg("-C")
+                .arg(&staging)
+                .status()
         } else {
-            std::process::Command::new("unzip").arg("-q").arg("-o").arg(&file).arg("-d").arg(&staging).status()
+            std::process::Command::new("unzip")
+                .arg("-q")
+                .arg("-o")
+                .arg(&file)
+                .arg("-d")
+                .arg(&staging)
+                .status()
         }
         .map_err(|e| format!("cannot extract the bundle (unzip missing?): {}", e))?;
         if !status.success() {
@@ -1634,13 +2057,17 @@ async fn prepare_bundle(p: &Value, slug: &str) -> Result<(PathBuf, Value), Strin
         let _ = std::fs::remove_dir_all(&current);
         std::fs::rename(&staging, &current).map_err(|e| e.to_string())?;
     }
-    let raw = std::fs::read_to_string(current.join("manifest.json")).map_err(|_| "bundle without manifest.json".to_string())?;
-    let manifest: Value = serde_json::from_str(&raw).map_err(|e| format!("invalid manifest.json: {}", e))?;
+    let raw = std::fs::read_to_string(current.join("manifest.json"))
+        .map_err(|_| "bundle without manifest.json".to_string())?;
+    let manifest: Value =
+        serde_json::from_str(&raw).map_err(|e| format!("invalid manifest.json: {}", e))?;
     Ok((current, manifest))
 }
 
 fn all_inside(dir: &Path, root: &Path) -> bool {
-    let Ok(rd) = std::fs::read_dir(dir) else { return true };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return true;
+    };
     for e in rd.flatten() {
         let p = e.path();
         if let Ok(meta) = std::fs::symlink_metadata(&p) {
@@ -1683,7 +2110,13 @@ fn servers_obj(config: &Value) -> Option<&Map<String, Value>> {
 fn local_slug(name: &str, taken: &Map<String, Value>) -> String {
     let base: String = short_name(name)
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect();
     let base = base.trim_matches('-').to_string();
     let base = if base.is_empty() || base == "mcp" || base == "server" {
@@ -1694,7 +2127,10 @@ fn local_slug(name: &str, taken: &Map<String, Value>) -> String {
     if !taken.contains_key(&base) {
         return base;
     }
-    (2..).map(|i| format!("{}-{}", base, i)).find(|n| !taken.contains_key(n)).unwrap()
+    (2..)
+        .map(|i| format!("{}-{}", base, i))
+        .find(|n| !taken.contains_key(n))
+        .unwrap()
 }
 
 fn store_secret(name: &str, value: &str) -> Result<(), String> {
@@ -1729,11 +2165,21 @@ pub async fn install(req: InstallRequest) -> Result<Value, String> {
     let server = e["server"].clone();
     let opts = options(&server);
     let chosen = match &req.option {
-        Some(id) => opts.iter().find(|o| o["id"] == id.as_str()).cloned().ok_or_else(|| format!("unknown option {}", id))?,
-        None => opts.first().cloned().ok_or("nothing installable for this server")?,
+        Some(id) => opts
+            .iter()
+            .find(|o| o["id"] == id.as_str())
+            .cloned()
+            .ok_or_else(|| format!("unknown option {}", id))?,
+        None => opts
+            .first()
+            .cloned()
+            .ok_or("nothing installable for this server")?,
     };
     if !chosen["available"].as_bool().unwrap_or(false) {
-        return Err(chosen["reason"].as_str().unwrap_or("option not available on this machine").to_string());
+        return Err(chosen["reason"]
+            .as_str()
+            .unwrap_or("option not available on this machine")
+            .to_string());
     }
     let option_id = chosen["id"].as_str().unwrap_or("").to_string();
     let kind = chosen["kind"].as_str().unwrap_or("").to_string();
@@ -1746,21 +2192,30 @@ pub async fn install(req: InstallRequest) -> Result<Value, String> {
     let taken = config[key].as_object().cloned().unwrap_or_default();
     let previous = taken
         .iter()
-        .find(|(_, v)| v.pointer("/registry/name").and_then(|n| n.as_str()) == Some(req.name.as_str()))
+        .find(|(_, v)| {
+            v.pointer("/registry/name").and_then(|n| n.as_str()) == Some(req.name.as_str())
+        })
         .map(|(k, _)| k.clone());
     let local = match (&req.local_name, &previous) {
         (Some(n), _) if !n.trim().is_empty() => n.trim().to_string(),
         (_, Some(p)) => p.clone(),
         _ => local_slug(&req.name, &taken),
     };
-    if !local.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if !local
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         return Err("server name may only contain letters, digits, - and _".into());
     }
     if previous.as_deref() != Some(local.as_str()) && taken.contains_key(&local) {
         return Err(format!("a server named {} already exists", local));
     }
 
-    let idx: usize = option_id.split(':').nth(1).and_then(|i| i.parse().ok()).unwrap_or(0);
+    let idx: usize = option_id
+        .split(':')
+        .nth(1)
+        .and_then(|i| i.parse().ok())
+        .unwrap_or(0);
     let mut b = Builder::new(&local, &req.values);
     let mut cfg = match kind.as_str() {
         "remote" => b.remote(&server["remotes"][idx])?,
@@ -1770,11 +2225,20 @@ pub async fn install(req: InstallRequest) -> Result<Value, String> {
         }
         _ => b.package(&server["packages"][idx])?,
     };
-    if req.by == "agent" && b.inputs.iter().any(|i| i["secret"] == true && req.values.contains_key(i["key"].as_str().unwrap_or(""))) {
+    if req.by == "agent"
+        && b.inputs.iter().any(|i| {
+            i["secret"] == true && req.values.contains_key(i["key"].as_str().unwrap_or(""))
+        })
+    {
         return Err("an agent cannot provide secrets: the user enters them in the McpHub dashboard (Library tab)".into());
     }
     if !b.needs.is_empty() {
-        let needs: Vec<Value> = b.inputs.iter().filter(|i| b.needs.iter().any(|n| i["key"] == n.as_str())).cloned().collect();
+        let needs: Vec<Value> = b
+            .inputs
+            .iter()
+            .filter(|i| b.needs.iter().any(|n| i["key"] == n.as_str()))
+            .cloned()
+            .collect();
         return Ok(json!({
             "ok": false,
             "name": local,
@@ -1792,7 +2256,9 @@ pub async fn install(req: InstallRequest) -> Result<Value, String> {
 
     // Protections héritées : bac à sable bouclier pour le code local (sauf réglage global, qui
     // s'applique alors), aucun pour Docker (déjà isolé dans son conteneur) ni pour le distant.
-    let global_sandbox = config.pointer("/settings/sandbox").filter(|v| !matches!(v, Value::Bool(false)));
+    let global_sandbox = config
+        .pointer("/settings/sandbox")
+        .filter(|v| !matches!(v, Value::Bool(false)));
     let sandbox = match kind.as_str() {
         "remote" => None,
         "oci" => Some(json!(false)),
@@ -1802,7 +2268,11 @@ pub async fn install(req: InstallRequest) -> Result<Value, String> {
     if let Some(sb) = &sandbox {
         cfg["sandbox"] = sb.clone();
     }
-    if cfg.get("env").and_then(|e| e.as_object()).is_some_and(|e| e.is_empty()) {
+    if cfg
+        .get("env")
+        .and_then(|e| e.as_object())
+        .is_some_and(|e| e.is_empty())
+    {
         cfg.as_object_mut().map(|o| o.remove("env"));
     }
     cfg["registry"] = json!({
@@ -1839,7 +2309,10 @@ pub async fn install(req: InstallRequest) -> Result<Value, String> {
 
     let oauth = kind == "remote" && cfg["auth"] == "oauth";
     let shown = crate::redaction::redact_json_value(&cfg);
-    eprintln!("[McpHub][LIBRARY] {} installe depuis le registre ({}, {}, par {})", local, req.name, kind, req.by);
+    eprintln!(
+        "[McpHub][LIBRARY] {} installe depuis le registre ({}, {}, par {})",
+        local, req.name, kind, req.by
+    );
     Ok(json!({
         "ok": true,
         "name": local,
@@ -1858,7 +2331,11 @@ pub async fn install(req: InstallRequest) -> Result<Value, String> {
 pub fn uninstall(local: &str) -> Result<bool, String> {
     let removed = crate::config::update_raw_guarded(&hub_config_path(), None, |config| {
         let key = servers_key(config);
-        let removed = config.get_mut(key).and_then(|v| v.as_object_mut()).and_then(|o| o.remove(local)).is_some();
+        let removed = config
+            .get_mut(key)
+            .and_then(|v| v.as_object_mut())
+            .and_then(|o| o.remove(local))
+            .is_some();
         Ok((removed, removed))
     })?
     .value;
@@ -1885,7 +2362,10 @@ fn agent_policy() -> (String, i64) {
         .and_then(|v| v.as_str())
         .unwrap_or("trusted")
         .to_ascii_lowercase();
-    let min = r.and_then(|r| r.get("minTrust")).and_then(|v| v.as_i64()).unwrap_or(60);
+    let min = r
+        .and_then(|r| r.get("minTrust"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(60);
     (mode, min)
 }
 
@@ -1909,7 +2389,12 @@ pub async fn agent_call(tool: &str, args: &Value) -> Result<Value, String> {
                 .into_iter()
                 .flatten()
                 .map(|x| {
-                    let desc: String = x["description"].as_str().unwrap_or("").chars().take(110).collect();
+                    let desc: String = x["description"]
+                        .as_str()
+                        .unwrap_or("")
+                        .chars()
+                        .take(110)
+                        .collect();
                     json!({
                         "name": x["name"],
                         "description": desc,
@@ -1925,7 +2410,10 @@ pub async fn agent_call(tool: &str, args: &Value) -> Result<Value, String> {
             }))
         }
         "registry_info" | "info" => {
-            let name = args.get("name").and_then(|v| v.as_str()).ok_or("name required")?;
+            let name = args
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or("name required")?;
             let d = details(name).await?;
             Ok(json!({
                 "name": d["name"], "description": d["description"], "version": d["version"],
@@ -1937,7 +2425,10 @@ pub async fn agent_call(tool: &str, args: &Value) -> Result<Value, String> {
             }))
         }
         "registry_install" | "install" => {
-            let name = args.get("name").and_then(|v| v.as_str()).ok_or("name required")?;
+            let name = args
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or("name required")?;
             let (mode, min) = agent_policy();
             if mode == "off" {
                 return Err("agent installs are turned off (settings.registry.agentInstall = \"off\"): ask the user to add it from the McpHub dashboard, Library tab".into());
@@ -1952,12 +2443,22 @@ pub async fn agent_call(tool: &str, args: &Value) -> Result<Value, String> {
                     ));
                 }
             }
-            let values = args.get("values").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+            let values = args
+                .get("values")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
             install(InstallRequest {
                 name: name.to_string(),
-                option: args.get("option").and_then(|v| v.as_str()).map(String::from),
+                option: args
+                    .get("option")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
                 values,
-                local_name: args.get("server_name").and_then(|v| v.as_str()).map(String::from),
+                local_name: args
+                    .get("server_name")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
                 by: "agent".into(),
             })
             .await
@@ -1992,15 +2493,29 @@ pub async fn run_cli(args: &[String]) -> i32 {
                         eprintln!("(hors ligne : resultats en cache)");
                     }
                     for x in res["servers"].as_array().into_iter().flatten() {
-                        let desc: String = x["description"].as_str().unwrap_or("").chars().take(70).collect();
-                        let kinds: Vec<&str> = x["kinds"].as_array().into_iter().flatten().filter_map(|k| k.as_str()).collect();
+                        let desc: String = x["description"]
+                            .as_str()
+                            .unwrap_or("")
+                            .chars()
+                            .take(70)
+                            .collect();
+                        let kinds: Vec<&str> = x["kinds"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|k| k.as_str())
+                            .collect();
                         println!(
                             "{:3}  {:52} {:14} {}{}",
                             x["trust"]["score"].as_i64().unwrap_or(0),
                             x["name"].as_str().unwrap_or(""),
                             kinds.join(","),
                             desc,
-                            if x["installed"].is_string() { "  [installe]" } else { "" }
+                            if x["installed"].is_string() {
+                                "  [installe]"
+                            } else {
+                                ""
+                            }
                         );
                     }
                     0
@@ -2018,14 +2533,26 @@ pub async fn run_cli(args: &[String]) -> i32 {
             };
             match details(name).await {
                 Ok(d) => {
-                    println!("{}  v{}", d["name"].as_str().unwrap_or(""), d["version"].as_str().unwrap_or(""));
+                    println!(
+                        "{}  v{}",
+                        d["name"].as_str().unwrap_or(""),
+                        d["version"].as_str().unwrap_or("")
+                    );
                     println!("{}", d["description"].as_str().unwrap_or(""));
                     if let Some(r) = d["repository"].as_str() {
                         println!("Code : {}", r);
                     }
-                    println!("\nConfiance : {}/100 ({})", d["trust"]["score"], d["trust"]["level"].as_str().unwrap_or(""));
+                    println!(
+                        "\nConfiance : {}/100 ({})",
+                        d["trust"]["score"],
+                        d["trust"]["level"].as_str().unwrap_or("")
+                    );
                     for sig in d["trust"]["signals"].as_array().into_iter().flatten() {
-                        println!("  {:+4}  {}", sig["points"].as_i64().unwrap_or(0), sig["label"].as_str().unwrap_or(""));
+                        println!(
+                            "  {:+4}  {}",
+                            sig["points"].as_i64().unwrap_or(0),
+                            sig["label"].as_str().unwrap_or("")
+                        );
                     }
                     for w in d["trust"]["warnings"].as_array().into_iter().flatten() {
                         println!("  !     {}", w.as_str().unwrap_or(""));
@@ -2039,7 +2566,10 @@ pub async fn run_cli(args: &[String]) -> i32 {
                             "  {:10} {}{}",
                             o["id"].as_str().unwrap_or(""),
                             o["label"].as_str().unwrap_or(""),
-                            o["reason"].as_str().map(|r| format!("  (indisponible : {})", r)).unwrap_or_default()
+                            o["reason"]
+                                .as_str()
+                                .map(|r| format!("  (indisponible : {})", r))
+                                .unwrap_or_default()
                         );
                     }
                     0
@@ -2082,7 +2612,11 @@ pub async fn run_cli(args: &[String]) -> i32 {
                 };
                 match install(req).await {
                     Ok(r) if r["ok"] == true => {
-                        println!("{} installe ({}).", r["name"].as_str().unwrap_or(""), r["kind"].as_str().unwrap_or(""));
+                        println!(
+                            "{} installe ({}).",
+                            r["name"].as_str().unwrap_or(""),
+                            r["kind"].as_str().unwrap_or("")
+                        );
                         if r["oauth"] == true {
                             println!("Connexion OAuth au premier appel, ou maintenant : McpHub oauth login {}", r["name"].as_str().unwrap_or(""));
                         }
@@ -2093,14 +2627,24 @@ pub async fn run_cli(args: &[String]) -> i32 {
                         if !interactive {
                             eprintln!("Valeurs requises :");
                             for n in r["needs"].as_array().into_iter().flatten() {
-                                eprintln!("  {}  {}", n["key"].as_str().unwrap_or(""), n["description"].as_str().unwrap_or(""));
+                                eprintln!(
+                                    "  {}  {}",
+                                    n["key"].as_str().unwrap_or(""),
+                                    n["description"].as_str().unwrap_or("")
+                                );
                             }
-                            eprintln!("Relancer avec CLE=VALEUR, ou dans un terminal pour les saisir.");
+                            eprintln!(
+                                "Relancer avec CLE=VALEUR, ou dans un terminal pour les saisir."
+                            );
                             return 1;
                         }
                         for n in r["needs"].as_array().into_iter().flatten() {
                             let key = n["key"].as_str().unwrap_or("").to_string();
-                            let label = format!("{} ({})", n["label"].as_str().unwrap_or(&key), n["description"].as_str().unwrap_or(""));
+                            let label = format!(
+                                "{} ({})",
+                                n["label"].as_str().unwrap_or(&key),
+                                n["description"].as_str().unwrap_or("")
+                            );
                             let v = if n["secret"] == true {
                                 crate::vault::read_secret_from_stdin(&label).unwrap_or_default()
                             } else {
@@ -2128,7 +2672,10 @@ pub async fn run_cli(args: &[String]) -> i32 {
             });
             loop {
                 tokio::time::sleep(Duration::from_secs(3)).await;
-                eprint!("\r  {} fiches", SYNC_DONE.load(std::sync::atomic::Ordering::SeqCst));
+                eprint!(
+                    "\r  {} fiches",
+                    SYNC_DONE.load(std::sync::atomic::Ordering::SeqCst)
+                );
                 if task.is_finished() {
                     break;
                 }
@@ -2213,7 +2760,10 @@ mod tests {
 
     #[test]
     fn score_editeur_verifie() {
-        let t = trust(&sample(), Some(&json!({"stars": 500, "pushedAt": "2026-10-20T00:00:00Z", "archived": false})));
+        let t = trust(
+            &sample(),
+            Some(&json!({"stars": 500, "pushedAt": "2026-10-20T00:00:00Z", "archived": false})),
+        );
         assert!(t["score"].as_i64().unwrap() >= 75, "{}", t);
         assert_eq!(t["level"], "high");
         assert!(t["capabilities"].to_string().contains("WEATHER_API_KEY"));
@@ -2243,14 +2793,20 @@ mod tests {
         let mut b = Builder::new("weather", &values);
         let cfg = b.package(&e["server"]["packages"][0]).unwrap();
         assert_eq!(b.needs, vec!["env:WEATHER_API_KEY".to_string()]);
-        assert_eq!(cfg["args"], json!(["-y", "@acme/weather-mcp@1.2.0", "--region", "eu"]));
+        assert_eq!(
+            cfg["args"],
+            json!(["-y", "@acme/weather-mcp@1.2.0", "--region", "eu"])
+        );
         assert_eq!(cfg["env"]["UNITS"], "metric");
         values.insert("env:WEATHER_API_KEY".into(), json!("k-123"));
         let mut b = Builder::new("weather", &values);
         let cfg = b.package(&e["server"]["packages"][0]).unwrap();
         assert!(b.needs.is_empty());
         assert_eq!(cfg["env"]["WEATHER_API_KEY"], "${WEATHER_API_KEY}");
-        assert_eq!(b.secrets, vec![("WEATHER_API_KEY".to_string(), "k-123".to_string())]);
+        assert_eq!(
+            b.secrets,
+            vec![("WEATHER_API_KEY".to_string(), "k-123".to_string())]
+        );
     }
 
     #[test]
@@ -2271,12 +2827,21 @@ mod tests {
         assert_eq!(env_var_name("9x", "k"), "MCP_9X_K");
         assert_eq!(placeholders("Bearer {a} {b_c}"), vec!["a", "b_c"]);
         assert_eq!(namespace_domain("com.stripe"), "stripe.com");
-        assert_eq!(local_slug("io.github.acme/weather-mcp", &Map::new()), "weather-mcp");
+        assert_eq!(
+            local_slug("io.github.acme/weather-mcp", &Map::new()),
+            "weather-mcp"
+        );
         let mut taken = Map::new();
         taken.insert("weather-mcp".into(), json!({}));
-        assert_eq!(local_slug("io.github.acme/weather-mcp", &taken), "weather-mcp-2");
+        assert_eq!(
+            local_slug("io.github.acme/weather-mcp", &taken),
+            "weather-mcp-2"
+        );
         assert_eq!(local_slug("com.acme/mcp", &Map::new()), "com-acme");
         assert!(days_since("1970-01-02T00:00:00Z").unwrap() > 20000);
-        assert_eq!(github_repo("https://github.com/a/b.git"), Some(("a".into(), "b".into())));
+        assert_eq!(
+            github_repo("https://github.com/a/b.git"),
+            Some(("a".into(), "b".into()))
+        );
     }
 }

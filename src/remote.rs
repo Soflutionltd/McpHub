@@ -25,7 +25,10 @@ pub struct RemoteClient {
 
 impl RemoteClient {
     pub fn new(server: &str, url: &str, headers: &HashMap<String, String>, oauth: bool) -> Self {
-        let mut hs: Vec<(String, String)> = headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let mut hs: Vec<(String, String)> = headers
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         hs.sort();
         Self {
             server: server.to_string(),
@@ -79,7 +82,9 @@ impl RemoteClient {
             let resp = self.post(body, token.as_deref()).await?;
             if resp.status().as_u16() == 401 && self.oauth && !retried {
                 retried = true;
-                if let Ok(Some(t)) = crate::oauth::force_refresh(&self.server, &self.url, token.as_deref()).await {
+                if let Ok(Some(t)) =
+                    crate::oauth::force_refresh(&self.server, &self.url, token.as_deref()).await
+                {
                     token = Some(t);
                     continue;
                 }
@@ -101,7 +106,10 @@ impl RemoteClient {
             }
             if resp.status().as_u16() == 404 && self.session.lock().await.is_some() {
                 *self.session.lock().await = None;
-                return Err(format!("Server closed connection: session {} expiree", self.server));
+                return Err(format!(
+                    "Server closed connection: session {} expiree",
+                    self.server
+                ));
             }
             return Ok(resp);
         }
@@ -109,10 +117,15 @@ impl RemoteClient {
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let body = serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        let body =
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         let resp = self.send(&body).await?;
         if method == "initialize" {
-            if let Some(s) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()) {
+            if let Some(s) = resp
+                .headers()
+                .get("mcp-session-id")
+                .and_then(|v| v.to_str().ok())
+            {
                 *self.session.lock().await = Some(s.to_string());
             }
         }
@@ -132,8 +145,14 @@ impl RemoteClient {
                 crate::redaction::redact_text(&text.chars().take(300).collect::<String>())
             ));
         }
-        if resp.content_length().is_some_and(|l| l as usize > MAX_SSE_BYTES) {
-            return Err(format!("Read error: reponse de {} trop volumineuse", self.server));
+        if resp
+            .content_length()
+            .is_some_and(|l| l as usize > MAX_SSE_BYTES)
+        {
+            return Err(format!(
+                "Read error: reponse de {} trop volumineuse",
+                self.server
+            ));
         }
         let message = if ctype.starts_with("text/event-stream") {
             read_sse_response(resp, id).await?
@@ -146,7 +165,12 @@ impl RemoteClient {
             Value::Array(items) => items
                 .into_iter()
                 .find(|m| m.get("id").and_then(|v| v.as_u64()) == Some(id))
-                .ok_or_else(|| format!("MCP error: reponse sans l'identifiant attendu de {}", self.server))?,
+                .ok_or_else(|| {
+                    format!(
+                        "MCP error: reponse sans l'identifiant attendu de {}",
+                        self.server
+                    )
+                })?,
             m => m,
         };
         if let Some(err) = message.get("error") {
@@ -167,13 +191,18 @@ impl RemoteClient {
         if resp.status().is_success() {
             Ok(())
         } else {
-            Err(format!("MCP error: notification refusee (HTTP {})", resp.status()))
+            Err(format!(
+                "MCP error: notification refusee (HTTP {})",
+                resp.status()
+            ))
         }
     }
 
     /// Fin de session côté serveur (DELETE), au mieux.
     pub async fn close(&self) {
-        let Some(s) = self.session.lock().await.take() else { return };
+        let Some(s) = self.session.lock().await.take() else {
+            return;
+        };
         let mut req = self.http.delete(&self.url).header("Mcp-Session-Id", s);
         for (k, v) in &self.headers {
             req = req.header(k.as_str(), v.as_str());

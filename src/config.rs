@@ -102,7 +102,9 @@ impl Default for ProxyConfig {
 /// bibliothèque vivent dans .../McpHub/servers/ : leur chemin contient « McpHub » sans l'être.
 fn names_mcphub(s: &str) -> bool {
     let lower = s.to_lowercase();
-    let bundles = crate::registry::servers_dir().to_string_lossy().to_lowercase();
+    let bundles = crate::registry::servers_dir()
+        .to_string_lossy()
+        .to_lowercase();
     let lower = match lower.strip_prefix(&bundles) {
         Some(rest) => rest.to_string(),
         None => lower,
@@ -121,7 +123,10 @@ fn is_self(name: &str, config: &Value) -> bool {
         }
     }
     if let Some(args) = config.get("args").and_then(|v| v.as_array()) {
-        if args.iter().any(|a| a.as_str().map(names_mcphub).unwrap_or(false)) {
+        if args
+            .iter()
+            .any(|a| a.as_str().map(names_mcphub).unwrap_or(false))
+        {
             return true;
         }
     }
@@ -267,13 +272,17 @@ fn parse_servers(json: &Value) -> Result<HashMap<String, ServerConfig>, String> 
                 name
             ));
         }
-        let server = parse_server_entry(name, config, json.get("settings"), &|v| Ok(expand_vars(v)))?;
+        let server =
+            parse_server_entry(name, config, json.get("settings"), &|v| Ok(expand_vars(v)))?;
         result.insert(name.clone(), server);
     }
     Ok(result)
 }
 
-fn expand_string_map(value: Option<&Value>, expand: &Expander) -> Result<HashMap<String, String>, String> {
+fn expand_string_map(
+    value: Option<&Value>,
+    expand: &Expander,
+) -> Result<HashMap<String, String>, String> {
     let mut out = HashMap::new();
     if let Some(obj) = value.and_then(|v| v.as_object()) {
         for (k, v) in obj {
@@ -304,7 +313,12 @@ pub(crate) fn parse_server_entry(
         let args: Vec<String> = config
             .get("args")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str()).map(expand).collect::<Result<_, _>>())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(expand)
+                    .collect::<Result<_, _>>()
+            })
             .transpose()?
             .unwrap_or_default();
         let env = expand_string_map(config.get("env"), expand)?;
@@ -327,7 +341,11 @@ pub(crate) fn parse_server_entry(
             inherit_env: config
                 .get("inheritEnv")
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default(),
             url: None,
             headers: HashMap::new(),
@@ -337,7 +355,9 @@ pub(crate) fn parse_server_entry(
     } else if let Some(url) = config.get("url").and_then(|v| v.as_str()) {
         // Serveur distant natif : {"url": "...", "headers": {...}, "auth": "oauth" | "none"}
         let headers = expand_string_map(config.get("headers"), expand)?;
-        let has_auth_header = headers.keys().any(|k| k.eq_ignore_ascii_case("authorization"));
+        let has_auth_header = headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("authorization"));
         let oauth = match config.get("auth").and_then(|v| v.as_str()) {
             Some(a) => a.eq_ignore_ascii_case("oauth"),
             None => !has_auth_header,
@@ -385,10 +405,17 @@ pub fn read_raw(path: &Path) -> Result<Option<Value>, String> {
         Err(e) => return Err(format!("{} illisible : {}", path.display(), e)),
     };
     let json: Value = serde_json::from_str(&content).map_err(|e| {
-        format!("{} : JSON invalide ({}), corrige-le avant toute modification", path.display(), e)
+        format!(
+            "{} : JSON invalide ({}), corrige-le avant toute modification",
+            path.display(),
+            e
+        )
     })?;
     if !json.is_object() {
-        return Err(format!("{} : la racine doit etre un objet JSON", path.display()));
+        return Err(format!(
+            "{} : la racine doit etre un objet JSON",
+            path.display()
+        ));
     }
     Ok(Some(json))
 }
@@ -433,7 +460,11 @@ pub fn revision_of(bytes: Option<&[u8]>) -> String {
     use sha2::{Digest, Sha256};
     match bytes {
         None => String::new(),
-        Some(b) => Sha256::digest(b).iter().take(8).map(|x| format!("{:02x}", x)).collect(),
+        Some(b) => Sha256::digest(b)
+            .iter()
+            .take(8)
+            .map(|x| format!("{:02x}", x))
+            .collect(),
     }
 }
 
@@ -522,7 +553,11 @@ pub fn update_raw_guarded<T>(
     };
     let (value, write) = mutate(&mut config)?;
     if !write {
-        return Ok(GuardedWrite { value, revision, backup: None });
+        return Ok(GuardedWrite {
+            value,
+            revision,
+            backup: None,
+        });
     }
     let backup = match &before {
         Some(bytes) => Some(backup_config(path, bytes)?),
@@ -536,7 +571,11 @@ pub fn update_raw_guarded<T>(
     }
     write_raw_atomic(path, &config)?;
     let revision = revision_of(read_bytes(path)?.as_deref());
-    Ok(GuardedWrite { value, revision, backup })
+    Ok(GuardedWrite {
+        value,
+        revision,
+        backup,
+    })
 }
 
 /// Fichier neuf, créé directement en 600 (la config peut contenir des secrets en clair) et
@@ -668,7 +707,8 @@ fn config_from_json(json: &Value, source_path: Option<&Path>) -> Result<ProxyCon
                 .ok_or("settings.autoUpdate doit valoir true ou false")?;
         }
         if let Some(response_cache) = settings.get("responseCache") {
-            config.response_cache = crate::response_cache::CacheSettings::from_json(response_cache)?;
+            config.response_cache =
+                crate::response_cache::CacheSettings::from_json(response_cache)?;
         }
         if let Some(permissions) = settings.get("permissions") {
             config.permissions = crate::permissions::PermissionsConfig::from_json(permissions)?;
@@ -709,7 +749,10 @@ fn get_config_paths() -> Vec<PathBuf> {
 /// erreur visible), jamais l'import des serveurs des éditeurs.
 pub fn auto_detect() -> ProxyConfig {
     try_auto_detect().unwrap_or_else(|e| {
-        eprintln!("[McpHub][ERROR] config invalide, aucun serveur charge : {}", e);
+        eprintln!(
+            "[McpHub][ERROR] config invalide, aucun serveur charge : {}",
+            e
+        );
         apply_env_overrides(ProxyConfig::default())
     })
 }
@@ -745,7 +788,9 @@ fn editors_config() -> ProxyConfig {
         return config;
     }
     for path in &get_config_paths() {
-        let Ok(content) = fs::read_to_string(path) else { continue };
+        let Ok(content) = fs::read_to_string(path) else {
+            continue;
+        };
         let Ok(json) = serde_json::from_str::<Value>(&content) else {
             eprintln!("[McpHub][WARN] {} : JSON invalide, ignore", path.display());
             continue;
@@ -872,7 +917,10 @@ mod tests {
         let auto = parse(json!({ "preload": "auto" }));
         assert_eq!(auto.preload, Preload::Auto);
         assert_eq!(auto.preload_auto_count, 5);
-        assert_eq!(parse(json!({ "preload": "auto", "preloadAutoCount": 3 })).preload_auto_count, 3);
+        assert_eq!(
+            parse(json!({ "preload": "auto", "preloadAutoCount": 3 })).preload_auto_count,
+            3
+        );
     }
 
     #[test]
@@ -891,36 +939,80 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.json");
         let _ = fs::remove_file(&path);
-        assert!(matches!(load_dedicated_from_path(&path), Dedicated::Missing));
+        assert!(matches!(
+            load_dedicated_from_path(&path),
+            Dedicated::Missing
+        ));
 
         fs::write(&path, "{\"servers\": {").unwrap();
-        assert!(matches!(load_dedicated_from_path(&path), Dedicated::Invalid(_)));
+        assert!(matches!(
+            load_dedicated_from_path(&path),
+            Dedicated::Invalid(_)
+        ));
 
-        fs::write(&path, r#"{"servers": {"a": {"command": "x", "sandbox": "sheild"}}}"#).unwrap();
-        assert!(matches!(load_dedicated_from_path(&path), Dedicated::Invalid(_)));
+        fs::write(
+            &path,
+            r#"{"servers": {"a": {"command": "x", "sandbox": "sheild"}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            load_dedicated_from_path(&path),
+            Dedicated::Invalid(_)
+        ));
 
         fs::write(&path, r#"{"servers": {"a": {"args": ["x"]}}}"#).unwrap();
-        assert!(matches!(load_dedicated_from_path(&path), Dedicated::Invalid(_)));
+        assert!(matches!(
+            load_dedicated_from_path(&path),
+            Dedicated::Invalid(_)
+        ));
 
-        fs::write(&path, r#"{"servers": {}, "settings": {"permissions": {"rules": [{"action": "dney"}]}}}"#).unwrap();
-        assert!(matches!(load_dedicated_from_path(&path), Dedicated::Invalid(_)));
+        fs::write(
+            &path,
+            r#"{"servers": {}, "settings": {"permissions": {"rules": [{"action": "dney"}]}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            load_dedicated_from_path(&path),
+            Dedicated::Invalid(_)
+        ));
 
-        fs::write(&path, r#"{"servers": {}, "settings": {"autoUpdate": "no"}}"#).unwrap();
-        assert!(matches!(load_dedicated_from_path(&path), Dedicated::Invalid(_)));
+        fs::write(
+            &path,
+            r#"{"servers": {}, "settings": {"autoUpdate": "no"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            load_dedicated_from_path(&path),
+            Dedicated::Invalid(_)
+        ));
 
-        fs::write(&path, r#"{"servers": {}, "settings": {"responseCache": {"ttlSecs": 99999}}}"#).unwrap();
-        assert!(matches!(load_dedicated_from_path(&path), Dedicated::Invalid(_)));
+        fs::write(
+            &path,
+            r#"{"servers": {}, "settings": {"responseCache": {"ttlSecs": 99999}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            load_dedicated_from_path(&path),
+            Dedicated::Invalid(_)
+        ));
 
         fs::write(&path, r#"{"servers": {}, "settings": {"responseCache": {"ttlSecs": 0, "tools": ["context7__resolve-library-id"]}}}"#).unwrap();
         match load_dedicated_from_path(&path) {
             Dedicated::Valid(c) => {
                 assert_eq!(c.response_cache.ttl_secs, 0);
-                assert!(c.response_cache.tools.contains("context7__resolve-library-id"));
+                assert!(c
+                    .response_cache
+                    .tools
+                    .contains("context7__resolve-library-id"));
             }
             _ => panic!("responseCache valide"),
         }
 
-        fs::write(&path, r#"{"servers": {}, "settings": {"autoUpdate": false}}"#).unwrap();
+        fs::write(
+            &path,
+            r#"{"servers": {}, "settings": {"autoUpdate": false}}"#,
+        )
+        .unwrap();
         match load_dedicated_from_path(&path) {
             Dedicated::Valid(c) => assert!(!c.auto_update),
             _ => panic!("autoUpdate: false est valide"),

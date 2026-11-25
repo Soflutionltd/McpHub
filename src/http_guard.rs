@@ -18,7 +18,6 @@
 
 use std::collections::HashMap;
 
-
 const LOCAL_HOSTS: &[&str] = &["127.0.0.1", "localhost", "[::1]"];
 
 /// Sépare "hote:port" en (hote, port optionnel), en gérant les crochets IPv6.
@@ -84,7 +83,9 @@ pub fn bearer_token(headers: &HashMap<String, String>) -> Option<&str> {
     let v = headers.get("authorization")?;
     let v = v.trim();
     match (v.get(..7), v.get(7..)) {
-        (Some(scheme), Some(rest)) if scheme.eq_ignore_ascii_case("bearer ") && !rest.is_empty() => {
+        (Some(scheme), Some(rest))
+            if scheme.eq_ignore_ascii_case("bearer ") && !rest.is_empty() =>
+        {
             Some(rest.trim())
         }
         _ => None,
@@ -98,13 +99,22 @@ pub fn session_secret() -> &'static str {
     SECRET.get_or_init(|| {
         random_token()
             .map(|t| t.replacen("mcphub_", "dash_", 1))
-            .unwrap_or_else(|| format!("dash_{:x}", std::process::id() as u128 * 0x9E37_79B9_7F4A_7C15))
+            .unwrap_or_else(|| {
+                format!(
+                    "dash_{:x}",
+                    std::process::id() as u128 * 0x9E37_79B9_7F4A_7C15
+                )
+            })
     })
 }
 
 /// Jeton principal, ou secret de session (Bearer, ou `session=` pour EventSource qui ne
 /// sait pas envoyer d'en-tête).
-pub fn api_authorized(headers: &HashMap<String, String>, query_session: Option<&str>, master: &str) -> bool {
+pub fn api_authorized(
+    headers: &HashMap<String, String>,
+    query_session: Option<&str>,
+    master: &str,
+) -> bool {
     if let Some(t) = bearer_token(headers) {
         if token_matches(t, master) || token_matches(t, session_secret()) {
             return true;
@@ -115,9 +125,7 @@ pub fn api_authorized(headers: &HashMap<String, String>, query_session: Option<&
 
 /// Jeton au format actuel (32 octets aléatoires) ; sinon il est régénéré.
 pub fn token_is_current(t: &str) -> bool {
-    t.len() == 7 + 64
-        && t.starts_with("mcphub_")
-        && t[7..].bytes().all(|c| c.is_ascii_hexdigit())
+    t.len() == 7 + 64 && t.starts_with("mcphub_") && t[7..].bytes().all(|c| c.is_ascii_hexdigit())
 }
 
 fn login_path() -> std::path::PathBuf {
@@ -213,21 +221,47 @@ mod tests {
         assert!(!origin_allowed(Some("null"), 24680));
         assert!(!origin_allowed(Some("https://evil.example"), 24680));
         assert!(!origin_allowed(Some("http://127.0.0.1"), 24680));
-        assert!(!origin_allowed(Some("http://127.0.0.1:24680.evil.example"), 24680));
+        assert!(!origin_allowed(
+            Some("http://127.0.0.1:24680.evil.example"),
+            24680
+        ));
         assert!(!origin_allowed(Some("http://localhost:3000"), 24680));
     }
 
     #[test]
     fn api_auth_bearer_ou_session() {
         let tok = "mcphub_abc";
-        assert!(api_authorized(&h(&[("authorization", "Bearer mcphub_abc")]), None, tok));
-        assert!(api_authorized(&h(&[("authorization", "bearer mcphub_abc")]), None, tok));
+        assert!(api_authorized(
+            &h(&[("authorization", "Bearer mcphub_abc")]),
+            None,
+            tok
+        ));
+        assert!(api_authorized(
+            &h(&[("authorization", "bearer mcphub_abc")]),
+            None,
+            tok
+        ));
         let bearer = format!("Bearer {}", session_secret());
-        assert!(api_authorized(&h(&[("authorization", bearer.as_str())]), None, tok));
+        assert!(api_authorized(
+            &h(&[("authorization", bearer.as_str())]),
+            None,
+            tok
+        ));
         assert!(api_authorized(&h(&[]), Some(session_secret()), tok));
-        assert!(!api_authorized(&h(&[]), Some(tok), tok), "le jeton principal ne passe pas en URL");
-        assert!(!api_authorized(&h(&[("authorization", "Bearer nope")]), None, tok));
-        assert!(!api_authorized(&h(&[("cookie", "mcphub_session=mcphub_abc")]), None, tok));
+        assert!(
+            !api_authorized(&h(&[]), Some(tok), tok),
+            "le jeton principal ne passe pas en URL"
+        );
+        assert!(!api_authorized(
+            &h(&[("authorization", "Bearer nope")]),
+            None,
+            tok
+        ));
+        assert!(!api_authorized(
+            &h(&[("cookie", "mcphub_session=mcphub_abc")]),
+            None,
+            tok
+        ));
         assert!(!token_matches("mcphub_ab", tok));
         let mut padded = tok.to_string();
         padded.push_str(&"\0".repeat(256));
@@ -242,8 +276,15 @@ mod tests {
         assert_eq!(bearer_token(&h(&[("authorization", "Beareré x")])), None);
         assert_eq!(bearer_token(&h(&[("authorization", "ééééé")])), None);
         assert_eq!(bearer_token(&h(&[("authorization", "Bearer ")])), None);
-        assert_eq!(bearer_token(&h(&[("authorization", "Bearer é")])), Some("é"));
-        assert!(!api_authorized(&h(&[("authorization", "\u{FFFD}\u{FFFD}\u{FFFD}")]), None, "mcphub_abc"));
+        assert_eq!(
+            bearer_token(&h(&[("authorization", "Bearer é")])),
+            Some("é")
+        );
+        assert!(!api_authorized(
+            &h(&[("authorization", "\u{FFFD}\u{FFFD}\u{FFFD}")]),
+            None,
+            "mcphub_abc"
+        ));
     }
 
     #[test]

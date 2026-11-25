@@ -65,7 +65,10 @@ pub fn get_auth_token() -> String {
     if written.is_err() {
         let _ = fs::remove_file(&tmp);
     } else {
-        eprintln!("[McpHub][SECURITY] Nouveau jeton d'authentification genere dans {}", path.display());
+        eprintln!(
+            "[McpHub][SECURITY] Nouveau jeton d'authentification genere dans {}",
+            path.display()
+        );
     }
     token
 }
@@ -85,7 +88,9 @@ fn binary_path() -> PathBuf {
 fn read_config() -> Result<Value, Vec<u8>> {
     match crate::config::read_raw(&config_path()) {
         Ok(Some(c)) => Ok(c),
-        Ok(None) => Ok(json!({"mcpServers": {}, "settings": {"mode": "discover", "idleTimeout": 300}})),
+        Ok(None) => {
+            Ok(json!({"mcpServers": {}, "settings": {"mode": "discover", "idleTimeout": 300}}))
+        }
         Err(e) => Err(json_err(409, &e)),
     }
 }
@@ -119,12 +124,20 @@ fn summarize_cache(cache: &Value) -> CacheSummary {
                         .as_array()
                         .map(|arr| {
                             arr.iter()
-                                .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+                                .filter_map(|t| {
+                                    t.get("name").and_then(|n| n.as_str()).map(String::from)
+                                })
                                 .collect()
                         })
                         .unwrap_or_default();
                     let schema_tokens = tools.to_string().len() / 4;
-                    (name.clone(), CachedServer { tool_names, schema_tokens })
+                    (
+                        name.clone(),
+                        CachedServer {
+                            tool_names,
+                            schema_tokens,
+                        },
+                    )
                 })
                 .collect()
         })
@@ -153,8 +166,13 @@ static CACHE_SUMMARY: Mutex<Option<(CacheStamp, Arc<CacheSummary>)>> = Mutex::ne
 fn read_cache_summary() -> Option<Arc<CacheSummary>> {
     let path = cache_path();
     let metadata = fs::metadata(&path).ok()?;
-    let stamp = metadata.modified().ok().map(|modified| (modified, metadata.len()));
-    let mut slot = CACHE_SUMMARY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let stamp = metadata
+        .modified()
+        .ok()
+        .map(|modified| (modified, metadata.len()));
+    let mut slot = CACHE_SUMMARY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let (Some(stamp), Some((cached_stamp, summary))) = (stamp, slot.as_ref()) {
         if stamp == *cached_stamp {
             return Some(Arc::clone(summary));
@@ -302,7 +320,10 @@ async fn handle_streamable_http_message(
     }
     let mut responses = Vec::new();
     for request in requests {
-        if let Some(resp) = proxy.handle_request_in_profile(request, profile.clone()).await {
+        if let Some(resp) = proxy
+            .handle_request_in_profile(request, profile.clone())
+            .await
+        {
             responses.push(resp);
         }
     }
@@ -339,7 +360,10 @@ fn prefers_french(accept_language: &str) -> bool {
 fn oauth_callback_page(page: OauthPage, french: bool) -> String {
     let (tone, icon) = match page {
         OauthPage::Connected => ("ok", r#"<path pathLength="1" d="M5 12.5l4.5 4.5L19 7.5"/>"#),
-        OauthPage::Denied => ("denied", r#"<path pathLength="1" d="M7 7l10 10"/><path pathLength="1" d="M17 7L7 17"/>"#),
+        OauthPage::Denied => (
+            "denied",
+            r#"<path pathLength="1" d="M7 7l10 10"/><path pathLength="1" d="M17 7L7 17"/>"#,
+        ),
         OauthPage::Expired => (
             "expired",
             r#"<path pathLength="1" d="M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z"/><path pathLength="1" d="M12 7v5l3 2"/>"#,
@@ -636,9 +660,14 @@ fn handle_get_settings() -> Vec<u8> {
 /// Tenant déclaré et serveur qui lui appartient.
 fn tenant_server(server: &str, tenant: &str) -> Result<crate::tenant::TenantDef, String> {
     let tenants = crate::tenant::load_from(&crate::tenant::projects_path())?;
-    let def = tenants.get(tenant).ok_or_else(|| format!("tenant {} inconnu", tenant))?;
+    let def = tenants
+        .get(tenant)
+        .ok_or_else(|| format!("tenant {} inconnu", tenant))?;
     if !def.owns(server) {
-        return Err(format!("{} n'est pas un serveur du tenant {}", server, tenant));
+        return Err(format!(
+            "{} n'est pas un serveur du tenant {}",
+            server, tenant
+        ));
     }
     Ok(def.clone())
 }
@@ -652,14 +681,18 @@ async fn tenant_oauth_login(server: &str, tenant: &str) -> Vec<u8> {
         Err(e) => return json_err(400, &e),
     };
     let base = server.to_string();
-    let derived = tokio::task::spawn_blocking(move || crate::tenant::derive_from_vault(&def, &base)).await;
+    let derived =
+        tokio::task::spawn_blocking(move || crate::tenant::derive_from_vault(&def, &base)).await;
     let config = match derived {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => return json_err(400, &e),
         Err(e) => return json_err(500, &e.to_string()),
     };
     let Some(url) = config.url.filter(|_| config.oauth) else {
-        return json_err(400, "serveur sans OAuth gere par McpHub (pas d'url ou auth != oauth)");
+        return json_err(
+            400,
+            "serveur sans OAuth gere par McpHub (pas d'url ou auth != oauth)",
+        );
     };
     let instance = crate::tenant::instance_name(server, tenant);
     match crate::oauth::prepare_login(&instance, &url, None).await {
@@ -1208,10 +1241,16 @@ async fn handle_get_tenants(proxy: Option<Arc<ProxyServer>>) -> Vec<u8> {
                 continue;
             };
             for server in servers.iter_mut() {
-                let instance = server.get("instance").and_then(|i| i.as_str()).unwrap_or_default().to_string();
+                let instance = server
+                    .get("instance")
+                    .and_then(|i| i.as_str())
+                    .unwrap_or_default()
+                    .to_string();
                 server["running"] = json!(p.instance_running(&instance).await);
                 server["metrics"] = match metrics.get(&instance) {
-                    Some(m) => json!({ "calls": m.call_count, "errors": m.error_count, "last_error": m.last_error }),
+                    Some(m) => {
+                        json!({ "calls": m.call_count, "errors": m.error_count, "last_error": m.last_error })
+                    }
                     None => Value::Null,
                 };
             }
@@ -1278,7 +1317,11 @@ async fn handle_add_tenant(proxy: Option<Arc<ProxyServer>>, body: &str) -> Vec<u
         Ok(v) => v,
         Err(_) => return json_err(400, "JSON invalide"),
     };
-    let (id, dir, version) = match (required_str(&data, "id"), required_str(&data, "dir"), required_str(&data, "version")) {
+    let (id, dir, version) = match (
+        required_str(&data, "id"),
+        required_str(&data, "dir"),
+        required_str(&data, "version"),
+    ) {
         (Ok(i), Ok(d), Ok(v)) => (i.to_string(), PathBuf::from(d.trim()), v.to_string()),
         (Err(r), _, _) | (_, Err(r), _) | (_, _, Err(r)) => return r,
     };
@@ -1309,7 +1352,11 @@ async fn handle_add_tenant(proxy: Option<Arc<ProxyServer>>, body: &str) -> Vec<u
 
 /// `DELETE /api/tenants/<id>` : fenêtre macOS native obligatoire (ni la page ni un agent ne
 /// peuvent la valider), puis effacement du coffre, du HOME isolé et de l'entrée.
-async fn handle_remove_tenant(proxy: Option<Arc<ProxyServer>>, id: &str, version: Option<String>) -> Vec<u8> {
+async fn handle_remove_tenant(
+    proxy: Option<Arc<ProxyServer>>,
+    id: &str,
+    version: Option<String>,
+) -> Vec<u8> {
     let Some(version) = version else {
         return json_err(400, "version requise");
     };
@@ -1324,7 +1371,11 @@ async fn handle_remove_tenant(proxy: Option<Arc<ProxyServer>>, id: &str, version
         },
         Err(e) => return json_err(500, &e),
     };
-    let folders: Vec<String> = def.workspaces.iter().map(|w| format!("  {}", w.display())).collect();
+    let folders: Vec<String> = def
+        .workspaces
+        .iter()
+        .map(|w| format!("  {}", w.display()))
+        .collect();
     let message = format!(
         "Retirer le compte client \"{}\" de McpHub ?\n\nIRREVERSIBLE : tous ses secrets et jetons OAuth seront effaces du Trousseau, ainsi que son dossier isole. Le projet {} reste dans projects.json, sans tenant.\n\nDossiers :\n{}",
         id,
@@ -1346,9 +1397,11 @@ async fn handle_remove_tenant(proxy: Option<Arc<ProxyServer>>, id: &str, version
     reset_tenant(&proxy, id).await;
     let path = crate::tenant::projects_path();
     let task_id = id.to_string();
-    let purged = tokio::task::spawn_blocking(move || crate::tenant::purge_tenant(&path, &task_id, Some(&version)))
-        .await
-        .unwrap_or_else(|e| Err(e.to_string()));
+    let purged = tokio::task::spawn_blocking(move || {
+        crate::tenant::purge_tenant(&path, &task_id, Some(&version))
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()));
     let outcome = purged.as_ref().map(|_| ()).map_err(Clone::clone);
     audit_tenant_action(&proxy, id, "tenant.remove".into(), &outcome).await;
     match purged {
@@ -1359,7 +1412,11 @@ async fn handle_remove_tenant(proxy: Option<Arc<ProxyServer>>, id: &str, version
 }
 
 /// `PUT /api/tenants/<id>/servers` : {servers: {serveur: [VARIABLES]}, shared: [serveurs], version}.
-async fn handle_set_tenant_servers(proxy: Option<Arc<ProxyServer>>, id: &str, body: &str) -> Vec<u8> {
+async fn handle_set_tenant_servers(
+    proxy: Option<Arc<ProxyServer>>,
+    id: &str,
+    body: &str,
+) -> Vec<u8> {
     let data: Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(_) => return json_err(400, "JSON invalide"),
@@ -1368,7 +1425,8 @@ async fn handle_set_tenant_servers(proxy: Option<Arc<ProxyServer>>, id: &str, bo
         Ok(v) => v.to_string(),
         Err(r) => return r,
     };
-    let mut servers: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    let mut servers: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
     let Some(raw_servers) = data.get("servers").and_then(|s| s.as_object()) else {
         return json_err(400, "servers requis (objet serveur -> liste de variables)");
     };
@@ -1380,13 +1438,22 @@ async fn handle_set_tenant_servers(proxy: Option<Arc<ProxyServer>>, id: &str, bo
         for v in vars {
             match v.as_str() {
                 Some(name) => names.push(name.to_string()),
-                None => return json_err(400, &format!("servers.{} : noms de variables attendus", server)),
+                None => {
+                    return json_err(
+                        400,
+                        &format!("servers.{} : noms de variables attendus", server),
+                    )
+                }
             }
         }
         servers.insert(server.clone(), names);
     }
     let shared: Vec<String> = match data.get("shared").and_then(|s| s.as_array()) {
-        Some(items) => match items.iter().map(|v| v.as_str().map(String::from)).collect::<Option<Vec<_>>>() {
+        Some(items) => match items
+            .iter()
+            .map(|v| v.as_str().map(String::from))
+            .collect::<Option<Vec<_>>>()
+        {
             Some(list) => list,
             None => return json_err(400, "shared : noms de serveurs attendus"),
         },
@@ -1396,9 +1463,12 @@ async fn handle_set_tenant_servers(proxy: Option<Arc<ProxyServer>>, id: &str, bo
     let task_id = id.to_string();
     let written = tokio::task::spawn_blocking(move || {
         let known = crate::tenant::configured_servers()?.into_keys().collect();
-        crate::tenant::edit_projects(&path, &version, &format!("serveurs-tenant-{}", task_id), |json| {
-            crate::tenant::set_servers(json, &task_id, &servers, &shared, &known)
-        })
+        crate::tenant::edit_projects(
+            &path,
+            &version,
+            &format!("serveurs-tenant-{}", task_id),
+            |json| crate::tenant::set_servers(json, &task_id, &servers, &shared, &known),
+        )
     })
     .await
     .unwrap_or_else(|e| Err(e.to_string()));
@@ -1418,18 +1488,36 @@ fn declared_secret(id: &str, name: &str) -> Result<(), Vec<u8>> {
     if !crate::vault::is_valid_name(name) || name.starts_with(crate::oauth::VAULT_PREFIX) {
         return Err(json_err(400, "nom de secret invalide"));
     }
-    let tenants = crate::tenant::load_from(&crate::tenant::projects_path()).map_err(|e| json_err(500, &e))?;
-    let def = tenants.get(id).ok_or_else(|| json_err(404, &format!("tenant {} inconnu", id)))?;
-    if def.credentials.values().any(|vars| vars.values().any(|n| n == name)) {
+    let tenants =
+        crate::tenant::load_from(&crate::tenant::projects_path()).map_err(|e| json_err(500, &e))?;
+    let def = tenants
+        .get(id)
+        .ok_or_else(|| json_err(404, &format!("tenant {} inconnu", id)))?;
+    if def
+        .credentials
+        .values()
+        .any(|vars| vars.values().any(|n| n == name))
+    {
         Ok(())
     } else {
-        Err(json_err(400, &format!("{} n'est pas un secret declare par les serveurs du tenant {}", name, id)))
+        Err(json_err(
+            400,
+            &format!(
+                "{} n'est pas un secret declare par les serveurs du tenant {}",
+                name, id
+            ),
+        ))
     }
 }
 
 /// `PUT /api/tenants/<id>/secrets/<NOM>` : {value}. Écriture seule : la valeur part vers le
 /// coffre du tenant et n'est jamais renvoyée ni journalisée.
-async fn handle_set_tenant_secret(proxy: Option<Arc<ProxyServer>>, id: &str, name: &str, body: &str) -> Vec<u8> {
+async fn handle_set_tenant_secret(
+    proxy: Option<Arc<ProxyServer>>,
+    id: &str,
+    name: &str,
+    body: &str,
+) -> Vec<u8> {
     if body.len() > SECRET_BODY_MAX {
         return json_err(413, "valeur trop longue (16 Ko au plus)");
     }
@@ -1469,7 +1557,11 @@ async fn handle_set_tenant_secret(proxy: Option<Arc<ProxyServer>>, id: &str, nam
 }
 
 /// `DELETE /api/tenants/<id>/secrets/<NOM>`.
-async fn handle_delete_tenant_secret(proxy: Option<Arc<ProxyServer>>, id: &str, name: &str) -> Vec<u8> {
+async fn handle_delete_tenant_secret(
+    proxy: Option<Arc<ProxyServer>>,
+    id: &str,
+    name: &str,
+) -> Vec<u8> {
     if let Err(resp) = declared_secret(id, name) {
         return resp;
     }
@@ -1479,7 +1571,13 @@ async fn handle_delete_tenant_secret(proxy: Option<Arc<ProxyServer>>, id: &str, 
         .await
         .unwrap_or_else(|e| Err(e.to_string()));
     let outcome = deleted.as_ref().map(|_| ()).map_err(Clone::clone);
-    audit_tenant_action(&proxy, id, format!("tenant.secret_delete {}", name), &outcome).await;
+    audit_tenant_action(
+        &proxy,
+        id,
+        format!("tenant.secret_delete {}", name),
+        &outcome,
+    )
+    .await;
     match deleted {
         Ok(existed) => {
             reset_tenant(&proxy, id).await;
@@ -1494,7 +1592,9 @@ async fn handle_check_tenant(id: &str) -> Vec<u8> {
     let task_id = id.to_string();
     let checked = tokio::task::spawn_blocking(move || {
         let tenants = crate::tenant::load_from(&crate::tenant::projects_path())?;
-        let def = tenants.get(&task_id).ok_or_else(|| format!("tenant {} inconnu", task_id))?;
+        let def = tenants
+            .get(&task_id)
+            .ok_or_else(|| format!("tenant {} inconnu", task_id))?;
         Ok::<_, String>(
             def.credentials
                 .keys()
@@ -1786,13 +1886,19 @@ fn open_login_page() {
         eprintln!("[McpHub] Impossible de creer le lien de connexion.");
         return;
     };
-    let url = format!("http://127.0.0.1:{}/login?nonce={}", crate::instance::port(), nonce);
+    let url = format!(
+        "http://127.0.0.1:{}/login?nonce={}",
+        crate::instance::port(),
+        nonce
+    );
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(&url).spawn();
     #[cfg(target_os = "linux")]
     let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
     #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd").args(["/c", "start", &url]).spawn();
+    let _ = std::process::Command::new("cmd")
+        .args(["/c", "start", &url])
+        .spawn();
 }
 
 /// Start full server: dashboard + SSE transport. For `McpHub serve` and default mode.
@@ -1927,12 +2033,13 @@ async fn handle_connection(
     let expected_auth = format!("Bearer {}", auth_token);
 
     // Anti DNS rebinding et anti requêtes envoyées par des sites tiers.
-    if !crate::http_guard::host_allowed(req.headers.get("host").map(|s| s.as_str()), crate::instance::port())
-        || !crate::http_guard::origin_allowed(
-            req.headers.get("origin").map(|s| s.as_str()),
-            crate::instance::port(),
-        )
-    {
+    if !crate::http_guard::host_allowed(
+        req.headers.get("host").map(|s| s.as_str()),
+        crate::instance::port(),
+    ) || !crate::http_guard::origin_allowed(
+        req.headers.get("origin").map(|s| s.as_str()),
+        crate::instance::port(),
+    ) {
         eprintln!(
             "[McpHub][SECURITY] Requete refusee (Host={:?}, Origin={:?}) {} {}",
             req.headers.get("host"),
@@ -2101,8 +2208,7 @@ async fn handle_connection(
                         let line_trim = line.trim();
                         if !line_trim.is_empty() {
                             let json_msg = serde_json::json!({ "line": line_trim });
-                            let event =
-                                format!("event: message\ndata: {}\n\n", json_msg);
+                            let event = format!("event: message\ndata: {}\n\n", json_msg);
                             if stream.write_all(event.as_bytes()).await.is_err() {
                                 break;
                             }
@@ -2150,7 +2256,9 @@ mod oauth_page_tests {
         }
         assert!(oauth_callback_page(OauthPage::Connected, true).contains("Connexion réussie"));
         assert!(oauth_callback_page(OauthPage::Connected, false).contains("You're connected"));
-        assert!(oauth_callback_page(OauthPage::Expired, false).contains("McpHub oauth login SERVER"));
+        assert!(
+            oauth_callback_page(OauthPage::Expired, false).contains("McpHub oauth login SERVER")
+        );
     }
 }
 
@@ -2167,9 +2275,15 @@ mod cache_summary_tests {
         });
         let summary = summarize_cache(&cache);
         let cf = &summary.servers["cf"];
-        assert_eq!(cf.tool_names, vec!["deploy".to_string(), "rollback".to_string()]);
+        assert_eq!(
+            cf.tool_names,
+            vec!["deploy".to_string(), "rollback".to_string()]
+        );
         assert_eq!(cf.schema_tokens, tools.to_string().len() / 4);
-        assert_eq!(summary.errors.get("broken").map(String::as_str), Some("spawn failed"));
+        assert_eq!(
+            summary.errors.get("broken").map(String::as_str),
+            Some("spawn failed")
+        );
         assert!(!summary.errors.contains_key("ignored"));
     }
 

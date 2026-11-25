@@ -34,7 +34,10 @@ fn sandbox_profile() -> String {
             .iter()
             .map(|f| format!("(literal {})", q(&format!("{}/{}", home, f)))),
     );
-    denied.push(format!("(subpath {})", q(&format!("{}/Library/Keychains", home))));
+    denied.push(format!(
+        "(subpath {})",
+        q(&format!("{}/Library/Keychains", home))
+    ));
     denied.extend(crate::instance::sandbox_hub_rules(&home));
     format!(
         "(version 1)(allow default)(deny network*)(deny file-write*)(allow file-write-data (literal \"/dev/null\"))(deny file-read* {})(deny process-exec (literal \"/usr/bin/security\") (literal \"/bin/launchctl\") (literal \"/usr/bin/osascript\") (literal \"/usr/bin/open\"))",
@@ -80,7 +83,10 @@ pub async fn read_line_limited<R: tokio::io::AsyncBufRead + Unpin>(
 
 /// Version de Node (majeure, mineure) via `node --version`.
 pub fn node_version(node: &PathBuf) -> Option<(u32, u32)> {
-    let out = std::process::Command::new(node).arg("--version").output().ok()?;
+    let out = std::process::Command::new(node)
+        .arg("--version")
+        .output()
+        .ok()?;
     let v = String::from_utf8_lossy(&out.stdout);
     let mut parts = v.trim().trim_start_matches('v').split('.');
     Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
@@ -138,7 +144,10 @@ fn node_major(path: &Path) -> u32 {
     // ~/.nvm/versions/node/v25.0.0/bin/node -> 25
     path.components()
         .filter_map(|c| c.as_os_str().to_str())
-        .find_map(|s| s.strip_prefix('v').and_then(|r| r.split('.').next()?.parse().ok()))
+        .find_map(|s| {
+            s.strip_prefix('v')
+                .and_then(|r| r.split('.').next()?.parse().ok())
+        })
         .unwrap_or(0)
 }
 
@@ -160,10 +169,14 @@ pub fn find_node(cfg: &CodeModeConfig) -> Option<PathBuf> {
     candidates.retain(|p| p.exists());
     candidates.sort_by_key(|p| std::cmp::Reverse(node_major(p)));
     candidates.extend(
-        ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"]
-            .iter()
-            .map(PathBuf::from)
-            .filter(|p| p.exists()),
+        [
+            "/opt/homebrew/bin/node",
+            "/usr/local/bin/node",
+            "/usr/bin/node",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .filter(|p| p.exists()),
     );
     candidates
         .into_iter()
@@ -229,7 +242,10 @@ pub struct RunPolicy {
     pinned: HashMap<String, serde_json::Map<String, Value>>,
 }
 
-fn policy_server_list(policy: &serde_json::Map<String, Value>, key: &str) -> Result<Option<HashSet<String>>, String> {
+fn policy_server_list(
+    policy: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<HashSet<String>>, String> {
     let Some(value) = policy.get(key) else {
         return Ok(None);
     };
@@ -273,7 +289,10 @@ impl RunPolicy {
             for (server, args) in servers {
                 let key = crate::proxy::normalize_server_key(server);
                 let Some(args) = args.as_object().filter(|_| !key.is_empty()) else {
-                    return Err(format!("pinned_args for server \"{}\" must be an object", server));
+                    return Err(format!(
+                        "pinned_args for server \"{}\" must be an object",
+                        server
+                    ));
                 };
                 if policy.pinned.insert(key, args.clone()).is_some() {
                     return Err(format!("pinned_args names server \"{}\" twice", server));
@@ -288,7 +307,10 @@ impl RunPolicy {
         let key = crate::proxy::normalize_server_key(server);
         let allowed = self.allowed.as_ref().is_none_or(|list| list.contains(&key));
         if self.denied.contains(&key) || !allowed {
-            return Err(format!("Server \"{}\" is not allowed by the project policy.", server));
+            return Err(format!(
+                "Server \"{}\" is not allowed by the project policy.",
+                server
+            ));
         }
         Ok(())
     }
@@ -332,7 +354,10 @@ impl RunPolicy {
 
 /// `project_id`, `projectId` et `Project-ID` désignent le même argument.
 fn normalize_arg_key(key: &str) -> String {
-    key.chars().filter(|c| c.is_ascii_alphanumeric()).map(|c| c.to_ascii_lowercase()).collect()
+    key.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
 }
 
 /// Faux dès qu'un argument du même nom, à n'importe quelle profondeur et quelle que soit
@@ -343,7 +368,9 @@ fn pinned_value_respected(value: &Value, normalized_key: &str, expected: &Value)
             (normalize_arg_key(key) != normalized_key || child == expected)
                 && pinned_value_respected(child, normalized_key, expected)
         }),
-        Value::Array(items) => items.iter().all(|item| pinned_value_respected(item, normalized_key, expected)),
+        Value::Array(items) => items
+            .iter()
+            .all(|item| pinned_value_respected(item, normalized_key, expected)),
         _ => true,
     }
 }
@@ -351,7 +378,8 @@ fn pinned_value_respected(value: &Value, normalized_key: &str, expected: &Value)
 /// Résultat de `mcphub_run` renvoyé à l'appelant. `"policy": "enforced"` n'apparaît que si une
 /// règle de projet a été fournie et appliquée à cette exécution.
 pub fn run_payload(calls: usize, duration_ms: u64, logs: Value, policy_enforced: bool) -> Value {
-    let mut payload = serde_json::json!({ "calls": calls, "duration_ms": duration_ms, "logs": logs });
+    let mut payload =
+        serde_json::json!({ "calls": calls, "duration_ms": duration_ms, "logs": logs });
     if policy_enforced {
         payload["policy"] = serde_json::json!("enforced");
     }
@@ -397,7 +425,10 @@ mod tests {
 
     #[test]
     fn simplification_des_resultats() {
-        assert_eq!(simplify_result(&json!({"structuredContent": {"a": 1}, "content": []})), json!({"a": 1}));
+        assert_eq!(
+            simplify_result(&json!({"structuredContent": {"a": 1}, "content": []})),
+            json!({"a": 1})
+        );
         assert_eq!(
             simplify_result(&json!({"content": [{"type":"text","text":"[1,2]"}]})),
             json!([1, 2])
@@ -423,12 +454,19 @@ mod tests {
         // Meme normalisation que la resolution des serveurs : casse, tirets, underscores.
         assert!(p.check_call("SUPABASE", &json!({})).is_ok());
         assert!(p.check_call("cloudflare_docs", &json!({})).is_ok());
-        assert!(p.check_call("mcphub", &json!({})).is_err(), "les outils internes aussi");
+        assert!(
+            p.check_call("mcphub", &json!({})).is_err(),
+            "les outils internes aussi"
+        );
         assert!(p.check_call("", &json!({})).is_err());
         // Liste vide : rien n'est joignable.
-        assert!(policy(json!({"allowed_servers": []})).check_server("supabase").is_err());
+        assert!(policy(json!({"allowed_servers": []}))
+            .check_server("supabase")
+            .is_err());
         // Sans policy de serveurs : tout passe.
-        assert!(policy(json!({})).check_call("github", &json!({"a": 1})).is_ok());
+        assert!(policy(json!({}))
+            .check_call("github", &json!({"a": 1}))
+            .is_ok());
     }
 
     #[test]
@@ -442,7 +480,9 @@ mod tests {
             );
         }
         // Refuse meme s'il figure aussi dans allowed_servers.
-        let p = policy(json!({"allowed_servers": ["stripe", "supabase"], "denied_servers": ["stripe"]}));
+        let p = policy(
+            json!({"allowed_servers": ["stripe", "supabase"], "denied_servers": ["stripe"]}),
+        );
         assert!(p.check_server("stripe").is_err());
         assert!(p.check_server("supabase").is_ok());
     }
@@ -450,24 +490,54 @@ mod tests {
     #[test]
     fn policy_pinned_args() {
         let p = policy(json!({"pinned_args": {"supabase": {"project_id": "xyz"}}}));
-        assert!(p.check_call("supabase", &json!({"project_id": "xyz", "query": "select 1"})).is_ok());
+        assert!(p
+            .check_call(
+                "supabase",
+                &json!({"project_id": "xyz", "query": "select 1"})
+            )
+            .is_ok());
         assert_eq!(
-            p.check_call("supabase", &json!({"project_id": "autre"})).unwrap_err(),
+            p.check_call("supabase", &json!({"project_id": "autre"}))
+                .unwrap_err(),
             "project_id mismatch for server \"supabase\""
         );
-        assert!(p.check_call("Supa-Base", &json!({"project_id": "autre"})).is_err());
-        assert!(p.check_call("supabase", &json!({"project_id": null})).is_err());
+        assert!(p
+            .check_call("Supa-Base", &json!({"project_id": "autre"}))
+            .is_err());
+        assert!(p
+            .check_call("supabase", &json!({"project_id": null}))
+            .is_err());
         // Cle absente : l'appel passe tel quel.
-        assert!(p.check_call("supabase", &json!({"query": "select 1"})).is_ok());
+        assert!(p
+            .check_call("supabase", &json!({"query": "select 1"}))
+            .is_ok());
         assert!(p.check_call("supabase", &json!(null)).is_ok());
         // Les autres serveurs ne sont pas concernes.
-        assert!(p.check_call("github", &json!({"project_id": "autre"})).is_ok());
+        assert!(p
+            .check_call("github", &json!({"project_id": "autre"}))
+            .is_ok());
         // Une autre ecriture de la cle, ou une cle imbriquee, ne contourne pas la regle.
-        assert!(p.check_call("supabase", &json!({"projectId": "autre"})).is_err());
-        assert!(p.check_call("supabase", &json!({"Project-ID": "autre"})).is_err());
-        assert!(p.check_call("supabase", &json!({"options": {"project_id": "autre"}})).is_err());
-        assert!(p.check_call("supabase", &json!({"batch": [{"projectId": "xyz"}, {"projectId": "autre"}]})).is_err());
-        assert!(p.check_call("supabase", &json!({"projectId": "xyz", "options": {"project_id": "xyz"}})).is_ok());
+        assert!(p
+            .check_call("supabase", &json!({"projectId": "autre"}))
+            .is_err());
+        assert!(p
+            .check_call("supabase", &json!({"Project-ID": "autre"}))
+            .is_err());
+        assert!(p
+            .check_call("supabase", &json!({"options": {"project_id": "autre"}}))
+            .is_err());
+        assert!(p
+            .check_call(
+                "supabase",
+                &json!({"batch": [{"projectId": "xyz"}, {"projectId": "autre"}]})
+            )
+            .is_err());
+        assert!(p
+            .check_call(
+                "supabase",
+                &json!({"projectId": "xyz", "options": {"project_id": "xyz"}})
+            )
+            .is_ok());
     }
 
     #[test]
@@ -480,7 +550,9 @@ mod tests {
             {"tool": "sans_serveur"},
             "texte"
         ]);
-        let allowed = policy(json!({"allowed_servers": ["supabase", "stripe"], "denied_servers": ["stripe"]}));
+        let allowed = policy(
+            json!({"allowed_servers": ["supabase", "stripe"], "denied_servers": ["stripe"]}),
+        );
         assert_eq!(
             allowed.filter_search_results(&results, 10),
             json!([
@@ -488,13 +560,27 @@ mod tests {
                 {"server": "Supabase", "tool": "execute_sql"}
             ])
         );
-        assert_eq!(allowed.filter_search_results(&results, 1).as_array().unwrap().len(), 1);
+        assert_eq!(
+            allowed
+                .filter_search_results(&results, 1)
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
         let denied = policy(json!({"denied_servers": ["stripe"]}));
         let kept = denied.filter_search_results(&results, 10);
         assert_eq!(kept.as_array().unwrap().len(), 3);
-        assert!(kept.as_array().unwrap().iter().all(|r| r["server"] != "stripe"));
+        assert!(kept
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["server"] != "stripe"));
         // Une reponse qui n'est pas une liste ne laisse rien passer.
-        assert_eq!(allowed.filter_search_results(&json!({"available_servers": ["github"]}), 10), json!([]));
+        assert_eq!(
+            allowed.filter_search_results(&json!({"available_servers": ["github"]}), 10),
+            json!([])
+        );
         // Filtre `server` de mcp.search hors liste : erreur.
         assert!(allowed.check_server("github").is_err());
         assert!(allowed.check_server("stripe").is_err());
@@ -516,7 +602,11 @@ mod tests {
             json!({"pinned_args": {"supabase": {"a": 1}, "Supa-base": {"a": 2}}}),
             json!({"allowed_server": ["supabase"]}),
         ] {
-            assert!(RunPolicy::from_json(&invalid).is_err(), "{} doit etre refusee", invalid);
+            assert!(
+                RunPolicy::from_json(&invalid).is_err(),
+                "{} doit etre refusee",
+                invalid
+            );
         }
     }
 
@@ -525,14 +615,24 @@ mod tests {
         let def = tool_definition();
         let policy = &def["inputSchema"]["properties"]["policy"];
         assert_eq!(policy["type"], "object");
-        assert_eq!(policy["description"], "Set by the McpHub client, not by the model.");
-        assert_eq!(def["inputSchema"]["required"], json!(["code"]), "policy reste optionnelle");
+        assert_eq!(
+            policy["description"],
+            "Set by the McpHub client, not by the model."
+        );
+        assert_eq!(
+            def["inputSchema"]["required"],
+            json!(["code"]),
+            "policy reste optionnelle"
+        );
     }
 
     #[test]
     fn policy_enforced_seulement_si_appliquee() {
         let with = run_payload(2, 15, json!(["a"]), true);
-        assert_eq!(with, json!({"calls": 2, "duration_ms": 15, "logs": ["a"], "policy": "enforced"}));
+        assert_eq!(
+            with,
+            json!({"calls": 2, "duration_ms": 15, "logs": ["a"], "policy": "enforced"})
+        );
         let without = run_payload(2, 15, json!([]), false);
         assert!(without.get("policy").is_none());
         assert_eq!(without, json!({"calls": 2, "duration_ms": 15, "logs": []}));
@@ -542,7 +642,9 @@ mod tests {
     fn reglages() {
         assert!(parse(None).enabled);
         assert!(!parse(Some(&json!({"codeMode": false}))).enabled);
-        let c = parse(Some(&json!({"codeMode": {"timeoutSecs": 1000, "maxCalls": 5}})));
+        let c = parse(Some(
+            &json!({"codeMode": {"timeoutSecs": 1000, "maxCalls": 5}}),
+        ));
         assert_eq!(c.timeout_secs, 300);
         assert_eq!(c.max_calls, 5);
     }
@@ -560,7 +662,10 @@ mod tests {
     async fn ligne_bornee() {
         let data = b"court\n".to_vec();
         let mut r = tokio::io::BufReader::new(&data[..]);
-        assert_eq!(read_line_limited(&mut r, 10).await.unwrap().as_deref(), Some("court"));
+        assert_eq!(
+            read_line_limited(&mut r, 10).await.unwrap().as_deref(),
+            Some("court")
+        );
         assert_eq!(read_line_limited(&mut r, 10).await.unwrap(), None);
         let big = [b'x'; 100];
         let mut r = tokio::io::BufReader::new(&big[..]);
@@ -569,7 +674,10 @@ mod tests {
 
     #[test]
     fn version_node() {
-        assert_eq!(node_major(&PathBuf::from("/u/.nvm/versions/node/v25.0.0/bin/node")), 25);
+        assert_eq!(
+            node_major(&PathBuf::from("/u/.nvm/versions/node/v25.0.0/bin/node")),
+            25
+        );
         assert_eq!(node_major(&PathBuf::from("/opt/homebrew/bin/node")), 0);
     }
 }

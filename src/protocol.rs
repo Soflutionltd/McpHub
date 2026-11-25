@@ -88,7 +88,11 @@ impl JsonRpcResponse {
             jsonrpc: "2.0".into(),
             id,
             result: None,
-            error: Some(JsonRpcError { code, message, data: None }),
+            error: Some(JsonRpcError {
+                code,
+                message,
+                data: None,
+            }),
         }
     }
 
@@ -99,7 +103,11 @@ impl JsonRpcResponse {
             jsonrpc: "2.0".into(),
             id,
             result: None,
-            error: Some(JsonRpcError { code, message, data: Some(data) }),
+            error: Some(JsonRpcError {
+                code,
+                message,
+                data: Some(data),
+            }),
         }
     }
 
@@ -209,7 +217,11 @@ pub struct ToolDef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annotations: Option<Value>,
     /// Schéma de sortie (structuredContent), relayé tel quel.
-    #[serde(rename = "outputSchema", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "outputSchema",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub output_schema: Option<Value>,
 }
 
@@ -250,8 +262,13 @@ impl ToolContent {
 /// Révisions MCP à poignée de main (`initialize`) que McpHub implémente, la plus récente en
 /// premier. La révision 2026-07-28 (sans `initialize`, avec `server/discover`) n'en fait pas
 /// partie : l'annoncer serait promettre un protocole que McpHub ne parle pas.
-pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
-    &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07"];
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+    "2024-10-07",
+];
 
 pub const LATEST_PROTOCOL_VERSION: &str = SUPPORTED_PROTOCOL_VERSIONS[0];
 

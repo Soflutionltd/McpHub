@@ -439,9 +439,15 @@ mod tests {
             mock_tool("listOrders", "Returns data"),
         ]);
         let results = engine.search("user profile", 5);
-        assert_eq!(results.first().map(|t| t.original_name.as_str()), Some("getUserProfile"));
+        assert_eq!(
+            results.first().map(|t| t.original_name.as_str()),
+            Some("getUserProfile")
+        );
         let results = engine.search("orders", 5);
-        assert_eq!(results.first().map(|t| t.original_name.as_str()), Some("listOrders"));
+        assert_eq!(
+            results.first().map(|t| t.original_name.as_str()),
+            Some("listOrders")
+        );
     }
 
     #[test]
@@ -494,11 +500,11 @@ mod tests {
                 tool_def: ToolDef {
                     name: "create_issue".to_string(),
                     description: "Create a GitHub issue".to_string(),
-                input_schema: json!({"type": "object"}),
-                ..Default::default()
+                    input_schema: json!({"type": "object"}),
+                    ..Default::default()
+                },
+                untrusted_output: false,
             },
-            untrusted_output: false,
-        },
             IndexedTool {
                 name: "supabase__execute_sql".to_string(),
                 original_name: "execute_sql".to_string(),
@@ -507,11 +513,11 @@ mod tests {
                 tool_def: ToolDef {
                     name: "execute_sql".to_string(),
                     description: "Execute SQL on Supabase".to_string(),
-                input_schema: json!({"type": "object"}),
-                ..Default::default()
+                    input_schema: json!({"type": "object"}),
+                    ..Default::default()
+                },
+                untrusted_output: false,
             },
-            untrusted_output: false,
-        },
         ];
         engine.build_index(tools);
 
@@ -533,11 +539,11 @@ mod tests {
                 tool_def: ToolDef {
                     name: "recall".to_string(),
                     description: "Recall memories".to_string(),
-                input_schema: json!({"type": "object"}),
-                ..Default::default()
+                    input_schema: json!({"type": "object"}),
+                    ..Default::default()
+                },
+                untrusted_output: false,
             },
-            untrusted_output: false,
-        },
             IndexedTool {
                 name: "supabase__execute_sql".to_string(),
                 original_name: "execute_sql".to_string(),
@@ -546,11 +552,11 @@ mod tests {
                 tool_def: ToolDef {
                     name: "execute_sql".to_string(),
                     description: "Execute SQL".to_string(),
-                input_schema: json!({"type": "object"}),
-                ..Default::default()
+                    input_schema: json!({"type": "object"}),
+                    ..Default::default()
+                },
+                untrusted_output: false,
             },
-            untrusted_output: false,
-        },
             IndexedTool {
                 name: "github__create_issue".to_string(),
                 original_name: "create_issue".to_string(),
@@ -559,11 +565,11 @@ mod tests {
                 tool_def: ToolDef {
                     name: "create_issue".to_string(),
                     description: "Create issue".to_string(),
-                input_schema: json!({"type": "object"}),
-                ..Default::default()
+                    input_schema: json!({"type": "object"}),
+                    ..Default::default()
+                },
+                untrusted_output: false,
             },
-            untrusted_output: false,
-        },
         ]);
 
         assert_eq!(
@@ -588,11 +594,11 @@ mod tests {
                 tool_def: ToolDef {
                     name: "search".to_string(),
                     description: "Search GitHub".to_string(),
-                input_schema: json!({"type": "object"}),
-                ..Default::default()
+                    input_schema: json!({"type": "object"}),
+                    ..Default::default()
+                },
+                untrusted_output: false,
             },
-            untrusted_output: false,
-        },
             IndexedTool {
                 name: "exa__search".to_string(),
                 original_name: "search".to_string(),
@@ -601,11 +607,11 @@ mod tests {
                 tool_def: ToolDef {
                     name: "search".to_string(),
                     description: "Search web".to_string(),
-                input_schema: json!({"type": "object"}),
-                ..Default::default()
+                    input_schema: json!({"type": "object"}),
+                    ..Default::default()
+                },
+                untrusted_output: false,
             },
-            untrusted_output: false,
-        },
         ]);
 
         assert_eq!(engine.infer_server_from_tool_query("search"), None);
@@ -623,11 +629,11 @@ mod tests {
                 tool_def: ToolDef {
                     name: "browser_navigate".to_string(),
                     description: "Navigate browser".to_string(),
-                input_schema: json!({"type": "object"}),
-                ..Default::default()
+                    input_schema: json!({"type": "object"}),
+                    ..Default::default()
+                },
+                untrusted_output: false,
             },
-            untrusted_output: false,
-        },
             IndexedTool {
                 name: "playwright__browser_navigate".to_string(),
                 original_name: "browser_navigate".to_string(),
@@ -636,11 +642,11 @@ mod tests {
                 tool_def: ToolDef {
                     name: "browser_navigate".to_string(),
                     description: "Navigate browser".to_string(),
-                input_schema: json!({"type": "object"}),
-                ..Default::default()
+                    input_schema: json!({"type": "object"}),
+                    ..Default::default()
+                },
+                untrusted_output: false,
             },
-            untrusted_output: false,
-        },
         ]);
 
         assert_eq!(

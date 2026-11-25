@@ -29,7 +29,13 @@ const PREVIEW_MAX: usize = 900;
 /// Texte de la fenêtre. Si les arguments sont trop longs pour être affichés en entier, on le
 /// dit clairement et on liste toutes les clés : un argument dangereux ne peut pas se cacher
 /// derrière un remplissage.
-pub fn build_message(server: &str, tool: &str, reason: &str, args: &serde_json::Value, origin: &str) -> String {
+pub fn build_message(
+    server: &str,
+    tool: &str,
+    reason: &str,
+    args: &serde_json::Value,
+    origin: &str,
+) -> String {
     let pretty = serde_json::to_string_pretty(args).unwrap_or_default();
     let total = pretty.chars().count();
     let args_block = if total > PREVIEW_MAX {
@@ -124,7 +130,13 @@ mod tests {
     #[test]
     fn message_borne_et_lisible() {
         let args = serde_json::json!({"aaa": "x".repeat(5000), "drop": "production"});
-        let m = build_message("supabase", "delete_branch", "nom destructeur", &args, "Cursor");
+        let m = build_message(
+            "supabase",
+            "delete_branch",
+            "nom destructeur",
+            &args,
+            "Cursor",
+        );
         assert!(m.contains("supabase") && m.contains("delete_branch"));
         assert!(m.len() < 2200);
         assert!(m.contains("ATTENTION"));

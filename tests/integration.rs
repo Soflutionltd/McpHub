@@ -7,7 +7,14 @@ fn binary_reports_crate_version() {
         .arg("version")
         .output()
         .expect("le binaire McpHub doit se lancer");
-    assert!(output.status.success(), "code de sortie : {:?}", output.status);
+    assert!(
+        output.status.success(),
+        "code de sortie : {:?}",
+        output.status
+    );
     let stdout = String::from_utf8(output.stdout).expect("sortie en UTF-8");
-    assert_eq!(stdout.trim(), format!("McpHub v{}", env!("CARGO_PKG_VERSION")));
+    assert_eq!(
+        stdout.trim(),
+        format!("McpHub v{}", env!("CARGO_PKG_VERSION"))
+    );
 }

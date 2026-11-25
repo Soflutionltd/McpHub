@@ -63,7 +63,9 @@ fn valid_name(name: &str) -> bool {
     (1..=32).contains(&name.len())
         && !name.starts_with('-')
         && !name.ends_with('-')
-        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 /// Résout l'instance depuis les variables d'environnement données.
@@ -79,21 +81,26 @@ pub fn resolve(env: impl Fn(&str) -> Option<String>, home: &Path) -> Result<Inst
         }
     }
 
-    let port = match var("MCPHUB_PORT") {
-        Some(raw) => {
-            let port: u16 = raw
-                .parse()
-                .map_err(|_| format!("MCPHUB_PORT=\"{}\" is not a port number", raw))?;
-            if port < 1024 {
-                return Err(format!("MCPHUB_PORT={} is reserved: use 1024 or above", port));
+    let port =
+        match var("MCPHUB_PORT") {
+            Some(raw) => {
+                let port: u16 = raw
+                    .parse()
+                    .map_err(|_| format!("MCPHUB_PORT=\"{}\" is not a port number", raw))?;
+                if port < 1024 {
+                    return Err(format!(
+                        "MCPHUB_PORT={} is reserved: use 1024 or above",
+                        port
+                    ));
+                }
+                port
             }
-            port
-        }
-        None if name.is_some() => {
-            return Err("MCPHUB_PORT is required with MCPHUB_INSTANCE (each instance needs its own port)".into())
-        }
-        None => DEFAULT_PORT,
-    };
+            None if name.is_some() => return Err(
+                "MCPHUB_PORT is required with MCPHUB_INSTANCE (each instance needs its own port)"
+                    .into(),
+            ),
+            None => DEFAULT_PORT,
+        };
     if name.is_some() && port == DEFAULT_PORT {
         return Err(format!(
             "MCPHUB_PORT={} belongs to the main instance: pick another port for MCPHUB_INSTANCE",
@@ -112,7 +119,12 @@ pub fn resolve(env: impl Fn(&str) -> Option<String>, home: &Path) -> Result<Inst
         (None, None) => DEFAULT_SERVICE.to_string(),
     };
 
-    Ok(Instance { name, hub_dir, port, vault_service })
+    Ok(Instance {
+        name,
+        hub_dir,
+        port,
+        vault_service,
+    })
 }
 
 fn from_process_env() -> Result<Instance, String> {
@@ -155,13 +167,19 @@ pub fn sandbox_hub_rules(home: &str) -> Vec<String> {
         .chars()
         .flat_map(|c| {
             let special = "\\.^$|?*+()[]{}\"".contains(c);
-            special.then_some('\\').into_iter().chain(std::iter::once(c))
+            special
+                .then_some('\\')
+                .into_iter()
+                .chain(std::iter::once(c))
         })
         .collect();
     let mut rules = vec![format!("(regex #\"^{}/\\.McpHub(-[^/]*)?(/|$)\")", escaped)];
     let own = hub_dir().to_string_lossy().to_string();
     if !own.starts_with(&format!("{}/.McpHub", home)) {
-        rules.push(format!("(subpath \"{}\")", own.replace('\\', "\\\\").replace('"', "\\\"")));
+        rules.push(format!(
+            "(subpath \"{}\")",
+            own.replace('\\', "\\\\").replace('"', "\\\"")
+        ));
     }
     rules
 }
@@ -172,7 +190,10 @@ mod tests {
     use std::collections::HashMap;
 
     fn resolve_with(vars: &[(&str, &str)]) -> Result<Instance, String> {
-        let map: HashMap<String, String> = vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let map: HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         resolve(|key| map.get(key).cloned(), Path::new("/home/dev"))
     }
 
@@ -189,7 +210,8 @@ mod tests {
 
     #[test]
     fn a_named_instance_shares_nothing_with_the_main_one() {
-        let instance = resolve_with(&[("MCPHUB_INSTANCE", "acme"), ("MCPHUB_PORT", "24690")]).unwrap();
+        let instance =
+            resolve_with(&[("MCPHUB_INSTANCE", "acme"), ("MCPHUB_PORT", "24690")]).unwrap();
         assert_eq!(instance.hub_dir, PathBuf::from("/home/dev/.McpHub-acme"));
         assert_eq!(instance.port, 24690);
         assert_eq!(instance.vault_service, "McpHub-acme");
@@ -213,16 +235,25 @@ mod tests {
     #[test]
     fn the_sandbox_hides_every_instance_folder() {
         let rules = sandbox_hub_rules("/Users/dev.name");
-        assert_eq!(rules[0], r#"(regex #"^/Users/dev\.name/\.McpHub(-[^/]*)?(/|$)")"#);
+        assert_eq!(
+            rules[0],
+            r#"(regex #"^/Users/dev\.name/\.McpHub(-[^/]*)?(/|$)")"#
+        );
     }
 
     #[test]
     fn misconfigured_instances_are_refused() {
-        assert!(resolve_with(&[("MCPHUB_INSTANCE", "acme")]).unwrap_err().contains("MCPHUB_PORT is required"));
-        assert!(resolve_with(&[("MCPHUB_INSTANCE", "acme"), ("MCPHUB_PORT", "24680")])
+        assert!(resolve_with(&[("MCPHUB_INSTANCE", "acme")])
             .unwrap_err()
-            .contains("main instance"));
-        assert!(resolve_with(&[("MCPHUB_INSTANCE", "Acme Corp"), ("MCPHUB_PORT", "24690")]).is_err());
+            .contains("MCPHUB_PORT is required"));
+        assert!(
+            resolve_with(&[("MCPHUB_INSTANCE", "acme"), ("MCPHUB_PORT", "24680")])
+                .unwrap_err()
+                .contains("main instance")
+        );
+        assert!(
+            resolve_with(&[("MCPHUB_INSTANCE", "Acme Corp"), ("MCPHUB_PORT", "24690")]).is_err()
+        );
         assert!(resolve_with(&[("MCPHUB_INSTANCE", "../x"), ("MCPHUB_PORT", "24690")]).is_err());
         assert!(resolve_with(&[("MCPHUB_PORT", "80")]).is_err());
         assert!(resolve_with(&[("MCPHUB_PORT", "abc")]).is_err());

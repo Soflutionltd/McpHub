@@ -29,6 +29,20 @@ tokio::task_local! {
     static CALL_TENANT: Option<String>;
 }
 
+/// Le dossier de la session d'un appel : son `working_dir`, sinon le dossier du client McpHub.
+fn session_root(origin: &CallOrigin) -> Option<std::path::PathBuf> {
+    origin.working_dir.clone().or_else(|| origin.cwd.clone())
+}
+
+/// Les arguments tels que le cache les distingue : avec le dossier de la session, pour qu'un
+/// serveur qui répond selon le projet ne serve jamais à une session le résultat d'une autre.
+fn cache_args(arguments: &serde_json::Value) -> serde_json::Value {
+    match crate::child::call_root() {
+        Some(root) => serde_json::json!({ "arguments": arguments, "root": root.to_string_lossy() }),
+        None => arguments.clone(),
+    }
+}
+
 /// Fenêtres de confirmation au plus par exécution de `mcphub_run`.
 const MAX_DIALOGS_PER_RUN: usize = 3;
 
@@ -39,14 +53,22 @@ static DIALOG_OPEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 
 fn controls_computer(server: &str) -> bool {
     let s = server.to_ascii_lowercase();
-    ["desktop-commander", "computer", "applescript", "osascript", "macos-automator", "peekaboo"]
-        .iter()
-        .any(|k| s.contains(k))
+    [
+        "desktop-commander",
+        "computer",
+        "applescript",
+        "osascript",
+        "macos-automator",
+        "peekaboo",
+    ]
+    .iter()
+    .any(|k| s.contains(k))
 }
 
 /// Refus récents (empreinte de l'appel) : on ne redemande pas la même chose pendant 5 minutes.
 fn recent_denials() -> std::sync::MutexGuard<'static, HashMap<String, Instant>> {
-    static D: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Instant>>> = std::sync::OnceLock::new();
+    static D: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Instant>>> =
+        std::sync::OnceLock::new();
     D.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -75,8 +97,7 @@ pub fn current_profile() -> Option<String> {
         })
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, serde::Serialize, Default)]
 pub struct ServerMetrics {
     pub call_count: u64,
     pub error_count: u64,
@@ -84,7 +105,6 @@ pub struct ServerMetrics {
     pub last_call_time: Option<SystemTime>,
     pub last_error: Option<String>,
 }
-
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GlobalMetrics {
@@ -280,7 +300,13 @@ impl ProxyServer {
     /// Seul chemin vers une instance `serveur@tenant`.
     async fn route_call(&self, ctx: &Context, server: &str) -> Result<Route, String> {
         let route = crate::tenant::route(ctx, server)?;
-        if let (Route::Tenant { server, instance, .. }, Context::Tenant(def)) = (&route, ctx) {
+        if let (
+            Route::Tenant {
+                server, instance, ..
+            },
+            Context::Tenant(def),
+        ) = (&route, ctx)
+        {
             self.ensure_instance(def.clone(), server, instance).await?;
         }
         Ok(route)
@@ -298,10 +324,11 @@ impl ProxyServer {
         }
         let base = server.to_string();
         // Lectures du Trousseau : bloquantes, hors du fil asynchrone.
-        let derived = tokio::task::spawn_blocking(move || crate::tenant::derive_from_vault(&def, &base))
-            .await
-            .map_err(|e| format!("instance {} : {}", instance, e))
-            .and_then(|r| r);
+        let derived =
+            tokio::task::spawn_blocking(move || crate::tenant::derive_from_vault(&def, &base))
+                .await
+                .map_err(|e| format!("instance {} : {}", instance, e))
+                .and_then(|r| r);
         let config = match derived {
             Ok(config) => config,
             Err(e) => {
@@ -311,7 +338,9 @@ impl ProxyServer {
                 return Err(e);
             }
         };
-        self.child_manager.set_instance_config(instance, config).await;
+        self.child_manager
+            .set_instance_config(instance, config)
+            .await;
         self.tenants.mark_derived(instance);
         Ok(())
     }
@@ -414,7 +443,12 @@ impl ProxyServer {
             Err(e) => (None, Some(format!("serveur indisponible : {}", e))),
         };
         let reason = live_block.or_else(|| {
-            crate::toolguard::block_reason(server, tool, tool_def.as_ref(), current_profile().as_deref())
+            crate::toolguard::block_reason(
+                server,
+                tool,
+                tool_def.as_ref(),
+                current_profile().as_deref(),
+            )
         });
         if let Some(reason) = reason {
             self.record_audit(AuditEntry {
@@ -445,7 +479,13 @@ impl ProxyServer {
             .map(|t| t.declared_destructive())
             .unwrap_or(false);
         let decision = permissions.decide_with(server, tool, declared_destructive);
-        let target = GateTarget { mode, server, instance: route.key(), tool, arguments };
+        let target = GateTarget {
+            mode,
+            server,
+            instance: route.key(),
+            tool,
+            arguments,
+        };
         self.permission_gate(id, target, confirmation_token, &permissions, decision)
             .await
     }
@@ -464,7 +504,8 @@ impl ProxyServer {
             source: "mcphub:install".into(),
             reason: Some("installe et lance un nouveau serveur MCP sur cette machine".into()),
         };
-        self.hub_gate_with(id, "library", tool, arguments, confirmation_token, default).await
+        self.hub_gate_with(id, "library", tool, arguments, confirmation_token, default)
+            .await
     }
 
     /// Contrôle d'un outil interne : une règle explicite `server: "mcphub"` l'emporte, sinon
@@ -480,7 +521,13 @@ impl ProxyServer {
     ) -> PolicyGate {
         let permissions = self.config.lock().await.permissions.clone();
         let decision = permissions.rule_for("mcphub", tool).unwrap_or(default);
-        let target = GateTarget { mode, server: "mcphub", instance: "mcphub", tool, arguments };
+        let target = GateTarget {
+            mode,
+            server: "mcphub",
+            instance: "mcphub",
+            tool,
+            arguments,
+        };
         self.permission_gate(id, target, confirmation_token, &permissions, decision)
             .await
     }
@@ -493,7 +540,13 @@ impl ProxyServer {
         permissions: &crate::permissions::PermissionsConfig,
         decision: crate::permissions::Decision,
     ) -> PolicyGate {
-        let GateTarget { mode, server, instance, tool, arguments } = target;
+        let GateTarget {
+            mode,
+            server,
+            instance,
+            tool,
+            arguments,
+        } = target;
         if DIALOG_OPEN.load(std::sync::atomic::Ordering::SeqCst) > 0 && controls_computer(server) {
             return PolicyGate::Respond(JsonRpcResponse::error(
                 id.clone(),
@@ -558,18 +611,18 @@ impl ProxyServer {
                         let policy_src = policy_src.clone();
                         let rid = id.clone();
                         async move {
-                        self.record_audit(entry).await;
-                        PolicyGate::Respond(JsonRpcResponse::error_with_data(
-                            rid,
-                            -32001,
-                            msg,
-                            serde_json::json!({
-                                "server": server,
-                                "tool": tool,
-                                "policy": policy_src,
-                                "hint": "Ne pas reessayer automatiquement : demander a l'utilisateur ce qu'il souhaite."
-                            }),
-                        ))
+                            self.record_audit(entry).await;
+                            PolicyGate::Respond(JsonRpcResponse::error_with_data(
+                                rid,
+                                -32001,
+                                msg,
+                                serde_json::json!({
+                                    "server": server,
+                                    "tool": tool,
+                                    "policy": policy_src,
+                                    "hint": "Ne pas reessayer automatiquement : demander a l'utilisateur ce qu'il souhaite."
+                                }),
+                            ))
                         }
                     };
                     // Même demande refusée il y a moins de 5 minutes : pas de harcèlement.
@@ -580,14 +633,19 @@ impl ProxyServer {
                     };
                     if recently_denied {
                         return deny(
-                            format!("{}/{} : refuse par l'utilisateur il y a moins de 5 minutes.", server, tool),
+                            format!(
+                                "{}/{} : refuse par l'utilisateur il y a moins de 5 minutes.",
+                                server, tool
+                            ),
                             "human_denied",
                         )
                         .await;
                     }
                     let in_code = CODE_RUN.try_with(|c| c.clone()).ok();
                     if let Some(counter) = &in_code {
-                        if counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= MAX_DIALOGS_PER_RUN {
+                        if counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                            >= MAX_DIALOGS_PER_RUN
+                        {
                             return deny(
                                 format!("Code mode : plus de {} confirmations dans une meme execution, refuse.", MAX_DIALOGS_PER_RUN),
                                 "deny",
@@ -607,10 +665,12 @@ impl ProxyServer {
                         origin.push_str(", code mode (mcphub_run)");
                     }
                     let preview = crate::audit::safe_arguments(arguments);
-                    let message =
-                        crate::confirm_dialog::build_message(instance, tool, &reason, &preview, &origin);
+                    let message = crate::confirm_dialog::build_message(
+                        instance, tool, &reason, &preview, &origin,
+                    );
                     DIALOG_OPEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let answer = crate::confirm_dialog::ask(message, permissions.dialog_timeout_secs).await;
+                    let answer =
+                        crate::confirm_dialog::ask(message, permissions.dialog_timeout_secs).await;
                     DIALOG_OPEN.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     match answer {
                         crate::confirm_dialog::DialogAnswer::Allow => {
@@ -860,7 +920,8 @@ impl ProxyServer {
         // Préchauffer pour arrêter trente minutes plus tard ne sert qu'au premier appel : ces
         // serveurs restent en vie, sauf réglage contraire.
         if keep_preloaded_warm {
-            self.child_manager.set_keep_warm(preload_names.iter().cloned());
+            self.child_manager
+                .set_keep_warm(preload_names.iter().cloned());
         }
         if !preload_names.is_empty() {
             tokio::spawn(preload_servers(
@@ -1092,7 +1153,9 @@ impl ProxyServer {
         req: JsonRpcRequest,
         profile: Option<String>,
     ) -> Option<JsonRpcResponse> {
-        REQUEST_PROFILE.scope(profile, self.handle_request(req)).await
+        REQUEST_PROFILE
+            .scope(profile, self.handle_request(req))
+            .await
     }
 
     pub async fn handle_request(&self, req: JsonRpcRequest) -> Option<JsonRpcResponse> {
@@ -1374,7 +1437,11 @@ impl ProxyServer {
         let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
         let ctx = match self.call_context(&CallOrigin::from_args(&args)) {
             Ok(ctx) => ctx,
-            Err(reason) => return self.refuse_for_tenant(id, None, "*", "mcphub_search", reason).await,
+            Err(reason) => {
+                return self
+                    .refuse_for_tenant(id, None, "*", "mcphub_search", reason)
+                    .await
+            }
         };
         let explicit_server_filter = args
             .get("server")
@@ -1434,16 +1501,17 @@ impl ProxyServer {
             .unwrap_or(false);
 
         if engine.tool_count() > 0 && !should_try_live_discovery {
-            let allowed_servers = if effective_server_filter.is_some() || profile.is_some() || tenant_scoped {
-                Some(
-                    visible_server_names
-                        .iter()
-                        .cloned()
-                        .collect::<HashSet<String>>(),
-                )
-            } else {
-                None
-            };
+            let allowed_servers =
+                if effective_server_filter.is_some() || profile.is_some() || tenant_scoped {
+                    Some(
+                        visible_server_names
+                            .iter()
+                            .cloned()
+                            .collect::<HashSet<String>>(),
+                    )
+                } else {
+                    None
+                };
             // Tous les résultats classés (des références, quelques milliers au plus) : le filtre de
             // profil passe avant la pagination, et offset/has_more restent justes au-delà de 50.
             let results = engine.search_filtered_with_usage(
@@ -1569,7 +1637,9 @@ impl ProxyServer {
             let live_key = match self.route_call(&ctx, filter).await {
                 Ok(route) => route.key().to_string(),
                 Err(reason) => {
-                    return self.refuse_for_tenant(id, Some(&ctx), filter, "mcphub_search", reason).await
+                    return self
+                        .refuse_for_tenant(id, Some(&ctx), filter, "mcphub_search", reason)
+                        .await
                 }
             };
             match self.child_manager.start_server(&live_key).await {
@@ -1577,8 +1647,13 @@ impl ProxyServer {
                     let tools: Vec<ToolDef> = crate::toolguard::present_tools(filter, &tools)
                         .into_iter()
                         .filter(|t| {
-                            crate::toolguard::block_reason(filter, &t.name, Some(t), profile.as_deref())
-                                .is_none()
+                            crate::toolguard::block_reason(
+                                filter,
+                                &t.name,
+                                Some(t),
+                                profile.as_deref(),
+                            )
+                            .is_none()
                         })
                         .collect();
                     let live_results = live_discover_results(filter, &tools, query, top_k);
@@ -1702,7 +1777,9 @@ impl ProxyServer {
             .call_context(&CallOrigin::from_args(&args))
             .ok()
             .and_then(|ctx| ctx.tenant_id().map(String::from));
-        CALL_TENANT.scope(tenant, Box::pin(self.handle_run_in(id, args))).await
+        let root = session_root(&CallOrigin::from_args(&args));
+        let run = CALL_TENANT.scope(tenant, Box::pin(self.handle_run_in(id, args)));
+        crate::child::CALL_ROOT.scope(root, run).await
     }
 
     async fn handle_run_in(
@@ -1713,7 +1790,11 @@ impl ProxyServer {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         let cfg = self.config.lock().await.code_mode.clone();
         if !cfg.enabled {
-            return JsonRpcResponse::error(id, -32001, "Code mode desactive (settings.codeMode)".into());
+            return JsonRpcResponse::error(
+                id,
+                -32001,
+                "Code mode desactive (settings.codeMode)".into(),
+            );
         }
         let Some(code) = args.get("code").and_then(|v| v.as_str()).map(String::from) else {
             return JsonRpcResponse::error(id, -32602, "Missing 'code' parameter".into());
@@ -1721,11 +1802,18 @@ impl ProxyServer {
         // Les appels du programme partent avec le dossier de l'appelant : même cloisonnement.
         let run_origin = CallOrigin::from_args(&args).to_json();
         // Règles de projet : contrôlées avant de lancer quoi que ce soit.
-        let policy = match args.get("policy").map(crate::codemode::RunPolicy::from_json) {
+        let policy = match args
+            .get("policy")
+            .map(crate::codemode::RunPolicy::from_json)
+        {
             None => None,
             Some(Ok(policy)) => Some(policy),
             Some(Err(e)) => {
-                return JsonRpcResponse::error(id, -32602, format!("Invalid 'policy' parameter: {}", e));
+                return JsonRpcResponse::error(
+                    id,
+                    -32602,
+                    format!("Invalid 'policy' parameter: {}", e),
+                );
             }
         };
         let timeout_secs = args
@@ -1742,7 +1830,13 @@ impl ProxyServer {
         };
         let mut child = match crate::codemode::spawn(&node) {
             Ok(c) => c,
-            Err(e) => return JsonRpcResponse::error(id, -32000, format!("Code mode : lancement impossible : {}", e)),
+            Err(e) => {
+                return JsonRpcResponse::error(
+                    id,
+                    -32000,
+                    format!("Code mode : lancement impossible : {}", e),
+                )
+            }
         };
         let (Some(mut stdin), Some(stdout), Some(stderr)) =
             (child.stdin.take(), child.stdout.take(), child.stderr.take())
@@ -1763,13 +1857,18 @@ impl ProxyServer {
         });
         let start = serde_json::json!({ "t": "start", "code": code }).to_string() + "\n";
         if stdin.write_all(start.as_bytes()).await.is_err() {
-            return JsonRpcResponse::error(id, -32000, "Code mode : envoi du code impossible".into());
+            return JsonRpcResponse::error(
+                id,
+                -32000,
+                "Code mode : envoi du code impossible".into(),
+            );
         }
         let started = Instant::now();
         let run_state = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
         let mut calls = 0usize;
-        let mut outcome: Result<serde_json::Value, String> = Err("le programme s'est arrete sans resultat".into());
+        let mut outcome: Result<serde_json::Value, String> =
+            Err("le programme s'est arrete sans resultat".into());
         let mut logs = serde_json::Value::Array(vec![]);
         loop {
             let line = match tokio::time::timeout_at(
@@ -1793,7 +1892,9 @@ impl ProxyServer {
                 outcome = Err(format!("temps depasse ({} s)", timeout_secs));
                 break;
             }
-            let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+            let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
             let kind = msg.get("t").and_then(|v| v.as_str()).unwrap_or("");
             let req_id = msg.get("id").cloned().unwrap_or(serde_json::Value::Null);
             let reply = match kind {
@@ -1819,7 +1920,10 @@ impl ProxyServer {
                         // l'exécution au-delà de timeout_secs.
                         let Ok(resp) = tokio::time::timeout_at(
                             deadline,
-                            CODE_RUN.scope(run_state.clone(), Box::pin(self.handle_execute(None, call_args))),
+                            CODE_RUN.scope(
+                                run_state.clone(),
+                                Box::pin(self.handle_execute(None, call_args)),
+                            ),
                         )
                         .await
                         else {
@@ -1832,17 +1936,27 @@ impl ProxyServer {
                             break;
                         };
                         match (resp.result, resp.error) {
-                            (_, Some(err)) => serde_json::json!({"id": req_id, "ok": false, "error": err.message}),
+                            (_, Some(err)) => {
+                                serde_json::json!({"id": req_id, "ok": false, "error": err.message})
+                            }
                             (Some(res), None) => {
-                                if res.get("_mcphub").and_then(|m| m.get("status")).and_then(|s| s.as_str()) == Some("confirmation_required") {
+                                if res
+                                    .get("_mcphub")
+                                    .and_then(|m| m.get("status"))
+                                    .and_then(|s| s.as_str())
+                                    == Some("confirmation_required")
+                                {
                                     serde_json::json!({"id": req_id, "ok": false, "error": "confirmation par jeton impossible dans le code : appeler cet outil directement avec mcphub_call"})
-                                } else if res.get("isError").and_then(|v| v.as_bool()) == Some(true) {
+                                } else if res.get("isError").and_then(|v| v.as_bool()) == Some(true)
+                                {
                                     serde_json::json!({"id": req_id, "ok": false, "error": crate::codemode::simplify_result(&res)})
                                 } else {
                                     serde_json::json!({"id": req_id, "ok": true, "result": crate::codemode::simplify_result(&res)})
                                 }
                             }
-                            (None, None) => serde_json::json!({"id": req_id, "ok": true, "result": null}),
+                            (None, None) => {
+                                serde_json::json!({"id": req_id, "ok": true, "result": null})
+                            }
                         }
                     }
                 }
@@ -1866,10 +1980,16 @@ impl ProxyServer {
                         if let Some(server) = server_filter {
                             search_args["server"] = serde_json::json!(server);
                         }
-                        let Ok(resp) =
-                            tokio::time::timeout_at(deadline, Box::pin(self.handle_discover(None, search_args))).await
+                        let Ok(resp) = tokio::time::timeout_at(
+                            deadline,
+                            Box::pin(self.handle_discover(None, search_args)),
+                        )
+                        .await
                         else {
-                            outcome = Err(format!("temps depasse ({} s) pendant une recherche", timeout_secs));
+                            outcome = Err(format!(
+                                "temps depasse ({} s) pendant une recherche",
+                                timeout_secs
+                            ));
                             break;
                         };
                         let result = resp
@@ -1894,7 +2014,11 @@ impl ProxyServer {
                 }
                 "error" => {
                     logs = msg.get("logs").cloned().unwrap_or(logs);
-                    outcome = Err(msg.get("message").and_then(|v| v.as_str()).unwrap_or("erreur").to_string());
+                    outcome = Err(msg
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("erreur")
+                        .to_string());
                     break;
                 }
                 _ => continue,
@@ -1951,11 +2075,14 @@ impl ProxyServer {
         confirmation_token: Option<&str>,
     ) -> JsonRpcResponse {
         if crate::server_admin::is_admin_tool(tool) {
-            return self.handle_admin_tool(id, tool, arguments, confirmation_token).await;
+            return self
+                .handle_admin_tool(id, tool, arguments, confirmation_token)
+                .await;
         }
         if crate::registry::is_install_tool(tool) {
-            if let PolicyGate::Respond(response) =
-                self.hub_tool_gate(&id, tool, &arguments, confirmation_token).await
+            if let PolicyGate::Respond(response) = self
+                .hub_tool_gate(&id, tool, &arguments, confirmation_token)
+                .await
             {
                 return response;
             }
@@ -1964,7 +2091,11 @@ impl ProxyServer {
         let mut outcome = crate::registry::agent_call(tool, &arguments).await;
         if let Ok(v) = &mut outcome {
             if v.get("ok").and_then(|o| o.as_bool()) == Some(true) {
-                let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                let name = v
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 self.reload_config_now().await;
                 let tools = self.wait_for_tools(&name, 45).await;
                 v["tools"] = serde_json::json!(tools);
@@ -2030,38 +2161,52 @@ impl ProxyServer {
                 reason: None,
             },
         };
-        let (decision, policy) =
-            match self.hub_gate_with(&id, "admin", tool, &arguments, confirmation_token, default).await {
-                PolicyGate::Respond(response) => return response,
-                PolicyGate::Proceed { decision, policy } => (decision, policy),
-            };
+        let (decision, policy) = match self
+            .hub_gate_with(&id, "admin", tool, &arguments, confirmation_token, default)
+            .await
+        {
+            PolicyGate::Respond(response) => return response,
+            PolicyGate::Proceed { decision, policy } => (decision, policy),
+        };
         let started = std::time::Instant::now();
         let tenants = self.tenants.tenants();
         let tool_owned = tool.to_string();
         let args = arguments.clone();
         let mut outcome = tokio::task::spawn_blocking(move || {
-            let tenants = tenants
-                .as_ref()
-                .as_ref()
-                .map_err(|e| format!("projects.json illisible, comptes clients inconnus : {}", e))?;
+            let tenants = tenants.as_ref().as_ref().map_err(|e| {
+                format!("projects.json illisible, comptes clients inconnus : {}", e)
+            })?;
             let config_path = crate::config::dedicated_config_path();
             let servers_dir = crate::registry::servers_dir();
             crate::server_admin::call(
                 &tool_owned,
                 &args,
-                &crate::server_admin::Env { config_path: &config_path, servers_dir: &servers_dir, tenants },
+                &crate::server_admin::Env {
+                    config_path: &config_path,
+                    servers_dir: &servers_dir,
+                    tenants,
+                },
             )
         })
         .await
         .unwrap_or_else(|e| Err(format!("erreur interne : {}", e)));
         if let Ok(v) = &mut outcome {
-            let changed = crate::server_admin::is_write_tool(tool) && v.get("unchanged") != Some(&serde_json::json!(true));
+            let changed = crate::server_admin::is_write_tool(tool)
+                && v.get("unchanged") != Some(&serde_json::json!(true));
             if changed {
                 self.reload_config_now().await;
             }
             if tool == "server_add" {
-                let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
-                let tools = if v.get("missingVariables").is_some() { Vec::new() } else { self.wait_for_tools(&name, 45).await };
+                let name = v
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let tools = if v.get("missingVariables").is_some() {
+                    Vec::new()
+                } else {
+                    self.wait_for_tools(&name, 45).await
+                };
                 v["tools"] = serde_json::json!(tools);
                 v["next"] = serde_json::json!(if !tools.is_empty() {
                     format!("Ready: mcphub_call server={} tool=<one of tools>.", name)
@@ -2180,9 +2325,13 @@ impl ProxyServer {
             }
         };
         let tenant = ctx.tenant_id().map(String::from);
-        CALL_TENANT
-            .scope(tenant, Box::pin(self.handle_execute_in(id, args, ctx)))
-            .await
+        let call = CALL_TENANT.scope(tenant, Box::pin(self.handle_execute_in(id, args, ctx)));
+        // Le dossier de la session suit l'appel jusqu'au serveur ; un appel sans dossier (code mode)
+        // garde celui du `mcphub_run` qui l'a lancé.
+        match session_root(&origin) {
+            Some(root) => crate::child::CALL_ROOT.scope(Some(root), call).await,
+            None => call.await,
+        }
     }
 
     async fn handle_execute_in(
@@ -2215,14 +2364,18 @@ impl ProxyServer {
                         "gerer les serveurs McpHub est toujours refuse depuis le dossier du tenant {}",
                         t.id
                     );
-                    return self.refuse_for_tenant(id, Some(&ctx), &server, &tool, reason).await;
+                    return self
+                        .refuse_for_tenant(id, Some(&ctx), &server, &tool, reason)
+                        .await;
                 }
                 if !t.shared_servers.contains("mcphub") {
                     let reason = format!(
                         "outils internes McpHub refuses dans le dossier du tenant {} (ajouter \"mcphub\" a ses sharedServers pour les permettre)",
                         t.id
                     );
-                    return self.refuse_for_tenant(id, Some(&ctx), &server, &tool, reason).await;
+                    return self
+                        .refuse_for_tenant(id, Some(&ctx), &server, &tool, reason)
+                        .await;
                 }
             }
             let token = args.get("confirmation_token").and_then(|v| v.as_str());
@@ -2236,7 +2389,11 @@ impl ProxyServer {
             .unwrap_or_else(|| server.clone());
         let route = match self.route_call(&ctx, &canonical).await {
             Ok(route) => route,
-            Err(reason) => return self.refuse_for_tenant(id, Some(&ctx), &server, &tool, reason).await,
+            Err(reason) => {
+                return self
+                    .refuse_for_tenant(id, Some(&ctx), &server, &tool, reason)
+                    .await
+            }
         };
         let bypass_cache = args
             .get("bypass_cache")
@@ -2246,7 +2403,8 @@ impl ProxyServer {
             let config = self.config.lock().await;
             let configured_server_names: Vec<String> = config.servers.keys().cloned().collect();
             (
-                resolve_server_name(&server, &configured_server_names).unwrap_or_else(|| server.clone()),
+                resolve_server_name(&server, &configured_server_names)
+                    .unwrap_or_else(|| server.clone()),
                 config.response_cache.clone(),
             )
         };
@@ -2287,7 +2445,10 @@ impl ProxyServer {
                         return JsonRpcResponse::error(
                             id,
                             -32001,
-                            format!("Bloque par McpHub : {}/{} : {}", indexed_server_name, tool, reason),
+                            format!(
+                                "Bloque par McpHub : {}/{} : {}",
+                                indexed_server_name, tool, reason
+                            ),
                         );
                     }
                     self.record_execute_route(ExecuteRouteStrategy::UnknownToolError)
@@ -2424,7 +2585,10 @@ impl ProxyServer {
         // Relevée avant l'appel : une écriture concurrente la fait avancer.
         let cache_generation = self.response_cache.generation(&process_key);
         if cacheable {
-            if let Some(hit) = self.response_cache.get(&process_key, &tool, &arguments, epoch) {
+            if let Some(hit) =
+                self.response_cache
+                    .get(&process_key, &tool, &cache_args(&arguments), epoch)
+            {
                 let mut value = hit.value;
                 if let Some(obj) = value.as_object_mut() {
                     obj.insert(
@@ -2518,15 +2682,14 @@ impl ProxyServer {
             Ok(result) => {
                 let mut normalized = self.normalize_result_for_profile(result).await;
                 if cacheable {
-                    self.response_cache
-                        .put_if_current(
-                            &process_key,
-                            &tool,
-                            &arguments,
-                            normalized.clone(),
-                            epoch,
-                            cache_generation,
-                        );
+                    self.response_cache.put_if_current(
+                        &process_key,
+                        &tool,
+                        &cache_args(&arguments),
+                        normalized.clone(),
+                        epoch,
+                        cache_generation,
+                    );
                 }
                 if tool_untrusted {
                     if let Some(obj) = normalized.as_object_mut() {
@@ -2652,11 +2815,9 @@ impl ProxyServer {
                 let normalized = self.normalize_result_for_profile(result).await;
                 JsonRpcResponse::success(id, normalized)
             }
-            Err(e) => tool_failure_response(
-                id,
-                e,
-                serde_json::json!({ "server": server, "tool": tool }),
-            ),
+            Err(e) => {
+                tool_failure_response(id, e, serde_json::json!({ "server": server, "tool": tool }))
+            }
         }
     }
 
@@ -2680,7 +2841,11 @@ impl ProxyServer {
             .await
             .unwrap_or_else(|| parts[0].to_string());
         if !crate::toolguard::server_visible(&canonical, current_profile().as_deref()) {
-            return JsonRpcResponse::error(id, -32001, format!("Serveur {} hors du profil McpHub", canonical));
+            return JsonRpcResponse::error(
+                id,
+                -32001,
+                format!("Serveur {} hors du profil McpHub", canonical),
+            );
         }
         let server = canonical.as_str();
         let prompt_name = parts[1];
@@ -2728,7 +2893,11 @@ impl ProxyServer {
             .await
             .unwrap_or_else(|| parts[0].to_string());
         if !crate::toolguard::server_visible(&canonical, current_profile().as_deref()) {
-            return JsonRpcResponse::error(id, -32001, format!("Serveur {} hors du profil McpHub", canonical));
+            return JsonRpcResponse::error(
+                id,
+                -32001,
+                format!("Serveur {} hors du profil McpHub", canonical),
+            );
         }
         let server = canonical.as_str();
         let actual_uri = parts[1];
@@ -3145,9 +3314,15 @@ async fn preload_servers(manager: Arc<ChildManager>, names: Vec<String>, delay_m
         .map(|(position, name)| {
             let manager = manager.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms * position as u64)).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(
+                    delay_ms * position as u64,
+                ))
+                .await;
                 if let Err(error) = manager.start_server(&name).await {
-                    eprintln!("[McpHub][WARN] Prechauffage de {} en echec : {}", name, error);
+                    eprintln!(
+                        "[McpHub][WARN] Prechauffage de {} en echec : {}",
+                        name, error
+                    );
                 }
             })
         })
@@ -3174,7 +3349,11 @@ fn spawn_catalog_refresh(
     delay_ms: u64,
     in_progress: Arc<AtomicBool>,
 ) {
-    let CatalogChanges { names_to_refresh, removed_names, server_hashes } = changes;
+    let CatalogChanges {
+        names_to_refresh,
+        removed_names,
+        server_hashes,
+    } = changes;
     if names_to_refresh.is_empty() && removed_names.is_empty() {
         return;
     }
@@ -3297,15 +3476,13 @@ async fn apply_config_change(
     let new_servers = new_config.servers.clone();
     let new_server_hashes = crate::cache::server_config_hashes(&new_servers);
     let existing_cache = crate::cache::load_cache();
-    let mut refresh_server_names: Vec<String> =
-        new_servers.keys().cloned().collect();
+    let mut refresh_server_names: Vec<String> = new_servers.keys().cloned().collect();
     refresh_server_names.sort();
     let mut removed_server_names = Vec::new();
 
     if let Some(cached) = existing_cache {
         refresh_server_names.retain(|server_name| {
-            cached.server_hashes.get(server_name)
-                != new_server_hashes.get(server_name)
+            cached.server_hashes.get(server_name) != new_server_hashes.get(server_name)
                 || cached.errors.contains_key(server_name)
                 || !cached.servers.contains_key(server_name)
         });
@@ -3415,7 +3592,10 @@ async fn config_and_cache_watcher(
                 let all_tools = indexed_tools_from_servers(&cached.servers);
                 let mut eng = engine.lock().await;
                 eng.build_index(all_tools);
-                eprintln!("[McpHub][GUARD] Catalogue reconstruit (epingles modifiees) : {} outils", eng.tool_count());
+                eprintln!(
+                    "[McpHub][GUARD] Catalogue reconstruit (epingles modifiees) : {} outils",
+                    eng.tool_count()
+                );
             }
             // L'index peut lui-même avoir réécrit le fichier (premier contact) : on suit.
             last_pins_modified = pins_path.metadata().ok().and_then(|m| m.modified().ok());
@@ -3466,6 +3646,34 @@ async fn config_and_cache_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn le_dossier_de_la_session_distingue_le_cache_et_vient_du_working_dir() {
+        let origin = CallOrigin {
+            working_dir: Some("/a".into()),
+            cwd: Some("/b".into()),
+        };
+        assert_eq!(session_root(&origin), Some(std::path::PathBuf::from("/a")));
+        let only_cwd = CallOrigin {
+            working_dir: None,
+            cwd: Some("/b".into()),
+        };
+        assert_eq!(
+            session_root(&only_cwd),
+            Some(std::path::PathBuf::from("/b"))
+        );
+        assert_eq!(session_root(&CallOrigin::default()), None);
+
+        let args = serde_json::json!({ "q": 1 });
+        assert_eq!(cache_args(&args), args, "hors session, les arguments seuls");
+        let keyed = crate::child::CALL_ROOT
+            .scope(Some("/projet".into()), async { cache_args(&args) })
+            .await;
+        assert_eq!(
+            keyed,
+            serde_json::json!({ "arguments": { "q": 1 }, "root": "/projet" })
+        );
+    }
     use serde_json::json;
 
     fn hub_with_permissions(permissions: crate::permissions::PermissionsConfig) -> ProxyServer {
@@ -3485,9 +3693,15 @@ mod tests {
             "type": "object",
             "properties": {"project": {"type": "string"}, "level": {"type": "string"}}
         });
-        assert_eq!(unknown_arguments(&schema, &json!({"path": "/tmp/app"})), vec!["path"]);
         assert_eq!(
-            unknown_arguments(&schema, &json!({"zeta": 1, "project": "/tmp/app", "alpha": 2})),
+            unknown_arguments(&schema, &json!({"path": "/tmp/app"})),
+            vec!["path"]
+        );
+        assert_eq!(
+            unknown_arguments(
+                &schema,
+                &json!({"zeta": 1, "project": "/tmp/app", "alpha": 2})
+            ),
             vec!["alpha", "zeta"]
         );
         assert!(unknown_arguments(&schema, &json!({"project": "/tmp/app"})).is_empty());
@@ -3512,7 +3726,10 @@ mod tests {
             json!({"properties": properties, "patternProperties": {"^x-": {}}}),
             json!({"properties": properties, "$ref": "#/definitions/args"}),
         ] {
-            assert!(unknown_arguments(&schema, &arguments).is_empty(), "{schema}");
+            assert!(
+                unknown_arguments(&schema, &arguments).is_empty(),
+                "{schema}"
+            );
         }
         let closed = json!({"properties": properties, "additionalProperties": false});
         assert_eq!(unknown_arguments(&closed, &arguments), vec!["path"]);
@@ -3520,11 +3737,18 @@ mod tests {
 
     #[test]
     fn version_inconnue_jamais_renvoyee_telle_quelle() {
-        let negotiate = |v: &str| ProxyServer::negotiate_protocol_version(&json!({"protocolVersion": v}));
+        let negotiate =
+            |v: &str| ProxyServer::negotiate_protocol_version(&json!({"protocolVersion": v}));
         assert_eq!(negotiate("2025-06-18"), "2025-06-18");
         assert_eq!(negotiate("2024-11-05"), "2024-11-05");
-        assert_eq!(negotiate("2026-07-28"), crate::protocol::LATEST_PROTOCOL_VERSION);
-        assert_eq!(negotiate("2099-01-01"), crate::protocol::LATEST_PROTOCOL_VERSION);
+        assert_eq!(
+            negotiate("2026-07-28"),
+            crate::protocol::LATEST_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            negotiate("2099-01-01"),
+            crate::protocol::LATEST_PROTOCOL_VERSION
+        );
         assert_eq!(
             ProxyServer::negotiate_protocol_version(&json!({})),
             crate::protocol::LATEST_PROTOCOL_VERSION
@@ -3552,7 +3776,8 @@ done
         preload: crate::config::Preload,
         idle_timeout_ms: u64,
     ) -> ProxyServer {
-        let dir = std::env::temp_dir().join(format!("mcphub-preload-{}-{}", tag, std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("mcphub-preload-{}-{}", tag, std::process::id()));
         std::fs::create_dir_all(&dir).expect("dossier temporaire");
         let script = dir.join("server.sh");
         std::fs::write(&script, FAKE_PRELOAD_SERVER).expect("script du faux serveur");
@@ -3613,7 +3838,10 @@ done
         assert!(hub.child_manager.is_running("alpha").await);
         assert!(!hub.child_manager.is_running("casse").await);
         assert!(!hub.child_manager.is_running("beta").await, "non liste");
-        assert!(!hub.child_manager.is_running("ferme").await, "interdit par les permissions");
+        assert!(
+            !hub.child_manager.is_running("ferme").await,
+            "interdit par les permissions"
+        );
         hub.shutdown().await;
     }
 
@@ -3675,7 +3903,10 @@ done
             ("c__jamais".to_string(), 0),
             ("inconnu__outil".to_string(), 9),
         ]);
-        assert_eq!(most_called_servers(&calls, &configured, 5), vec!["a__b", "a", "c"]);
+        assert_eq!(
+            most_called_servers(&calls, &configured, 5),
+            vec!["a__b", "a", "c"]
+        );
         assert_eq!(most_called_servers(&calls, &configured, 1), vec!["a__b"]);
         assert!(most_called_servers(&HashMap::new(), &configured, 5).is_empty());
     }
@@ -3687,13 +3918,23 @@ done
             ..Default::default()
         });
         let response = hub
-            .handle_hub_tool(Some(json!(1)), "registry_install", json!({"name": "io.example/x"}), None)
+            .handle_hub_tool(
+                Some(json!(1)),
+                "registry_install",
+                json!({"name": "io.example/x"}),
+                None,
+            )
             .await;
         let result = response.result.expect("demande de confirmation");
         assert_eq!(result["_meta"]["mcphub"]["status"], "confirmation_required");
 
         let response = hub
-            .handle_hub_tool(Some(json!(2)), "registry_install", json!({"name": "io.example/x"}), Some("faux"))
+            .handle_hub_tool(
+                Some(json!(2)),
+                "registry_install",
+                json!({"name": "io.example/x"}),
+                Some("faux"),
+            )
             .await;
         assert!(response.error.is_some(), "un jeton inconnu est refuse");
     }
@@ -3708,7 +3949,12 @@ done
             .unwrap(),
         );
         let response = hub
-            .handle_hub_tool(Some(json!(1)), "registry_install", json!({"name": "io.example/x"}), None)
+            .handle_hub_tool(
+                Some(json!(1)),
+                "registry_install",
+                json!({"name": "io.example/x"}),
+                None,
+            )
             .await;
         assert!(response.error.expect("refus").message.contains("interdit"));
     }
@@ -3724,7 +3970,10 @@ done
             json!({"allowed_server": ["supabase"]}),
         ] {
             let response = hub
-                .handle_run(Some(json!(1)), json!({"code": "return 1", "policy": invalid}))
+                .handle_run(
+                    Some(json!(1)),
+                    json!({"code": "return 1", "policy": invalid}),
+                )
                 .await;
             let error = response.error.expect("policy refusee");
             assert_eq!(error.code, -32602);

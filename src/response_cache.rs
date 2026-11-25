@@ -35,10 +35,43 @@ const DEFAULT_MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 /// Tools matching ANY of these prefixes are considered safe to cache.
 /// Conservative on purpose: better to skip a cacheable read than to serve stale state.
 const IDEMPOTENT_PREFIXES: &[&str] = &[
-    "read_", "read-", "list_", "list-", "get_", "get-", "fetch_", "fetch-", "search_", "search-",
-    "find_", "find-", "info_", "info-", "show_", "show-", "view_", "view-", "describe_",
-    "describe-", "inspect_", "inspect-", "head_", "head-", "tail_", "tail-", "count_", "count-",
-    "exists", "has_", "has-", "lookup_", "lookup-", "preview_", "preview-", "render_", "render-",
+    "read_",
+    "read-",
+    "list_",
+    "list-",
+    "get_",
+    "get-",
+    "fetch_",
+    "fetch-",
+    "search_",
+    "search-",
+    "find_",
+    "find-",
+    "info_",
+    "info-",
+    "show_",
+    "show-",
+    "view_",
+    "view-",
+    "describe_",
+    "describe-",
+    "inspect_",
+    "inspect-",
+    "head_",
+    "head-",
+    "tail_",
+    "tail-",
+    "count_",
+    "count-",
+    "exists",
+    "has_",
+    "has-",
+    "lookup_",
+    "lookup-",
+    "preview_",
+    "preview-",
+    "render_",
+    "render-",
 ];
 
 /// Tools matching ANY of these patterns are NEVER cached, even if they happen to start with a
@@ -88,7 +121,9 @@ impl CacheSettings {
         }
         if let Some(tools) = object.get("tools") {
             let Some(list) = tools.as_array() else {
-                return Err("settings.responseCache.tools doit etre une liste de \"serveur__outil\"".into());
+                return Err(
+                    "settings.responseCache.tools doit etre une liste de \"serveur__outil\"".into(),
+                );
             };
             for item in list {
                 let valid = item.as_str().filter(|name| {
@@ -265,7 +300,13 @@ impl ResponseCache {
         )
     }
 
-    pub fn get(&self, server: &str, tool: &str, args: &Value, epoch: u64) -> Option<CachedResponse> {
+    pub fn get(
+        &self,
+        server: &str,
+        tool: &str,
+        args: &Value,
+        epoch: u64,
+    ) -> Option<CachedResponse> {
         let ttl = self.ttl();
         if ttl.is_zero() {
             return None;
@@ -322,7 +363,9 @@ impl ResponseCache {
         if value.get("isError").and_then(|v| v.as_bool()) == Some(true) {
             return;
         }
-        let bytes = serde_json::to_string(&value).map(|s| s.len()).unwrap_or(usize::MAX);
+        let bytes = serde_json::to_string(&value)
+            .map(|s| s.len())
+            .unwrap_or(usize::MAX);
         if bytes > self.max_entry_bytes {
             return;
         }
@@ -394,13 +437,30 @@ mod tests {
         // La lecture lente part, puis une écriture invalide le serveur avant son retour.
         let generation = cache.generation("db");
         cache.invalidate_server("db");
-        cache.put_if_current("db", "list_items", &args, json!({"items": []}), 0, generation);
+        cache.put_if_current(
+            "db",
+            "list_items",
+            &args,
+            json!({"items": []}),
+            0,
+            generation,
+        );
         assert!(cache.get("db", "list_items", &args, 0).is_none());
 
         // Une lecture lancée après l'écriture entre normalement, sans gêner un autre serveur.
         let generation = cache.generation("db");
-        cache.put_if_current("db", "list_items", &args, json!({"items": ["x"]}), 0, generation);
-        assert_eq!(cache.get("db", "list_items", &args, 0).map(|hit| hit.value), Some(json!({"items": ["x"]})));
+        cache.put_if_current(
+            "db",
+            "list_items",
+            &args,
+            json!({"items": ["x"]}),
+            0,
+            generation,
+        );
+        assert_eq!(
+            cache.get("db", "list_items", &args, 0).map(|hit| hit.value),
+            Some(json!({"items": ["x"]}))
+        );
         cache.invalidate_server("other");
         assert!(cache.get("db", "list_items", &args, 0).is_some());
     }
@@ -430,7 +490,10 @@ mod tests {
         let cache = ResponseCache::with_limits(0, 16, 1024, 1024 * 1024);
         cache.put("s", "get_x", &json!({}), json!(1), 0);
         assert!(cache.get("s", "get_x", &json!({}), 0).is_none());
-        let off = CacheSettings { ttl_secs: 0, tools: ["s__get_x".to_string()].into() };
+        let off = CacheSettings {
+            ttl_secs: 0,
+            tools: ["s__get_x".to_string()].into(),
+        };
         assert!(!off.is_cacheable("s", "get_x", Some(true)));
 
         // Passage a 0 en cours de route (config rechargee) : les entrees existantes tombent.
@@ -439,9 +502,15 @@ mod tests {
         cache.set_ttl_secs(0);
         assert!(cache.get("s", "get_x", &json!({}), 0).is_none());
         cache.set_ttl_secs(60);
-        assert!(cache.get("s", "get_x", &json!({}), 0).is_none(), "rien ne revient apres reactivation");
+        assert!(
+            cache.get("s", "get_x", &json!({}), 0).is_none(),
+            "rien ne revient apres reactivation"
+        );
         cache.put("s", "get_x", &json!({}), json!(2), 0);
-        assert_eq!(cache.get("s", "get_x", &json!({}), 0).unwrap().value, json!(2));
+        assert_eq!(
+            cache.get("s", "get_x", &json!({}), 0).unwrap().value,
+            json!(2)
+        );
     }
 
     #[test]
@@ -469,15 +538,31 @@ mod tests {
         .unwrap();
         assert_eq!(settings.ttl_secs, 120);
         assert!(settings.is_cacheable("context7", "resolve-library-id", None));
-        assert!(!settings.is_cacheable("autre", "resolve-library-id", None), "le serveur compte");
+        assert!(
+            !settings.is_cacheable("autre", "resolve-library-id", None),
+            "le serveur compte"
+        );
         assert!(!settings.is_cacheable("context7", "query-docs", None));
     }
 
     #[test]
     fn reglages_invalides_refuses() {
-        assert_eq!(CacheSettings::from_json(&json!({})).unwrap(), CacheSettings::default());
-        assert_eq!(CacheSettings::from_json(&json!({"ttlSecs": 0})).unwrap().ttl_secs, 0);
-        assert_eq!(CacheSettings::from_json(&json!({"ttlSecs": 3600})).unwrap().ttl_secs, 3600);
+        assert_eq!(
+            CacheSettings::from_json(&json!({})).unwrap(),
+            CacheSettings::default()
+        );
+        assert_eq!(
+            CacheSettings::from_json(&json!({"ttlSecs": 0}))
+                .unwrap()
+                .ttl_secs,
+            0
+        );
+        assert_eq!(
+            CacheSettings::from_json(&json!({"ttlSecs": 3600}))
+                .unwrap()
+                .ttl_secs,
+            3600
+        );
         for invalid in [
             json!(60),
             json!({"ttlSecs": 3601}),
@@ -489,7 +574,11 @@ mod tests {
             json!({"tools": ["__outil"]}),
             json!({"tools": [42]}),
         ] {
-            assert!(CacheSettings::from_json(&invalid).is_err(), "{} doit etre refuse", invalid);
+            assert!(
+                CacheSettings::from_json(&invalid).is_err(),
+                "{} doit etre refuse",
+                invalid
+            );
         }
     }
 
@@ -498,25 +587,44 @@ mod tests {
         let mut cache = small(16);
         // Tous les appels tombent sur le meme hash.
         cache.key_hasher = |_, _, _| 42;
-        cache.put("fs", "read_file", &json!({"path": "a"}), json!("contenu de a"), 0);
+        cache.put(
+            "fs",
+            "read_file",
+            &json!({"path": "a"}),
+            json!("contenu de a"),
+            0,
+        );
         assert!(
-            cache.get("fs", "read_file", &json!({"path": "b"}), 0).is_none(),
+            cache
+                .get("fs", "read_file", &json!({"path": "b"}), 0)
+                .is_none(),
             "meme hash, autres arguments : pas de reponse"
         );
         assert_eq!(
-            cache.get("fs", "read_file", &json!({"path": "a"}), 0).unwrap().value,
+            cache
+                .get("fs", "read_file", &json!({"path": "a"}), 0)
+                .unwrap()
+                .value,
             json!("contenu de a")
         );
         // L'ordre des cles ne change pas l'appel.
         cache.put("fs", "read_x", &json!({"a": 1, "b": 2}), json!("ab"), 0);
-        assert!(cache.get("fs", "read_x", &json!({"b": 2, "a": 1}), 0).is_some());
+        assert!(cache
+            .get("fs", "read_x", &json!({"b": 2, "a": 1}), 0)
+            .is_some());
     }
 
     #[test]
     fn put_get_roundtrip() {
         let cache = small(16);
         let args = json!({"path": "/tmp/x"});
-        cache.put("filesystem", "read_file", &args, json!({"content": "hello"}), 0);
+        cache.put(
+            "filesystem",
+            "read_file",
+            &args,
+            json!({"content": "hello"}),
+            0,
+        );
         let hit = cache.get("filesystem", "read_file", &args, 0).unwrap();
         assert_eq!(hit.value, json!({"content": "hello"}));
     }
@@ -526,8 +634,20 @@ mod tests {
         let cache = small(16);
         cache.put("fs", "read_file", &json!({"path": "a"}), json!(1), 0);
         cache.put("fs", "read_file", &json!({"path": "b"}), json!(2), 0);
-        assert_eq!(cache.get("fs", "read_file", &json!({"path": "a"}), 0).unwrap().value, json!(1));
-        assert_eq!(cache.get("fs", "read_file", &json!({"path": "b"}), 0).unwrap().value, json!(2));
+        assert_eq!(
+            cache
+                .get("fs", "read_file", &json!({"path": "a"}), 0)
+                .unwrap()
+                .value,
+            json!(1)
+        );
+        assert_eq!(
+            cache
+                .get("fs", "read_file", &json!({"path": "b"}), 0)
+                .unwrap()
+                .value,
+            json!(2)
+        );
     }
 
     #[test]
@@ -548,17 +668,31 @@ mod tests {
     #[test]
     fn errors_are_never_cached() {
         let cache = small(16);
-        cache.put("s", "get_x", &json!({}), json!({"isError": true, "content": []}), 0);
+        cache.put(
+            "s",
+            "get_x",
+            &json!({}),
+            json!({"isError": true, "content": []}),
+            0,
+        );
         assert!(cache.get("s", "get_x", &json!({}), 0).is_none());
     }
 
     #[test]
     fn write_then_read_sees_the_write() {
         let cache = small(16);
-        cache.put("memory", "search_memory", &json!({"q": "x"}), json!("old"), 0);
+        cache.put(
+            "memory",
+            "search_memory",
+            &json!({"q": "x"}),
+            json!("old"),
+            0,
+        );
         cache.put("other", "get_y", &json!({}), json!("kept"), 0);
         cache.invalidate_server("memory");
-        assert!(cache.get("memory", "search_memory", &json!({"q": "x"}), 0).is_none());
+        assert!(cache
+            .get("memory", "search_memory", &json!({"q": "x"}), 0)
+            .is_none());
         assert!(cache.get("other", "get_y", &json!({}), 0).is_some());
     }
 

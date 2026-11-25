@@ -21,6 +21,49 @@ use crate::redaction::redact_text;
 
 /// Préfixe d'une erreur où la requête n'a jamais atteint le serveur : la relancer est sans risque.
 pub const NOT_SENT: &str = "[non transmis]";
+
+/// Clé `_meta` d'un `tools/call` qui porte le dossier de la session à l'origine de l'appel, au format
+/// d'une réponse `roots/list` : un serveur partagé par plusieurs sessions sait ainsi, appel par appel
+/// et sans aller-retour, dans quel projet il travaille.
+pub const ROOTS_META: &str = "com.soflution.mcphub/roots";
+
+tokio::task_local! {
+    /// Dossier de la session dont vient l'appel en cours (`working_dir`, sinon le dossier du client).
+    pub static CALL_ROOT: Option<std::path::PathBuf>;
+}
+
+/// Le dossier de la session à l'origine de l'appel en cours, s'il est connu.
+pub fn call_root() -> Option<std::path::PathBuf> {
+    CALL_ROOT.try_with(|root| root.clone()).ok().flatten()
+}
+
+/// URI `file://` d'un dossier absolu, chaque octet hors des caractères non réservés encodé en %XX.
+fn file_uri(path: &std::path::Path) -> String {
+    let mut uri = String::from("file://");
+    for byte in path.to_string_lossy().bytes() {
+        if byte.is_ascii_alphanumeric() || b"/-._~".contains(&byte) {
+            uri.push(byte as char);
+        } else {
+            uri.push_str(&format!("%{:02X}", byte));
+        }
+    }
+    uri
+}
+
+/// Les racines d'une session, au format MCP de `roots/list` : le dossier, nommé par son dernier élément.
+pub fn roots_value(root: Option<&std::path::Path>) -> serde_json::Value {
+    let roots: Vec<serde_json::Value> = root
+        .map(|path| {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            serde_json::json!({ "uri": file_uri(path), "name": name })
+        })
+        .into_iter()
+        .collect();
+    serde_json::Value::Array(roots)
+}
 /// Préfixe d'une erreur où la requête a été transmise sans réponse : l'outil a pu s'exécuter.
 pub const UNKNOWN_OUTCOME: &str = "[issue inconnue]";
 
@@ -78,7 +121,12 @@ impl SendState {
     /// Côté écriture : faux si l'appelant a déjà renoncé, rien ne doit alors être écrit.
     fn begin_write(&self) -> bool {
         self.0
-            .compare_exchange(Self::QUEUED, Self::WRITING, Ordering::SeqCst, Ordering::SeqCst)
+            .compare_exchange(
+                Self::QUEUED,
+                Self::WRITING,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
             .is_ok()
     }
 
@@ -124,12 +172,16 @@ struct StdioShared {
     stdin: Mutex<tokio::process::ChildStdin>,
     waiting: std::sync::Mutex<Waiting>,
     next_id: AtomicU64,
+    /// Dossier de la session du dernier appel transmis : ce que `roots/list` répond.
+    root: std::sync::Mutex<Option<std::path::PathBuf>>,
 }
 
 impl StdioShared {
     fn waiting(&self) -> std::sync::MutexGuard<'_, Waiting> {
         // Aucune section critique ne peut paniquer en laissant la table incohérente.
-        self.waiting.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.waiting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn register(&self, id: u64, reply: oneshot::Sender<Reply>) -> Result<(), CallError> {
@@ -208,7 +260,10 @@ impl StdioShared {
         };
         let outcome = match parsed.get("error") {
             Some(error) => Err(CallError::Server(format!("MCP error: {}", error))),
-            None => Ok(parsed.get("result").cloned().unwrap_or(serde_json::Value::Null)),
+            None => Ok(parsed
+                .get("result")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)),
         };
         // L'appelant a pu renoncer entre-temps : sa réponse tardive est simplement perdue.
         let _ = reply.send(outcome);
@@ -283,9 +338,13 @@ impl StdioProcess {
             stdin: Mutex::new(stdin),
             waiting: std::sync::Mutex::new(Waiting::default()),
             next_id: AtomicU64::new(1),
+            root: std::sync::Mutex::new(None),
         });
         tokio::spawn(read_replies(shared.clone(), BufReader::new(stdout).lines()));
-        Self { shared, child: Mutex::new(child) }
+        Self {
+            shared,
+            child: Mutex::new(child),
+        }
     }
 
     async fn kill(&self) {
@@ -315,7 +374,8 @@ impl StdioProcess {
             "method": method,
             "params": params,
         });
-        let mut line = serde_json::to_vec(&request).map_err(|e| CallError::Server(e.to_string()))?;
+        let mut line =
+            serde_json::to_vec(&request).map_err(|e| CallError::Server(e.to_string()))?;
         line.push(b'\n');
 
         let (reply, answered) = oneshot::channel();
@@ -336,6 +396,27 @@ impl StdioProcess {
             .unwrap_or_else(|_| Err(CallError::Lost("Server closed connection".into())))
     }
 
+    /// Note le dossier de la session de l'appel qui part ; s'il change, le serveur en est averti
+    /// (`notifications/roots/list_changed`) avant de recevoir l'appel.
+    async fn note_root(&self, root: &std::path::Path) {
+        let changed = {
+            let mut current = self
+                .shared
+                .root
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let changed = current.as_deref() != Some(root);
+            *current = Some(root.to_path_buf());
+            changed
+        };
+        if changed {
+            // Au mieux : un serveur qui ne lit plus recevra quand même l'appel et son `_meta`.
+            let _ = self
+                .notify("notifications/roots/list_changed", serde_json::json!({}))
+                .await;
+        }
+    }
+
     async fn notify(&self, method: &str, params: serde_json::Value) -> Result<(), String> {
         let notification = serde_json::json!({
             "jsonrpc": "2.0",
@@ -348,8 +429,11 @@ impl StdioProcess {
             .await
             .map_err(|e| format!("Write task stopped: {}", e))?
             .map_err(|e| match e {
-                CallError::Dead(e) | CallError::Busy(e) | CallError::Lost(e)
-                | CallError::NoReply(e) | CallError::Server(e) => e,
+                CallError::Dead(e)
+                | CallError::Busy(e)
+                | CallError::Lost(e)
+                | CallError::NoReply(e)
+                | CallError::Server(e) => e,
             })
     }
 }
@@ -383,7 +467,10 @@ impl Drop for InFlight<'_> {
 
 impl Instance {
     fn new(link: Link) -> Self {
-        Self { link, in_flight: AtomicUsize::new(0) }
+        Self {
+            link,
+            in_flight: AtomicUsize::new(0),
+        }
     }
 
     fn busy(&self) -> bool {
@@ -398,11 +485,21 @@ impl Instance {
     }
 
     /// Un échange JSON-RPC, sans verrou tenu pendant l'attente de la réponse.
+    /// Note le dossier de la session de l'appel qui part (serveurs locaux : seuls à demander `roots/list`).
+    async fn note_root(&self, root: &std::path::Path) {
+        if let Link::Stdio(proc) = &self.link {
+            proc.note_root(root).await;
+        }
+    }
+
     async fn request(&self, method: &str, params: serde_json::Value, state: &SendState) -> Reply {
         match &self.link {
             Link::Http(remote) => {
                 state.mark_sent();
-                remote.request(method, params).await.map_err(CallError::Server)
+                remote
+                    .request(method, params)
+                    .await
+                    .map_err(CallError::Server)
             }
             Link::Stdio(proc) => proc.request(method, params, state).await,
         }
@@ -495,10 +592,31 @@ impl ServerPool {
 
 /// Variables système transmises à tous les serveurs.
 const BASE_ENV: &[&str] = &[
-    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
-    "TERM", "__CF_USER_TEXT_ENCODING", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy",
-    "https_proxy", "no_proxy", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "TZ", "NVM_DIR",
-    "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME",
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "__CF_USER_TEXT_ENCODING",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "NODE_EXTRA_CA_CERTS",
+    "SSL_CERT_FILE",
+    "TZ",
+    "NVM_DIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_STATE_HOME",
 ];
 
 pub fn base_child_env(unsandboxed: bool, inherit: &[String]) -> Vec<(String, String)> {
@@ -537,7 +655,11 @@ pub fn local_command(name: &str, config: &ServerConfig) -> Command {
     cmd.args(&program_args).kill_on_drop(true);
     cmd.env_clear();
     // Instance d'un tenant : jamais l'agent SSH ni les variables héritées du démon.
-    let inherit: &[String] = if config.tenant.is_some() { &[] } else { &config.inherit_env };
+    let inherit: &[String] = if config.tenant.is_some() {
+        &[]
+    } else {
+        &config.inherit_env
+    };
     for (k, v) in base_child_env(config.sandbox.is_none() && config.tenant.is_none(), inherit) {
         cmd.env(k, v);
     }
@@ -566,10 +688,18 @@ fn child_stderr(name: &str) -> Stdio {
     }
     let safe: String = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let path = dir.join(format!("{}.stderr.log", safe));
-    let too_big = std::fs::metadata(&path).map(|m| m.len() > 1_000_000).unwrap_or(false);
+    let too_big = std::fs::metadata(&path)
+        .map(|m| m.len() > 1_000_000)
+        .unwrap_or(false);
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true);
     if too_big {
@@ -690,11 +820,24 @@ impl ChildManager {
 
     /// Retire toutes les instances d'un tenant (configs et processus).
     pub async fn remove_tenant_instances(&self, tenant: &str) {
-        let of_tenant = |name: &String| {
-            crate::tenant::split_instance(name).is_some_and(|(_, t)| t == tenant)
-        };
-        let mut names: Vec<String> = self.configs.lock().await.keys().filter(|n| of_tenant(n)).cloned().collect();
-        names.extend(self.pools.lock().await.keys().filter(|n| of_tenant(n)).cloned());
+        let of_tenant =
+            |name: &String| crate::tenant::split_instance(name).is_some_and(|(_, t)| t == tenant);
+        let mut names: Vec<String> = self
+            .configs
+            .lock()
+            .await
+            .keys()
+            .filter(|n| of_tenant(n))
+            .cloned()
+            .collect();
+        names.extend(
+            self.pools
+                .lock()
+                .await
+                .keys()
+                .filter(|n| of_tenant(n))
+                .cloned(),
+        );
         names.sort();
         names.dedup();
         for name in names {
@@ -711,14 +854,19 @@ impl ChildManager {
         self.stop_server(name).await;
     }
 
-        pub async fn has_config(&self, name: &str) -> bool {
+    pub async fn has_config(&self, name: &str) -> bool {
         self.configs.lock().await.contains_key(name)
     }
 
     /// Nom exact d'une instance de tenant, sinon résolution normale.
     async fn resolve_internal(&self, name: &str) -> Option<String> {
         if crate::tenant::is_instance_name(name) {
-            return self.configs.lock().await.contains_key(name).then(|| name.to_string());
+            return self
+                .configs
+                .lock()
+                .await
+                .contains_key(name)
+                .then(|| name.to_string());
         }
         self.resolve_name(name).await
     }
@@ -737,13 +885,19 @@ impl ChildManager {
             return Some(name.to_string());
         }
         let lower = name.to_lowercase();
-        for key in configs.keys().filter(|k| !crate::tenant::is_instance_name(k)) {
+        for key in configs
+            .keys()
+            .filter(|k| !crate::tenant::is_instance_name(k))
+        {
             if key.to_lowercase() == lower {
                 return Some(key.clone());
             }
         }
         let normalized = lower.replace(['-', '_'], "");
-        for key in configs.keys().filter(|k| !crate::tenant::is_instance_name(k)) {
+        for key in configs
+            .keys()
+            .filter(|k| !crate::tenant::is_instance_name(k))
+        {
             let key_normalized = key.to_lowercase().replace(['-', '_'], "");
             if key_normalized == normalized {
                 return Some(key.clone());
@@ -919,6 +1073,11 @@ impl ChildManager {
         pool.touch();
         let instance = pool.pick();
         let _in_flight = InFlight::enter(&instance.in_flight);
+        if method == "tools/call" {
+            if let Some(root) = call_root() {
+                instance.note_root(&root).await;
+            }
+        }
         let secs = pool.request_timeout_secs;
         let state = SendState::new();
         let outcome = tokio::time::timeout(
@@ -998,7 +1157,10 @@ impl ChildManager {
             .pool(server_name)
             .await
             .ok_or_else(|| format!("Server not running: {}", server_name))?;
-        let params = serde_json::json!({ "name": tool_name, "arguments": arguments });
+        let mut params = serde_json::json!({ "name": tool_name, "arguments": arguments });
+        if let Some(root) = call_root() {
+            params["_meta"] = serde_json::json!({ ROOTS_META: roots_value(Some(&root)) });
+        }
 
         match self.exchange(&pool, "tools/call", params.clone()).await {
             Ok(result) => Ok(result),
@@ -1104,11 +1266,17 @@ impl ChildManager {
 
     /// Après un rechargement de configuration : oublie les serveurs qui n'existent plus.
     pub fn retain_keep_warm(&self, keep: impl Fn(&str) -> bool) {
-        self.keep_warm.write().unwrap_or_else(|e| e.into_inner()).retain(|name| keep(name));
+        self.keep_warm
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|name| keep(name));
     }
 
     fn kept_warm(&self, name: &str) -> bool {
-        self.keep_warm.read().unwrap_or_else(|e| e.into_inner()).contains(name)
+        self.keep_warm
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(name)
     }
 
     /// Arrête les serveurs inactifs. Un serveur occupé (appel plus long que le délai
@@ -1287,7 +1455,8 @@ async fn initialize(
         "initialize",
         serde_json::json!({
             "protocolVersion": crate::protocol::LATEST_PROTOCOL_VERSION,
-            "capabilities": {},
+            // Les racines : le dossier de la session de chaque appel (`roots/list`, `_meta`).
+            "capabilities": { "roots": { "listChanged": true } },
             "clientInfo": { "name": "McpHub", "version": env!("CARGO_PKG_VERSION") }
         }),
         request_timeout_secs,
@@ -1297,7 +1466,10 @@ async fn initialize(
     if let Some(pv) = init_result.get("protocolVersion").and_then(|v| v.as_str()) {
         if index == 0 {
             if crate::protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&pv) {
-                eprintln!("[McpHub][INFO] Server '{}' negotiated protocol: {}", name, pv);
+                eprintln!(
+                    "[McpHub][INFO] Server '{}' negotiated protocol: {}",
+                    name, pv
+                );
             } else {
                 eprintln!(
                     "[McpHub][WARN] Server '{}' answered with protocol {} that McpHub does not implement; tools/list and tools/call are attempted anyway",
@@ -1307,7 +1479,8 @@ async fn initialize(
         }
     }
 
-    proc.notify("notifications/initialized", serde_json::json!({})).await?;
+    proc.notify("notifications/initialized", serde_json::json!({}))
+        .await?;
     // tools/list est paginé (nextCursor) : on lit toutes les pages.
     let mut tools: Vec<ToolDef> = Vec::new();
     let mut cursor: Option<String> = None;
@@ -1366,11 +1539,19 @@ async fn send_request(
     }
 }
 
-/// Réponse à une requête que le serveur adresse à McpHub (sampling, roots, elicitation) :
-/// sans réponse, le serveur attendrait jusqu'à son propre délai.
+/// Réponse à une requête que le serveur adresse à McpHub : `ping`, `roots/list` (le dossier de la
+/// session du dernier appel) ; sampling et elicitation refusés. Sans réponse, le serveur attendrait
+/// jusqu'à son propre délai.
 async fn answer_server_request(shared: Arc<StdioShared>, id: serde_json::Value, method: String) {
     let reply = if method == "ping" {
         serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} })
+    } else if method == "roots/list" {
+        let root = shared
+            .root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "roots": roots_value(root.as_deref()) } })
     } else {
         serde_json::json!({
             "jsonrpc": "2.0",
@@ -1393,7 +1574,9 @@ mod tests {
     /// écrit dans `mutations` puis ferme sans répondre, `slow` répond après 2 s en bloquant
     /// la lecture. `wait` (1 s) et `late` (3 s) répondent en tâche de fond, la lecture
     /// continue ; `hang` note l'appel dans `received` et ne répond jamais ; `stall` fait de
-    /// même puis cesse de lire stdin. Une réponse -32601 reçue de McpHub va dans `answers`.
+    /// même puis cesse de lire stdin. Une réponse de McpHub à une requête du serveur (-32601, ou
+    /// les racines de `roots/list`) va dans `answers` ; `where` note l'appel reçu dans `calls`
+    /// puis demande `roots/list` ; un changement de racines annoncé va dans `changed`.
     const FAKE_SERVER: &str = r#"#!/bin/sh
 echo $$ >> "$FAKE_DIR/pids"
 while IFS= read -r line; do
@@ -1419,8 +1602,14 @@ while IFS= read -r line; do
     *'"name":"stall"'*)
       echo "stall $id" >> "$FAKE_DIR/received"
       sleep 30 ;;
-    *'-32601'*)
+    *'-32601'*|*'"result":{"roots":'*)
       echo "$line" >> "$FAKE_DIR/answers" ;;
+    *'roots/list_changed'*)
+      echo changed >> "$FAKE_DIR/changed" ;;
+    *'"name":"where"'*)
+      echo "$line" >> "$FAKE_DIR/calls"
+      printf '{"jsonrpc":"2.0","id":99998,"method":"roots/list"}\n'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"here"}]}}\n' "$id" ;;
     *'"name":"read_x"'*)
       echo "read_x $id" >> "$FAKE_DIR/received"
       printf '{"jsonrpc":"2.0","id":99999,"method":"roots/list"}\n'
@@ -1486,7 +1675,12 @@ done
         let peak_seen = peak.clone();
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                tokio::spawn(fake_http_connection(stream, delay, running.clone(), peak_seen.clone()));
+                tokio::spawn(fake_http_connection(
+                    stream,
+                    delay,
+                    running.clone(),
+                    peak_seen.clone(),
+                ));
             }
         });
         (url, peak)
@@ -1549,7 +1743,8 @@ done
             let reply = match id {
                 Some(id) => {
                     let payload =
-                        serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string();
+                        serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result })
+                            .to_string();
                     format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                         payload.len(),
@@ -1597,9 +1792,17 @@ done
         let elapsed = began.elapsed();
         assert_eq!(first.unwrap()["content"][0]["text"], "slow");
         assert_eq!(second.unwrap()["content"][0]["text"], "slow");
-        assert_eq!(peak.load(Ordering::SeqCst), 2, "les deux appels doivent se chevaucher");
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            2,
+            "les deux appels doivent se chevaucher"
+        );
         assert!(elapsed >= delay, "trop court : {:?}", elapsed);
-        assert!(elapsed < delay * 2 - Duration::from_millis(200), "appels en file : {:?}", elapsed);
+        assert!(
+            elapsed < delay * 2 - Duration::from_millis(200),
+            "appels en file : {:?}",
+            elapsed
+        );
         manager.stop_all().await;
     }
 
@@ -1617,7 +1820,11 @@ done
             .await
             .unwrap_err();
         assert!(is_unknown_outcome(&err), "{}", err);
-        assert!(began.elapsed() < Duration::from_millis(1500), "delai non applique : {:?}", began.elapsed());
+        assert!(
+            began.elapsed() < Duration::from_millis(1500),
+            "delai non applique : {:?}",
+            began.elapsed()
+        );
         assert!(manager.is_running("fake-remote-lent").await);
         // L'appel abandonné ne compte plus : le serveur redevient arrêtable sur inactivité.
         let pool = manager.pool("fake-remote-lent").await.unwrap();
@@ -1637,8 +1844,15 @@ done
             .await
             .unwrap_err();
         assert!(is_unknown_outcome(&err), "{}", err);
-        assert_eq!(lines(&dir.join("mutations")).len(), 1, "la mutation ne doit partir qu'une fois");
-        assert!(!manager.is_running("fake-mutate").await, "le processus perdu est retire");
+        assert_eq!(
+            lines(&dir.join("mutations")).len(),
+            1,
+            "la mutation ne doit partir qu'une fois"
+        );
+        assert!(
+            !manager.is_running("fake-mutate").await,
+            "le processus perdu est retire"
+        );
 
         // Le prochain appel redémarre le serveur normalement.
         let ok = manager
@@ -1691,7 +1905,11 @@ done
         let began = Instant::now();
         let error = manager.start_server("absent").await.unwrap_err();
         // Trois essais auraient attendu 500 + 1000 + 2000 ms.
-        assert!(began.elapsed() < Duration::from_millis(400), "{:?}", began.elapsed());
+        assert!(
+            began.elapsed() < Duration::from_millis(400),
+            "{:?}",
+            began.elapsed()
+        );
         assert!(error.contains("not retried"), "{}", error);
     }
 
@@ -1709,8 +1927,14 @@ done
         manager.start_server("cold").await.unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
         manager.reap_idle().await;
-        assert!(manager.pool("warm").await.is_some(), "le serveur garde au chaud a ete arrete");
-        assert!(manager.pool("cold").await.is_none(), "le serveur ordinaire devait etre arrete");
+        assert!(
+            manager.pool("warm").await.is_some(),
+            "le serveur garde au chaud a ete arrete"
+        );
+        assert!(
+            manager.pool("cold").await.is_none(),
+            "le serveur ordinaire devait etre arrete"
+        );
         // Retiré de la liste, il redevient arrêtable.
         manager.set_keep_warm(Vec::<String>::new());
         manager.reap_idle().await;
@@ -1731,7 +1955,8 @@ done
 
         let m1 = manager.clone();
         let slow = tokio::spawn(async move {
-            m1.call_tool("fake-slow", "slow", serde_json::json!({})).await
+            m1.call_tool("fake-slow", "slow", serde_json::json!({}))
+                .await
         });
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -1739,7 +1964,8 @@ done
         // que le serveur lent travaille : rien ne doit attendre la fin de l'appel lent.
         let m2 = manager.clone();
         let second_slow = tokio::spawn(async move {
-            m2.call_tool("fake-slow", "read_x", serde_json::json!({})).await
+            m2.call_tool("fake-slow", "read_x", serde_json::json!({}))
+                .await
         });
         let began = Instant::now();
         let dead = manager.health_check().await;
@@ -1751,10 +1977,17 @@ done
             .unwrap();
         assert!(dead.is_empty(), "{:?}", dead);
         assert_eq!(fast["content"][0]["text"], "x");
-        assert!(began.elapsed() < Duration::from_millis(1000), "bloque {:?}", began.elapsed());
+        assert!(
+            began.elapsed() < Duration::from_millis(1000),
+            "bloque {:?}",
+            began.elapsed()
+        );
 
         assert_eq!(slow.await.unwrap().unwrap()["content"][0]["text"], "slow");
-        assert_eq!(second_slow.await.unwrap().unwrap()["content"][0]["text"], "x");
+        assert_eq!(
+            second_slow.await.unwrap().unwrap()["content"][0]["text"],
+            "x"
+        );
         manager.stop_all().await;
     }
 
@@ -1767,7 +2000,12 @@ done
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        panic!("{} : {} ligne(s) attendue(s), trouve {:?}", path.display(), count, lines(path));
+        panic!(
+            "{} : {} ligne(s) attendue(s), trouve {:?}",
+            path.display(),
+            count,
+            lines(path)
+        );
     }
 
     fn kill_fake(dir: &Path) {
@@ -1807,14 +2045,89 @@ done
         assert_eq!(first.unwrap()["content"][0]["text"], "wait");
         assert_eq!(second.unwrap()["content"][0]["text"], "wait");
         assert_eq!(third.unwrap()["content"][0]["text"], "x");
-        assert!(elapsed >= Duration::from_millis(1000), "trop court : {:?}", elapsed);
-        assert!(elapsed < Duration::from_millis(1700), "appels en file : {:?}", elapsed);
+        assert!(
+            elapsed >= Duration::from_millis(1000),
+            "trop court : {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed < Duration::from_millis(1700),
+            "appels en file : {:?}",
+            elapsed
+        );
         assert_eq!(lines(&dir.join("pids")).len(), 1, "un seul processus");
 
-        // La requête roots/list émise par le serveur pendant read_x reçoit toujours -32601.
+        // La requête roots/list émise par le serveur pendant read_x reçoit toujours une réponse.
         let answers = wait_lines(&dir.join("answers"), 1).await;
         assert!(answers[0].contains("\"id\":99999"), "{}", answers[0]);
         manager.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn le_dossier_de_la_session_suit_chaque_appel_et_roots_list_le_donne() {
+        let dir = fake_dir("racines");
+        let manager = started(&dir, "fake-racines", 10);
+        manager.start_server("fake-racines").await.unwrap();
+        let call = |root: Option<&str>| {
+            let manager = manager.clone();
+            let root = root.map(PathBuf::from);
+            async move {
+                CALL_ROOT
+                    .scope(root, async move {
+                        manager
+                            .call_tool("fake-racines", "where", serde_json::json!({}))
+                            .await
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+
+        call(Some("/tmp/Mon projet")).await;
+        let calls = wait_lines(&dir.join("calls"), 1).await;
+        assert!(
+            calls[0].contains(r#""_meta":{"com.soflution.mcphub/roots":[{"name":"Mon projet","uri":"file:///tmp/Mon%20projet"}]}"#),
+            "{}",
+            calls[0]
+        );
+        let answers = wait_lines(&dir.join("answers"), 1).await;
+        assert!(
+            answers[0].contains(r#""id":99998"#) && answers[0].contains("file:///tmp/Mon%20projet"),
+            "{}",
+            answers[0]
+        );
+        call(Some("/tmp/Mon projet")).await;
+        call(Some("/tmp/autre")).await;
+        let answers = wait_lines(&dir.join("answers"), 3).await;
+        assert!(
+            answers[2].contains("file:///tmp/autre"),
+            "le dossier du dernier appel : {}",
+            answers[2]
+        );
+        assert_eq!(
+            lines(&dir.join("changed")).len(),
+            2,
+            "averti seulement quand le dossier change"
+        );
+
+        call(None).await;
+        let calls = wait_lines(&dir.join("calls"), 4).await;
+        assert!(
+            !calls[3].contains("_meta"),
+            "sans session connue, rien n'est ajouté : {}",
+            calls[3]
+        );
+        manager.stop_all().await;
+    }
+
+    #[test]
+    fn un_dossier_devient_une_racine_mcp() {
+        assert_eq!(roots_value(None), serde_json::json!([]));
+        assert_eq!(
+            roots_value(Some(Path::new("/Users/moi/Projets/Café & co"))),
+            serde_json::json!([{ "uri": "file:///Users/moi/Projets/Caf%C3%A9%20%26%20co", "name": "Café & co" }])
+        );
+        assert_eq!(call_root(), None, "hors d'un appel, aucun dossier");
     }
 
     #[tokio::test]
@@ -1833,7 +2146,11 @@ done
             let err = call.await.unwrap().unwrap_err();
             assert!(is_unknown_outcome(&err), "{}", err);
         }
-        assert!(began.elapsed() < Duration::from_secs(2), "bloque {:?}", began.elapsed());
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "bloque {:?}",
+            began.elapsed()
+        );
         // Transmis : aucun des deux n'est rejoué, ni sur l'ancien processus ni sur un nouveau.
         assert_eq!(lines(&dir.join("pids")).len(), 1);
         assert_eq!(lines(&dir.join("received")).len(), 2);
@@ -1860,7 +2177,12 @@ done
         let sent = spawn_call(&manager, "fake-file", "stall", serde_json::json!({}));
         wait_lines(&dir.join("received"), 1).await;
         let pad = "x".repeat(200_000);
-        let writing = spawn_call(&manager, "fake-file", "read_x", serde_json::json!({ "pad": pad }));
+        let writing = spawn_call(
+            &manager,
+            "fake-file",
+            "read_x",
+            serde_json::json!({ "pad": pad }),
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
         let queued = spawn_call(&manager, "fake-file", "read_x", serde_json::json!({}));
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1873,8 +2195,18 @@ done
         assert_eq!(queued.await.unwrap().unwrap()["content"][0]["text"], "x");
         assert_eq!(lines(&dir.join("pids")).len(), 2, "un seul redemarrage");
         let received = lines(&dir.join("received"));
-        assert_eq!(received.iter().filter(|l| l.starts_with("stall")).count(), 1, "{:?}", received);
-        assert_eq!(received.iter().filter(|l| l.starts_with("read_x")).count(), 2, "{:?}", received);
+        assert_eq!(
+            received.iter().filter(|l| l.starts_with("stall")).count(),
+            1,
+            "{:?}",
+            received
+        );
+        assert_eq!(
+            received.iter().filter(|l| l.starts_with("read_x")).count(),
+            2,
+            "{:?}",
+            received
+        );
         manager.stop_all().await;
     }
 
@@ -1892,8 +2224,15 @@ done
         let err = late.unwrap_err();
         assert!(is_unknown_outcome(&err), "{}", err);
         assert_eq!(wait.unwrap()["content"][0]["text"], "wait");
-        assert!(began.elapsed() < Duration::from_millis(2800), "{:?}", began.elapsed());
-        assert!(manager.is_running("fake-delai").await, "un delai depasse ne tue pas le serveur");
+        assert!(
+            began.elapsed() < Duration::from_millis(2800),
+            "{:?}",
+            began.elapsed()
+        );
+        assert!(
+            manager.is_running("fake-delai").await,
+            "un delai depasse ne tue pas le serveur"
+        );
 
         // La réponse tardive de `late` arrive vers 3 s : elle est ignorée, le processus sert
         // toujours et l'appel suivant reçoit bien sa propre réponse.
@@ -1918,7 +2257,12 @@ done
         let sent = spawn_call(&manager, "fake-attente", "stall", serde_json::json!({}));
         wait_lines(&dir.join("received"), 1).await;
         let pad = "x".repeat(200_000);
-        let writing = spawn_call(&manager, "fake-attente", "hang", serde_json::json!({ "pad": pad }));
+        let writing = spawn_call(
+            &manager,
+            "fake-attente",
+            "hang",
+            serde_json::json!({ "pad": pad }),
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
         let queued = spawn_call(&manager, "fake-attente", "hang", serde_json::json!({}));
 
@@ -1930,7 +2274,11 @@ done
         // Jamais écrit, et ne le sera jamais : sans risque à relancer.
         let err = queued.await.unwrap().unwrap_err();
         assert!(is_not_sent(&err), "{}", err);
-        assert_eq!(lines(&dir.join("pids")).len(), 1, "aucun redemarrage, aucun rejeu");
+        assert_eq!(
+            lines(&dir.join("pids")).len(),
+            1,
+            "aucun redemarrage, aucun rejeu"
+        );
         assert_eq!(lines(&dir.join("received")).len(), 1);
         manager.stop_all().await;
     }
@@ -1946,7 +2294,8 @@ done
             .map(|_| {
                 let m = manager.clone();
                 tokio::spawn(async move {
-                    m.call_tool("fake-burst", "read_x", serde_json::json!({})).await
+                    m.call_tool("fake-burst", "read_x", serde_json::json!({}))
+                        .await
                 })
             })
             .collect();

@@ -41,7 +41,12 @@ impl Fixture {
         let hub = root.join("hub");
         let acme = root.join("clients").join("acme");
         let homes = root.join("homes");
-        for dir in [&hub, &acme, &root.join("sofapp"), &hub.join("tenants").join("acme")] {
+        for dir in [
+            &hub,
+            &acme,
+            &root.join("sofapp"),
+            &hub.join("tenants").join("acme"),
+        ] {
             std::fs::create_dir_all(dir).unwrap();
         }
         let script = root.join("fake-server.sh");
@@ -63,10 +68,18 @@ impl Fixture {
             "servers": { "svc": server("${HUB_TOKEN}"), "other": server("${HUB_TOKEN}") },
             "settings": { "preload": "none" }
         });
-        std::fs::write(hub.join("config.json"), serde_json::to_string_pretty(&config).unwrap()).unwrap();
+        std::fs::write(
+            hub.join("config.json"),
+            serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
         // Coffre McpHub (fichier, hors Trousseau) et coffre du tenant.
         std::fs::write(hub.join("secrets.env"), "HUB_TOKEN=hub-secret\n").unwrap();
-        std::fs::write(hub.join("tenants").join("acme").join("secrets.env"), "ACME_TOKEN=acme-secret\n").unwrap();
+        std::fs::write(
+            hub.join("tenants").join("acme").join("secrets.env"),
+            "ACME_TOKEN=acme-secret\n",
+        )
+        .unwrap();
         let projects = json!({
             "projects": {
                 "sofapp": { "workspaces": [root.join("sofapp")], "allowedServers": ["*"] },
@@ -78,8 +91,17 @@ impl Fixture {
                 }
             }
         });
-        std::fs::write(hub.join("projects.json"), serde_json::to_string_pretty(&projects).unwrap()).unwrap();
-        Self { root, hub, acme, homes }
+        std::fs::write(
+            hub.join("projects.json"),
+            serde_json::to_string_pretty(&projects).unwrap(),
+        )
+        .unwrap();
+        Self {
+            root,
+            hub,
+            acme,
+            homes,
+        }
     }
 
     fn command(&self) -> Command {
@@ -102,13 +124,25 @@ impl Fixture {
             .arg("stdio")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(if std::env::var("MCPHUB_TEST_STDERR").is_ok() { Stdio::inherit() } else { Stdio::null() })
+            .stderr(if std::env::var("MCPHUB_TEST_STDERR").is_ok() {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
             .spawn()
             .expect("McpHub stdio");
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
-        let mut hub = Hub { child, stdin: Some(stdin), stdout, next_id: 1 };
-        hub.request("initialize", json!({ "protocolVersion": "2025-06-18", "capabilities": {} }));
+        let mut hub = Hub {
+            child,
+            stdin: Some(stdin),
+            stdout,
+            next_id: 1,
+        };
+        hub.request(
+            "initialize",
+            json!({ "protocolVersion": "2025-06-18", "capabilities": {} }),
+        );
         hub
     }
 }
@@ -136,8 +170,13 @@ impl Hub {
         stdin.flush().unwrap();
         loop {
             let mut buf = String::new();
-            assert!(self.stdout.read_line(&mut buf).unwrap() > 0, "McpHub s'est arrete");
-            let Ok(msg) = serde_json::from_str::<Value>(&buf) else { continue };
+            assert!(
+                self.stdout.read_line(&mut buf).unwrap() > 0,
+                "McpHub s'est arrete"
+            );
+            let Ok(msg) = serde_json::from_str::<Value>(&buf) else {
+                continue;
+            };
             if msg.get("id") == Some(&json!(id)) {
                 return msg;
             }
@@ -145,7 +184,12 @@ impl Hub {
     }
 
     /// `mcphub_call` avec le dossier de l'appelant ; renvoie le texte ou l'erreur.
-    fn call(&mut self, server: &str, working_dir: Option<&Path>, cwd: Option<&Path>) -> Result<String, String> {
+    fn call(
+        &mut self,
+        server: &str,
+        working_dir: Option<&Path>,
+        cwd: Option<&Path>,
+    ) -> Result<String, String> {
         let mut ctx = serde_json::Map::new();
         if let Some(w) = working_dir {
             ctx.insert("working_dir".into(), json!(w));
@@ -157,11 +201,17 @@ impl Hub {
         if !ctx.is_empty() {
             args["_mcphub_context"] = Value::Object(ctx);
         }
-        let resp = self.request("tools/call", json!({ "name": "mcphub_call", "arguments": args }));
+        let resp = self.request(
+            "tools/call",
+            json!({ "name": "mcphub_call", "arguments": args }),
+        );
         if let Some(err) = resp.get("error") {
             return Err(err["message"].as_str().unwrap_or_default().to_string());
         }
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap_or_default().to_string();
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         if resp["result"]["isError"] == json!(true) {
             return Err(text);
         }
@@ -207,16 +257,39 @@ fn un_tenant_n_utilise_jamais_les_jetons_mcphub_et_inversement() {
     let out = hub.call("svc", Some(&acme_src), None).unwrap();
     assert!(out.contains("token=acme-secret"), "{}", out);
     assert!(!out.contains("hub-secret"), "{}", out);
-    assert!(out.contains(&format!("home={}", fx.homes.join("acme").join("home").display())), "{}", out);
-    assert!(out.contains("p8= "), "cle .p8 McpHub non transmise : {}", out);
-    assert!(out.contains("leak= "), "variable du demon non transmise : {}", out);
+    assert!(
+        out.contains(&format!(
+            "home={}",
+            fx.homes.join("acme").join("home").display()
+        )),
+        "{}",
+        out
+    );
+    assert!(
+        out.contains("p8= "),
+        "cle .p8 McpHub non transmise : {}",
+        out
+    );
+    assert!(
+        out.contains("leak= "),
+        "variable du demon non transmise : {}",
+        out
+    );
     assert!(out.ends_with("ssh="), "agent SSH non transmis : {}", out);
 
     // Lecture mise en cache : chaque périmètre garde la sienne.
     let again = hub.call("svc", None, None).unwrap();
-    assert!(again.contains("token=hub-secret"), "cache partage avec le tenant : {}", again);
+    assert!(
+        again.contains("token=hub-secret"),
+        "cache partage avec le tenant : {}",
+        again
+    );
     let again = hub.call("svc", None, Some(&fx.acme)).unwrap();
-    assert!(again.contains("token=acme-secret"), "dossier courant du client ignore : {}", again);
+    assert!(
+        again.contains("token=acme-secret"),
+        "dossier courant du client ignore : {}",
+        again
+    );
 
     // Depuis le tenant, un serveur qui n'est pas le sien est refusé (pas de repli McpHub).
     let err = hub.call("other", Some(&fx.acme), None).unwrap_err();
@@ -236,20 +309,32 @@ fn un_tenant_n_utilise_jamais_les_jetons_mcphub_et_inversement() {
     // Journal d'audit : le tenant de chaque appel, jamais la valeur d'un secret. Écrit en
     // tâche de fond : on lui laisse quelques instants.
     let expected = |entries: &[Value]| {
-        entries.iter().any(|e| e["tenant"] == "acme" && e["status"] == "ok" && e["server"] == "svc")
-            && entries.iter().any(|e| e["tenant"] == "acme" && e["decision"] == "deny" && e["server"] == "other")
-            && entries.iter().any(|e| e.get("tenant").is_none() && e["status"] == "ok")
+        entries
+            .iter()
+            .any(|e| e["tenant"] == "acme" && e["status"] == "ok" && e["server"] == "svc")
+            && entries
+                .iter()
+                .any(|e| e["tenant"] == "acme" && e["decision"] == "deny" && e["server"] == "other")
+            && entries
+                .iter()
+                .any(|e| e.get("tenant").is_none() && e["status"] == "ok")
     };
     let mut audit = String::new();
     for _ in 0..50 {
         audit = std::fs::read_to_string(fx.hub.join("audit.jsonl")).unwrap_or_default();
-        let entries: Vec<Value> = audit.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+        let entries: Vec<Value> = audit
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
         if expected(&entries) {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    let entries: Vec<Value> = audit.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+    let entries: Vec<Value> = audit
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
     assert!(expected(&entries), "{}", audit);
     assert!(!audit.contains("acme-secret") && !audit.contains("hub-secret"));
 }
@@ -273,11 +358,17 @@ fn une_confirmation_ne_vaut_que_pour_son_perimetre() {
         if let Some(t) = token {
             args["confirmation_token"] = json!(t);
         }
-        hub.request("tools/call", json!({ "name": "mcphub_call", "arguments": args }))
+        hub.request(
+            "tools/call",
+            json!({ "name": "mcphub_call", "arguments": args }),
+        )
     };
     // Jeton délivré pour le compte McpHub.
     let asked = call(&mut hub, None, None);
-    let token = asked["result"]["_meta"]["mcphub"]["confirmation_token"].as_str().unwrap().to_string();
+    let token = asked["result"]["_meta"]["mcphub"]["confirmation_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
     // Présenté depuis le dossier du tenant : refusé, l'appel ne part pas.
     let reused = call(&mut hub, Some(&fx.acme), Some(&token));
     let text = reused.to_string();
@@ -298,20 +389,33 @@ fn gestion_des_serveurs_par_l_agent() {
     let projects_path = fx.hub.join("projects.json");
     let mut projects = read_json(&projects_path);
     projects["projects"]["acme"]["sharedServers"] = json!(["mcphub"]);
-    std::fs::write(&projects_path, serde_json::to_string_pretty(&projects).unwrap()).unwrap();
+    std::fs::write(
+        &projects_path,
+        serde_json::to_string_pretty(&projects).unwrap(),
+    )
+    .unwrap();
     let mut hub = fx.start();
-    let admin = |hub: &mut Hub, tool: &str, arguments: Value, wd: Option<&Path>, token: Option<&str>| {
-        let mut args = json!({ "server": "mcphub", "tool": tool, "arguments": arguments });
-        if let Some(w) = wd {
-            args["_mcphub_context"] = json!({ "working_dir": w });
-        }
-        if let Some(t) = token {
-            args["confirmation_token"] = json!(t);
-        }
-        hub.request("tools/call", json!({ "name": "mcphub_call", "arguments": args }))
-    };
+    let admin =
+        |hub: &mut Hub, tool: &str, arguments: Value, wd: Option<&Path>, token: Option<&str>| {
+            let mut args = json!({ "server": "mcphub", "tool": tool, "arguments": arguments });
+            if let Some(w) = wd {
+                args["_mcphub_context"] = json!({ "working_dir": w });
+            }
+            if let Some(t) = token {
+                args["confirmation_token"] = json!(t);
+            }
+            hub.request(
+                "tools/call",
+                json!({ "name": "mcphub_call", "arguments": args }),
+            )
+        };
     let text = |resp: &Value| -> Value {
-        serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap_or("null")).unwrap_or(Value::Null)
+        serde_json::from_str(
+            resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("null"),
+        )
+        .unwrap_or(Value::Null)
     };
 
     // Liste : le serveur utilisé par le tenant est signalé, la valeur du jeton n'apparaît pas.
@@ -319,38 +423,73 @@ fn gestion_des_serveurs_par_l_agent() {
     let listed_text = listed.to_string();
     assert!(!listed_text.contains("hub-secret"), "{}", listed_text);
     let rows = text(&listed);
-    let svc = rows["servers"].as_array().unwrap().iter().find(|r| r["name"] == "svc").unwrap().clone();
+    let svc = rows["servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "svc")
+        .unwrap()
+        .clone();
     assert_eq!(svc["tenants"], json!(["acme"]));
     let revision = rows["revision"].as_str().unwrap().to_string();
 
     // Désactiver : sans confirmation, avec sauvegarde.
-    let off = admin(&mut hub, "server_disable", json!({ "name": "other", "revision": revision }), None, None);
+    let off = admin(
+        &mut hub,
+        "server_disable",
+        json!({ "name": "other", "revision": revision }),
+        None,
+        None,
+    );
     assert_eq!(text(&off)["ok"], true, "{}", off);
     assert_eq!(read_json(&path)["servers"]["other"]["disabled"], true);
     assert!(std::fs::read_dir(fx.hub.join("backups")).unwrap().count() >= 1);
 
     // Même avec "mcphub" partagé, aucune modification depuis le dossier du tenant.
-    let from_tenant = admin(&mut hub, "server_enable", json!({ "name": "other" }), Some(&fx.acme), None).to_string();
+    let from_tenant = admin(
+        &mut hub,
+        "server_enable",
+        json!({ "name": "other" }),
+        Some(&fx.acme),
+        None,
+    )
+    .to_string();
     assert!(from_tenant.contains("toujours refuse"), "{}", from_tenant);
     assert_eq!(read_json(&path)["servers"]["other"]["disabled"], true);
-    let list_from_tenant = admin(&mut hub, "servers_list", json!({}), Some(&fx.acme), None).to_string();
-    assert!(list_from_tenant.contains("toujours refuse"), "{}", list_from_tenant);
+    let list_from_tenant =
+        admin(&mut hub, "servers_list", json!({}), Some(&fx.acme), None).to_string();
+    assert!(
+        list_from_tenant.contains("toujours refuse"),
+        "{}",
+        list_from_tenant
+    );
 
     // Ajouter : confirmation obligatoire, puis ajout avec le jeton.
     let add_args = json!({ "name": "extra", "command": "/bin/echo", "env": { "EXTRA_TOKEN": "${EXTRA_ABSENT_TOKEN}" } });
     let asked = admin(&mut hub, "server_add", add_args.clone(), None, None);
-    assert_eq!(asked["result"]["_meta"]["mcphub"]["status"], "confirmation_required", "{}", asked);
+    assert_eq!(
+        asked["result"]["_meta"]["mcphub"]["status"], "confirmation_required",
+        "{}",
+        asked
+    );
     assert!(read_json(&path)["servers"].get("extra").is_none());
-    let token = asked["result"]["_meta"]["mcphub"]["confirmation_token"].as_str().unwrap().to_string();
+    let token = asked["result"]["_meta"]["mcphub"]["confirmation_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let added = text(&admin(&mut hub, "server_add", add_args, None, Some(&token)));
     assert_eq!(added["ok"], true, "{}", added);
     assert_eq!(added["missingVariables"], json!(["EXTRA_ABSENT_TOKEN"]));
     assert_eq!(read_json(&path)["servers"]["extra"]["sandbox"], "shield");
 
     // Secret en clair : refusé, même avec confirmation.
-    let leak = json!({ "name": "leak", "command": "/bin/echo", "env": { "API_KEY": "plain-value-123" } });
+    let leak =
+        json!({ "name": "leak", "command": "/bin/echo", "env": { "API_KEY": "plain-value-123" } });
     let asked = admin(&mut hub, "server_add", leak.clone(), None, None);
-    let token = asked["result"]["_meta"]["mcphub"]["confirmation_token"].as_str().unwrap().to_string();
+    let token = asked["result"]["_meta"]["mcphub"]["confirmation_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let refused = admin(&mut hub, "server_add", leak, None, Some(&token));
     assert_eq!(refused["result"]["isError"], true, "{}", refused);
     assert!(read_json(&path)["servers"].get("leak").is_none());
@@ -391,29 +530,46 @@ fn cli_tenant_et_coffre_du_tenant() {
             .spawn()
             .unwrap();
         if let Some(input) = stdin {
-            child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
         }
         let out = child.wait_with_output().unwrap();
         (
             out.status.success(),
-            String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr),
+            String::from_utf8_lossy(&out.stdout).into_owned()
+                + &String::from_utf8_lossy(&out.stderr),
         )
     };
 
-    let (ok, out) = run(&["tenant", "add", "beta", "--dir", beta.to_str().unwrap()], None);
+    let (ok, out) = run(
+        &["tenant", "add", "beta", "--dir", beta.to_str().unwrap()],
+        None,
+    );
     assert!(ok, "{}", out);
     let backups = std::fs::read_dir(&fx.hub)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().starts_with("projects.json.avant-tenant-beta-"))
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("projects.json.avant-tenant-beta-")
+        })
         .count();
     assert_eq!(backups, 1, "sauvegarde de projects.json");
 
     // Secret du tenant : dans son coffre, pas dans celui de McpHub.
-    let (ok, out) = run(&["vault", "set", "--tenant", "beta", "BETA_TOKEN"], Some("beta-secret\n"));
+    let (ok, out) = run(
+        &["vault", "set", "--tenant", "beta", "BETA_TOKEN"],
+        Some("beta-secret\n"),
+    );
     assert!(ok, "{}", out);
     assert!(!out.contains("beta-secret"), "valeur affichee : {}", out);
-    let tenant_env = std::fs::read_to_string(fx.hub.join("tenants").join("beta").join("secrets.env")).unwrap();
+    let tenant_env =
+        std::fs::read_to_string(fx.hub.join("tenants").join("beta").join("secrets.env")).unwrap();
     assert!(tenant_env.contains("BETA_TOKEN=beta-secret"));
     let hub_env = std::fs::read_to_string(fx.hub.join("secrets.env")).unwrap();
     assert!(!hub_env.contains("BETA_TOKEN"));
@@ -431,11 +587,18 @@ fn cli_tenant_et_coffre_du_tenant() {
     assert!(ok, "{}", out);
     assert!(!fx.hub.join("tenants").join("beta").exists());
     let projects: Value =
-        serde_json::from_str(&std::fs::read_to_string(fx.hub.join("projects.json")).unwrap()).unwrap();
+        serde_json::from_str(&std::fs::read_to_string(fx.hub.join("projects.json")).unwrap())
+            .unwrap();
     assert!(projects["projects"]["beta"].get("tenant").is_none());
-    assert_eq!(projects["projects"]["acme"]["tenant"], "acme", "les autres tenants restent");
+    assert_eq!(
+        projects["projects"]["acme"]["tenant"], "acme",
+        "les autres tenants restent"
+    );
     // Le coffre McpHub n'a pas bougé.
-    assert_eq!(std::fs::read_to_string(fx.hub.join("secrets.env")).unwrap(), "HUB_TOKEN=hub-secret\n");
+    assert_eq!(
+        std::fs::read_to_string(fx.hub.join("secrets.env")).unwrap(),
+        "HUB_TOKEN=hub-secret\n"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -457,7 +620,11 @@ impl Drop for Daemon {
 
 impl Daemon {
     fn start(fx: &Fixture) -> Self {
-        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
         let child = fx
             .command()
             .arg("serve")
@@ -467,26 +634,46 @@ impl Daemon {
             .env("MCPHUB_NO_DIALOG", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(if std::env::var("MCPHUB_TEST_STDERR").is_ok() { Stdio::inherit() } else { Stdio::null() })
+            .stderr(if std::env::var("MCPHUB_TEST_STDERR").is_ok() {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
             .spawn()
             .expect("McpHub serve");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-            assert!(std::time::Instant::now() < deadline, "le demon n'ecoute pas");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "le demon n'ecoute pas"
+            );
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         // Le jeton est créé par le démon à la première requête.
-        let mut daemon = Self { child, port, token: String::new() };
+        let mut daemon = Self {
+            child,
+            port,
+            token: String::new(),
+        };
         let (status, _) = daemon.raw("GET", "/api/tenants", None, None, None);
         assert_eq!(status, 401);
-        daemon.token = std::fs::read_to_string(fx.hub.join("auth-token")).expect("jeton du demon").trim().to_string();
+        daemon.token = std::fs::read_to_string(fx.hub.join("auth-token"))
+            .expect("jeton du demon")
+            .trim()
+            .to_string();
         daemon
     }
 
     /// Requête comme le tableau de bord : Host et Origin locaux, jeton Bearer.
     fn call(&self, method: &str, path: &str, body: Option<&Value>) -> (u16, String) {
         let origin = format!("http://127.0.0.1:{}", self.port);
-        self.raw(method, path, body.map(|b| b.to_string()), Some(&self.token), Some(&origin))
+        self.raw(
+            method,
+            path,
+            body.map(|b| b.to_string()),
+            Some(&self.token),
+            Some(&origin),
+        )
     }
 
     fn json(&self, method: &str, path: &str, body: Option<&Value>) -> (u16, Value) {
@@ -494,7 +681,14 @@ impl Daemon {
         (status, serde_json::from_str(&text).unwrap_or(Value::Null))
     }
 
-    fn raw(&self, method: &str, path: &str, body: Option<String>, token: Option<&str>, origin: Option<&str>) -> (u16, String) {
+    fn raw(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<String>,
+        token: Option<&str>,
+        origin: Option<&str>,
+    ) -> (u16, String) {
         use std::io::Read;
         let body = body.unwrap_or_default();
         let mut request = format!(
@@ -513,12 +707,21 @@ impl Daemon {
         request.push_str("\r\n");
         request.push_str(&body);
         let mut stream = std::net::TcpStream::connect(("127.0.0.1", self.port)).unwrap();
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(30))).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+            .unwrap();
         stream.write_all(request.as_bytes()).unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
-        let status = response.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-        let text = response.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
+        let status = response
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let text = response
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_string())
+            .unwrap_or_default();
         (status, text)
     }
 }
@@ -558,18 +761,35 @@ fn ecran_client_accounts_par_http() {
         Some("http://evil.example"),
     );
     assert_eq!(status, 403);
-    assert!(std::fs::read_to_string(&tenant_secrets).unwrap().contains("ACME_TOKEN=acme-secret"));
+    assert!(std::fs::read_to_string(&tenant_secrets)
+        .unwrap()
+        .contains("ACME_TOKEN=acme-secret"));
 
     // Lecture : noms et états seulement, jamais une valeur.
     let (status, text) = daemon.call("GET", "/api/tenants", None);
     assert_eq!(status, 200, "{}", text);
-    assert!(!text.contains("acme-secret") && !text.contains("hub-secret"), "valeur de secret renvoyee : {}", text);
+    assert!(
+        !text.contains("acme-secret") && !text.contains("hub-secret"),
+        "valeur de secret renvoyee : {}",
+        text
+    );
     let snapshot: Value = serde_json::from_str(&text).unwrap();
     let acme = &snapshot["tenants"][0];
     assert_eq!(acme["id"], "acme");
-    assert_eq!(acme["servers"][0]["secrets"][0], json!({ "var": "TOKEN", "name": "ACME_TOKEN", "present": true }));
-    assert_eq!(acme["cf"]["projects"], json!([{ "name": "acme-site", "cf_project_name": "acme-pages", "type": "pages" }]));
-    let svc = snapshot["available"].as_array().unwrap().iter().find(|a| a["name"] == "svc").unwrap();
+    assert_eq!(
+        acme["servers"][0]["secrets"][0],
+        json!({ "var": "TOKEN", "name": "ACME_TOKEN", "present": true })
+    );
+    assert_eq!(
+        acme["cf"]["projects"],
+        json!([{ "name": "acme-site", "cf_project_name": "acme-pages", "type": "pages" }])
+    );
+    let svc = snapshot["available"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["name"] == "svc")
+        .unwrap();
     assert_eq!(svc["required"], json!(["TOKEN"]));
     assert_eq!(svc["optional"], json!(["P8"]));
     let version = snapshot["version"].as_str().unwrap().to_string();
@@ -582,32 +802,47 @@ fn ecran_client_accounts_par_http() {
     );
     assert_eq!(status, 200, "{}", text);
     assert!(!text.contains("acme-rotated"));
-    assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["replaced"], true);
-    assert!(std::fs::read_to_string(&tenant_secrets).unwrap().contains("ACME_TOKEN=acme-rotated"));
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).unwrap()["replaced"],
+        true
+    );
+    assert!(std::fs::read_to_string(&tenant_secrets)
+        .unwrap()
+        .contains("ACME_TOKEN=acme-rotated"));
     // Le coffre McpHub n'est pas touché.
-    assert!(std::fs::read_to_string(fx.hub.join("secrets.env")).unwrap().contains("HUB_TOKEN=hub-secret"));
+    assert!(std::fs::read_to_string(fx.hub.join("secrets.env"))
+        .unwrap()
+        .contains("HUB_TOKEN=hub-secret"));
 
     // Seuls les secrets déclarés par les serveurs du client s'écrivent ici.
     for name in ["HUB_TOKEN", "MCPHUB_OAUTH_SVC", "bad-name"] {
-        let (status, _) =
-            daemon.call("PUT", &format!("/api/tenants/acme/secrets/{}", name), Some(&json!({ "value": "x" })));
+        let (status, _) = daemon.call(
+            "PUT",
+            &format!("/api/tenants/acme/secrets/{}", name),
+            Some(&json!({ "value": "x" })),
+        );
         assert_eq!(status, 400, "{}", name);
     }
-    let (status, _) =
-        daemon.call("PUT", "/api/tenants/acme/secrets/ACME_TOKEN", Some(&json!({ "value": "a\nb" })));
+    let (status, _) = daemon.call(
+        "PUT",
+        "/api/tenants/acme/secrets/ACME_TOKEN",
+        Some(&json!({ "value": "a\nb" })),
+    );
     assert_eq!(status, 400);
     let big = json!({ "value": "x".repeat(17 * 1024) });
     let (status, _) = daemon.call("PUT", "/api/tenants/acme/secrets/ACME_TOKEN", Some(&big));
     assert_eq!(status, 413);
 
     // Serveurs du client : version périmée refusée, puis écriture avec sauvegarde.
-    let servers = json!({ "servers": { "svc": ["TOKEN", "P8"] }, "shared": ["other"], "version": "0-0" });
+    let servers =
+        json!({ "servers": { "svc": ["TOKEN", "P8"] }, "shared": ["other"], "version": "0-0" });
     let (status, _) = daemon.json("PUT", "/api/tenants/acme/servers", Some(&servers));
     assert_eq!(status, 409);
     let unknown = json!({ "servers": { "nope": [] }, "shared": [], "version": version });
     let (status, _) = daemon.json("PUT", "/api/tenants/acme/servers", Some(&unknown));
     assert_eq!(status, 400);
-    let servers = json!({ "servers": { "svc": ["TOKEN", "P8"] }, "shared": ["other"], "version": version });
+    let servers =
+        json!({ "servers": { "svc": ["TOKEN", "P8"] }, "shared": ["other"], "version": version });
     let (status, body) = daemon.json("PUT", "/api/tenants/acme/servers", Some(&servers));
     assert_eq!(status, 200, "{}", body);
     assert!(Path::new(body["backup"].as_str().unwrap()).exists());
@@ -631,14 +866,18 @@ fn ecran_client_accounts_par_http() {
     let version = fresh["version"].as_str().unwrap().to_string();
     let beta_dir = fx.root.join("clients").join("beta");
     std::fs::create_dir_all(&beta_dir).unwrap();
-    let overlap = json!({ "id": "beta", "dir": fx.acme.join("sub").to_string_lossy(), "version": version });
+    let overlap =
+        json!({ "id": "beta", "dir": fx.acme.join("sub").to_string_lossy(), "version": version });
     std::fs::create_dir_all(fx.acme.join("sub")).unwrap();
     let (status, _) = daemon.json("POST", "/api/tenants", Some(&overlap));
     assert_eq!(status, 400);
     let add = json!({ "id": "beta", "dir": beta_dir.to_string_lossy(), "version": version });
     let (status, body) = daemon.json("POST", "/api/tenants", Some(&add));
     assert_eq!(status, 200, "{}", body);
-    assert_eq!(read_json(&projects_path)["projects"]["beta"]["tenant"], "beta");
+    assert_eq!(
+        read_json(&projects_path)["projects"]["beta"]["tenant"],
+        "beta"
+    );
 
     // Retrait : version exigée, périmée refusée avant la fenêtre ; sans fenêtre validée, rien n'est effacé.
     let (status, _) = daemon.json("DELETE", "/api/tenants/acme", None);
@@ -647,9 +886,16 @@ fn ecran_client_accounts_par_http() {
     assert_eq!(status, 409);
     let (_, fresh) = daemon.json("GET", "/api/tenants", None);
     let version = fresh["version"].as_str().unwrap().to_string();
-    let (status, body) = daemon.json("DELETE", &format!("/api/tenants/acme?version={}", version), None);
+    let (status, body) = daemon.json(
+        "DELETE",
+        &format!("/api/tenants/acme?version={}", version),
+        None,
+    );
     assert_eq!(status, 403, "{}", body);
-    assert_eq!(read_json(&projects_path)["projects"]["acme"]["tenant"], "acme");
+    assert_eq!(
+        read_json(&projects_path)["projects"]["acme"]["tenant"],
+        "acme"
+    );
     assert!(tenant_secrets.exists());
 
     // Audit : l'action et le nom du secret, jamais la valeur (écriture en tâche de fond).
@@ -663,7 +909,11 @@ fn ecran_client_accounts_par_http() {
             assert!(!text.contains("acme-rotated"));
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "audit incomplet : {}", text);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "audit incomplet : {}",
+            text
+        );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
