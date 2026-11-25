@@ -135,12 +135,27 @@ function emptyUsage() {
 
 const countOf = (value) => (Number.isFinite(value) && value > 0 ? value : 0);
 
+/** Gain de la réduction des résultats ; vide tant qu'aucune taille brute n'a été comptée. */
+function shapingSavings(rawBytes, deliveredBytes) {
+  if (!countOf(rawBytes)) return {};
+  const savedBytes = Math.max(0, rawBytes - deliveredBytes);
+  return {
+    rawBytes,
+    savedBytes,
+    savedPercent: Math.round((savedBytes / rawBytes) * 1000) / 10,
+    approximateTokensSaved: Math.round(savedBytes / 4)
+  };
+}
+
 function addUsage(target, added) {
   for (const counter of usageCounters) target[counter] += countOf(added?.[counter]);
   for (const [server, entry] of Object.entries(added?.byServer ?? {})) {
     const total = (target.byServer[server] ??= { calls: 0, resultBytes: 0 });
     total.calls += countOf(entry?.calls);
     total.resultBytes += countOf(entry?.resultBytes);
+    // Comptés ensemble, appel par appel : le gain ne mélange pas d'anciens appels sans taille brute.
+    total.rawBytes = countOf(total.rawBytes) + countOf(entry?.rawBytes);
+    total.measuredBytes = countOf(total.measuredBytes) + countOf(entry?.measuredBytes);
   }
   return target;
 }
@@ -237,12 +252,17 @@ function markUsageDirty() {
   usageFlushTimer.unref?.();
 }
 
-// Ce que l'agent reçoit réellement d'un serveur, après réduction du résultat :
-// c'est ce volume qui entre dans son contexte.
-function recordServerUsage(server, delivered) {
-  const entry = (usage.byServer[server] ??= { calls: 0, resultBytes: 0 });
+// Ce que l'agent reçoit réellement d'un serveur, après réduction du résultat (c'est ce volume
+// qui entre dans son contexte), et ce que le serveur avait renvoyé avant réduction.
+function recordServerUsage(server, raw, delivered) {
+  // Un nom de serveur inconnu (faute de frappe) n'est pas un serveur : rien à attribuer.
+  if (raw?.isError && unknownServerPattern.test(extractText(raw))) return;
+  const entry = (usage.byServer[server] ??= { calls: 0, resultBytes: 0, rawBytes: 0, measuredBytes: 0 });
+  const deliveredBytes = Buffer.byteLength(JSON.stringify(delivered) ?? '');
   entry.calls += 1;
-  entry.resultBytes += Buffer.byteLength(JSON.stringify(delivered) ?? '');
+  entry.resultBytes += deliveredBytes;
+  entry.rawBytes += Buffer.byteLength(JSON.stringify(raw) ?? '');
+  entry.measuredBytes += deliveredBytes;
   markUsageDirty();
 }
 
@@ -1778,7 +1798,7 @@ registerHubTool(
         workingDirectory: working_dir
       });
       const shaped = shapeChildResult(result, pickShaping(shaping), childServer).result;
-      recordServerUsage(childServer, shaped);
+      recordServerUsage(childServer, result, shaped);
       return shaped;
     } catch (error) {
       return errorToResult(error);
@@ -1835,7 +1855,7 @@ registerHubTool(
           });
           const status = callStatus(result);
           const shaped = shapeChildResult(result, pickShaping(call), call.server);
-          recordServerUsage(call.server, shaped.value);
+          recordServerUsage(call.server, result, shaped.value);
           return {
             id: call.id,
             ok: status === 'ok',
@@ -2084,14 +2104,19 @@ registerHubTool(
         },
         perServer: {
           servers: Object.entries(serverUsage)
-            .map(([server, { calls, resultBytes }]) => ({
+            .map(([server, { calls, resultBytes, rawBytes, measuredBytes }]) => ({
               server,
               calls,
               resultBytes,
-              approximateTokens: Math.round(resultBytes / 4)
+              approximateTokens: Math.round(resultBytes / 4),
+              ...shapingSavings(rawBytes, measuredBytes)
             }))
             .sort((left, right) => right.resultBytes - left.resultBytes),
-          note: 'Result bytes delivered to the agent by mcphub_call and mcphub_batch, after shaping, counted since this field was added. Calls made inside mcphub_run scripts are not attributed to a server. Bytes divided by four.'
+          shaping: shapingSavings(
+            Object.values(serverUsage).reduce((sum, entry) => sum + countOf(entry.rawBytes), 0),
+            Object.values(serverUsage).reduce((sum, entry) => sum + countOf(entry.measuredBytes), 0)
+          ),
+          note: 'Result bytes delivered to the agent by mcphub_call and mcphub_batch, after shaping, counted since this field was added. rawBytes is what the child server returned before shaping, counted since it was added (calls recorded earlier have no raw size and are left out of the savings). Calls made inside mcphub_run scripts are not attributed to a server. Bytes divided by four.'
         },
         actualUsage: totalUsage
       });

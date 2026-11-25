@@ -396,7 +396,14 @@ try {
   for (const entry of perServer) {
     assert.ok(entry.calls > 0 && entry.resultBytes > 0, JSON.stringify(entry));
     assert.equal(entry.approximateTokens, Math.round(entry.resultBytes / 4));
+    // Size returned by the child server before shaping, and what shaping removed from it.
+    assert.ok(entry.rawBytes > 0 && entry.savedBytes >= 0 && entry.savedBytes < entry.rawBytes, JSON.stringify(entry));
+    assert.equal(entry.approximateTokensSaved, Math.round(entry.savedBytes / 4));
   }
+  const shaping = savingsReport.perServer.shaping;
+  assert.equal(shaping.rawBytes, perServer.reduce((sum, entry) => sum + entry.rawBytes, 0));
+  assert.equal(shaping.savedBytes, perServer.reduce((sum, entry) => sum + entry.savedBytes, 0));
+  assert.ok(shaping.savedPercent >= 0 && shaping.savedPercent <= 100, JSON.stringify(shaping));
   assert.deepEqual(perServer.map((entry) => entry.resultBytes), perServer.map((entry) => entry.resultBytes).sort((a, b) => b - a));
   // A call refused before any result came back (bad shaping arguments) is counted in the total only.
   const deliveredCalls = perServer.reduce((sum, entry) => sum + entry.calls, 0);
