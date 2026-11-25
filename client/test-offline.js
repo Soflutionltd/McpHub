@@ -37,6 +37,10 @@ function fakeHub() {
     async (args) => {
       received.push(args);
       if (args.tool === 'send_email') return new Promise(() => {});
+      if (args.tool === 'slow_report') {
+        await new Promise((resolve) => setTimeout(resolve, 600));
+        return { content: [{ type: 'text', text: 'report ready' }] };
+      }
       if (args.tool === 'recall' && args.arguments?.episodes_only) {
         return { content: [{ type: 'text', text: JSON.stringify({ episodes: [{ id: 'ep-1' }] }) }] };
       }
@@ -639,6 +643,75 @@ try {
     assert.ok(reports.every((report) => report.perServer.servers.some((entry) => entry.server === 'windows')));
   } finally {
     await Promise.all(windows.map((window) => window.close()));
+  }
+
+  // A call longer than the answer delay gets a waiting answer instead of being cut by the
+  // MCP client; it keeps running once, and its result is read by handle.
+  const patient = new Client({ name: 'mcphub-offline-pending', version: '1.0.0' });
+  await patient.connect(
+    new StdioClientTransport({
+      command: process.execPath,
+      args: [process.env.MCPHUB_CLIENT_ENTRY ?? 'index.js'],
+      cwd: new URL('.', import.meta.url).pathname,
+      env: {
+        ...process.env,
+        ...clientEnv,
+        MCPHUB_ANSWER_BEFORE_MS: '200',
+        MCPHUB_CALL_TIMEOUT_MS: '900'
+      },
+      stderr: 'pipe'
+    })
+  );
+  try {
+    const callResult = (handle) =>
+      patient.callTool({
+        name: 'mcphub_call',
+        arguments: { server: 'mcphub', tool: 'call_result', arguments: { handle } }
+      });
+    const slow = await patient.callTool({
+      name: 'mcphub_call',
+      arguments: { server: 'reports', tool: 'slow_report', arguments: {} }
+    });
+    assert.notEqual(slow.isError, true);
+    assert.equal(slow._meta?.mcphub?.status, 'pending');
+    assert.equal(slow._meta.mcphub.handle, 'c1');
+    assert.match(text(slow), /Do not call it again.*"handle":"c1"/);
+
+    // Still running: the same handle is given again, nothing is replayed.
+    const waiting = await callResult('c1');
+    assert.equal(waiting._meta?.mcphub?.status, 'pending');
+    assert.equal(waiting._meta.mcphub.handle, 'c1');
+
+    let ready = await callResult('c1');
+    while (ready._meta?.mcphub?.status === 'pending') ready = await callResult('c1');
+    assert.equal(text(ready), 'report ready');
+    assert.equal(received.filter((call) => call.tool === 'slow_report').length, 1);
+
+    // A result is read once.
+    const gone = await callResult('c1');
+    assert.equal(gone.isError, true);
+    assert.match(text(gone), /No pending call for handle "c1"/);
+
+    // A quick call is answered directly.
+    const quick = await patient.callTool({
+      name: 'mcphub_call',
+      arguments: { server: 'db', tool: 'read_row', arguments: { id: 3 } }
+    });
+    assert.equal(text(quick), 'done read_row');
+    assert.equal(quick._meta?.mcphub?.status, undefined);
+
+    // A call that fails in the background reports its failure through the handle.
+    const stuck = await patient.callTool({
+      name: 'mcphub_call',
+      arguments: { server: 'mail', tool: 'send_email', arguments: { to: 'b@example.com' } }
+    });
+    assert.equal(stuck._meta?.mcphub?.status, 'pending');
+    let failed = await callResult(stuck._meta.mcphub.handle);
+    while (failed._meta?.mcphub?.status === 'pending') failed = await callResult(stuck._meta.mcphub.handle);
+    assert.equal(failed.isError, true);
+    assert.equal(failed._meta?.mcphub?.status, 'unknown_outcome');
+  } finally {
+    await patient.close();
   }
 
   console.log('offline client tests: ok');

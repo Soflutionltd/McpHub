@@ -51,6 +51,10 @@ const daemonApiUrl = new URL('/api/servers', daemonBaseUrl);
 // mais bornée pour ne jamais laisser une requête pendre indéfiniment.
 const childCallTimeoutMs = Number(process.env.MCPHUB_CALL_TIMEOUT_MS ?? 600_000);
 const daemonProbeTimeoutMs = 1_500;
+// Délai au-delà duquel un appel reçoit une réponse d'attente au lieu de laisser le
+// client MCP le couper, et nombre d'appels gardés en attente de lecture.
+const answerBeforeMs = Number(process.env.MCPHUB_ANSWER_BEFORE_MS ?? 50_000);
+const pendingCallLimit = 20;
 const daemonRetryIntervalMs = Number(process.env.MCPHUB_DAEMON_RETRY_MS ?? 60_000);
 const usageFlushDelayMs = 2_000;
 // Verrou du fichier de statistiques : attente maximale, et âge au-delà duquel il est abandonné.
@@ -1514,8 +1518,77 @@ function registerHubTool(name, config, handler) {
   hubTools.set(name, config);
   return server.registerTool(name, config, async (...handlerArgs) => {
     await refreshProjects();
-    return handler(...handlerArgs);
+    return answerInTime(name, handler(...handlerArgs));
   });
+}
+
+// ---------------------------------------------------------------------------
+// Appels longs : l'app Claude coupe un appel d'outil resté 60 s sans réponse
+// (« Request timed out », mesuré le 2026-11-25 ; elle ne fournit pas de jeton de
+// progression, donc rien ne repousse ce délai), et a déjà marqué McpHub
+// indisponible après une telle coupure. On répond donc avant : passé
+// answerBeforeMs, l'appel continue ici et son résultat se lit par poignée
+// (server "mcphub", tool "call_result").
+// ---------------------------------------------------------------------------
+
+const pendingCalls = new Map();
+let pendingCallCount = 0;
+
+function waitFor(outcome, delayMs) {
+  let timer;
+  const late = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(undefined), delayMs);
+  });
+  return Promise.race([outcome, late]).finally(() => clearTimeout(timer));
+}
+
+function deliver(settled) {
+  if (settled.error) throw settled.error;
+  return settled.value;
+}
+
+function pendingNotice(handle, { name, startedAt }) {
+  const seconds = Math.round((Date.now() - startedAt) / 1000);
+  return {
+    ...textResult(
+      `Still running after ${seconds} s: ${name} continues in the background. Do not call it again, it may already have had its effect. Get its result with mcphub_call server "mcphub", tool "call_result", arguments {"handle":"${handle}"}.`
+    ),
+    _meta: { mcphub: { status: 'pending', handle } }
+  };
+}
+
+async function answerInTime(name, work) {
+  const startedAt = Date.now();
+  // Jamais de rejet non géré quand l'appel se termine après la réponse d'attente.
+  const outcome = Promise.resolve(work).then(
+    (value) => ({ value }),
+    (error) => ({ error })
+  );
+  const settled = await waitFor(outcome, answerBeforeMs);
+  if (settled) return deliver(settled);
+  pendingCallCount += 1;
+  const handle = `c${pendingCallCount}`;
+  const pending = { name, startedAt, outcome };
+  pendingCalls.set(handle, pending);
+  while (pendingCalls.size > pendingCallLimit) {
+    pendingCalls.delete(pendingCalls.keys().next().value);
+  }
+  return pendingNotice(handle, pending);
+}
+
+async function readPendingCall({ handle }) {
+  const pending = typeof handle === 'string' ? pendingCalls.get(handle) : undefined;
+  if (!pending) {
+    return textResult(
+      `No pending call for handle "${handle}": its result was already read, or this McpHub client restarted since. Check the effect of the call before running it again.`,
+      true
+    );
+  }
+  // Plus court que answerBeforeMs : cette lecture passe elle-même par answerInTime.
+  const settled = await waitFor(pending.outcome, Math.round(answerBeforeMs * 0.8));
+  if (!settled) return pendingNotice(handle, pending);
+  pendingCalls.delete(handle);
+  return deliver(settled);
 }
 
 const projectFields = {
@@ -1671,6 +1744,7 @@ registerHubTool(
     try {
       if (childServer === hubLocalServer && tool === 'read_result') return readStoredResult(args, working_dir);
       if (childServer === hubLocalServer && tool === 'search_result') return searchStoredResult(args, working_dir);
+      if (childServer === hubLocalServer && tool === 'call_result') return await readPendingCall(args);
       const [projectName, projectConfig] = resolveProject(project, working_dir);
       const securedArgs = enforceProjectPolicy({
         projectName,
