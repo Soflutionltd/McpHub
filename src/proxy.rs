@@ -2328,6 +2328,52 @@ impl ProxyServer {
             }
         };
 
+        // Un argument absent du schéma serait ignoré en silence par beaucoup de serveurs, et
+        // l'outil partirait sur ses valeurs par défaut (`path` au lieu de `project` : audit de
+        // tous les projets au lieu d'un seul). Refusé ici, avant toute confirmation ou exécution.
+        if let Some(schema) = &tool_schema {
+            let unknown = unknown_arguments(schema, &arguments);
+            if !unknown.is_empty() {
+                let accepted = accepted_arguments(schema);
+                let message = format!(
+                    "Unknown argument{} {} for {}/{}: nothing was executed. Accepted arguments: {}.",
+                    if unknown.len() > 1 { "s" } else { "" },
+                    unknown
+                        .iter()
+                        .map(|name| format!("'{}'", name))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    indexed_server_name,
+                    tool,
+                    accepted.join(", "),
+                );
+                self.record_audit(AuditEntry {
+                    server: indexed_server_name.clone(),
+                    tool: tool.clone(),
+                    mode: "discover",
+                    decision: "deny",
+                    policy: "schema".into(),
+                    status: "blocked",
+                    duration_ms: Some(0),
+                    arguments: Some(arguments.clone()),
+                    error: Some(message.clone()),
+                    ..Default::default()
+                })
+                .await;
+                return JsonRpcResponse::error_with_data(
+                    id,
+                    -32602,
+                    message,
+                    serde_json::json!({
+                        "server": indexed_server_name,
+                        "tool": tool,
+                        "unknown_arguments": unknown,
+                        "inputSchema": schema,
+                    }),
+                );
+            }
+        }
+
         // Permissions : appliquées avant le cache, pour qu'un outil bloqué le reste même en cache.
         let confirmation_token = args
             .get("confirmation_token")
@@ -2973,6 +3019,49 @@ fn score_live_tool(tool: &ToolDef, query_lower: &str, query_terms: &[&str]) -> i
     score
 }
 
+/// Noms des arguments déclarés par le schéma d'un outil, dans l'ordre alphabétique.
+fn accepted_arguments(schema: &serde_json::Value) -> Vec<String> {
+    let mut names: Vec<String> = schema
+        .get("properties")
+        .and_then(|v| v.as_object())
+        .map(|properties| properties.keys().cloned().collect())
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// Arguments reçus que le schéma de l'outil ne déclare pas. Vide dès que le schéma ne permet
+/// pas de trancher : pas de `properties`, `additionalProperties` ouvert, ou une combinaison
+/// (`anyOf`, `oneOf`, `allOf`, `patternProperties`, `$ref`) qui peut déclarer d'autres clés.
+fn unknown_arguments(schema: &serde_json::Value, arguments: &serde_json::Value) -> Vec<String> {
+    let Some(received) = arguments.as_object() else {
+        return Vec::new();
+    };
+    let Some(properties) = schema.get("properties").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    if properties.is_empty() {
+        return Vec::new();
+    }
+    let open = match schema.get("additionalProperties") {
+        None | Some(serde_json::Value::Bool(false)) => false,
+        Some(_) => true,
+    };
+    let combined = ["anyOf", "oneOf", "allOf", "patternProperties", "$ref"]
+        .iter()
+        .any(|key| schema.get(key).is_some());
+    if open || combined {
+        return Vec::new();
+    }
+    let mut unknown: Vec<String> = received
+        .keys()
+        .filter(|name| !properties.contains_key(*name))
+        .cloned()
+        .collect();
+    unknown.sort();
+    unknown
+}
+
 /// Strip noise from inputSchema: remove title, examples, $schema, additionalProperties.
 /// Keeps type, properties, required, description (on root only), items, enum.
 fn strip_schema(schema: &serde_json::Value) -> serde_json::Value {
@@ -3388,6 +3477,45 @@ mod tests {
             },
             ..Default::default()
         })
+    }
+
+    #[test]
+    fn argument_absent_du_schema_signale() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"project": {"type": "string"}, "level": {"type": "string"}}
+        });
+        assert_eq!(unknown_arguments(&schema, &json!({"path": "/tmp/app"})), vec!["path"]);
+        assert_eq!(
+            unknown_arguments(&schema, &json!({"zeta": 1, "project": "/tmp/app", "alpha": 2})),
+            vec!["alpha", "zeta"]
+        );
+        assert!(unknown_arguments(&schema, &json!({"project": "/tmp/app"})).is_empty());
+        assert!(unknown_arguments(&schema, &json!({})).is_empty());
+        assert!(unknown_arguments(&schema, &serde_json::Value::Null).is_empty());
+        assert_eq!(accepted_arguments(&schema), vec!["level", "project"]);
+    }
+
+    #[test]
+    fn schema_ouvert_ou_incertain_jamais_bloquant() {
+        let arguments = json!({"path": "/tmp/app"});
+        let properties = json!({"project": {"type": "string"}});
+        for schema in [
+            json!({}),
+            json!({"type": "object"}),
+            json!({"type": "object", "properties": {}}),
+            json!({"properties": properties, "additionalProperties": true}),
+            json!({"properties": properties, "additionalProperties": {"type": "string"}}),
+            json!({"properties": properties, "anyOf": [{"required": ["project"]}]}),
+            json!({"properties": properties, "oneOf": []}),
+            json!({"properties": properties, "allOf": []}),
+            json!({"properties": properties, "patternProperties": {"^x-": {}}}),
+            json!({"properties": properties, "$ref": "#/definitions/args"}),
+        ] {
+            assert!(unknown_arguments(&schema, &arguments).is_empty(), "{schema}");
+        }
+        let closed = json!({"properties": properties, "additionalProperties": false});
+        assert_eq!(unknown_arguments(&closed, &arguments), vec!["path"]);
     }
 
     #[test]
