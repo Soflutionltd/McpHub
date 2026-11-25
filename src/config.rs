@@ -112,6 +112,22 @@ fn names_mcphub(s: &str) -> bool {
     lower.contains("mcphub") || lower.contains("mcp-on-demand")
 }
 
+/// Un argument désigne McpHub quand un élément de son chemin est McpHub (`mcphub`,
+/// `McpHub/client/index.js`, `mcp-hub`…), jamais quand il cite le mot ailleurs : une valeur
+/// comme `com.soflution.mcphub/roots` ne fait pas d'un serveur une copie de McpHub.
+fn arg_names_mcphub(arg: &str) -> bool {
+    let lower = arg.to_lowercase();
+    let bundles = crate::registry::servers_dir()
+        .to_string_lossy()
+        .to_lowercase();
+    let lower = lower.strip_prefix(&bundles).unwrap_or(&lower);
+    lower.split('/').any(|part| {
+        ["mcphub", "mcp-hub", "mcp-on-demand"]
+            .iter()
+            .any(|name| part.starts_with(name))
+    })
+}
+
 fn is_self(name: &str, config: &Value) -> bool {
     let lower = name.to_lowercase();
     if lower == "mcphub" || lower == "mcp-hub" || lower == "mcp-on-demand" {
@@ -125,7 +141,7 @@ fn is_self(name: &str, config: &Value) -> bool {
     if let Some(args) = config.get("args").and_then(|v| v.as_array()) {
         if args
             .iter()
-            .any(|a| a.as_str().map(names_mcphub).unwrap_or(false))
+            .any(|a| a.as_str().map(arg_names_mcphub).unwrap_or(false))
         {
             return true;
         }
@@ -857,6 +873,17 @@ mod tests {
             "test",
             &json!({"command": "node", "args": ["mcphub"]})
         ));
+        assert!(is_self(
+            "client",
+            &json!({"command": "node", "args": ["/Users/me/McpHub/client/index.js"]})
+        ));
+        assert!(
+            !is_self(
+                "simtrail",
+                &json!({"command": "/Users/me/.local/bin/simtrail", "args": ["mcp", "--roots-meta", "com.soflution.mcphub/roots"]})
+            ),
+            "un argument qui cite McpHub ne fait pas du serveur une copie de McpHub"
+        );
         let bundle = crate::registry::servers_dir().join("depsonar/current/dist/index.js");
         assert!(!is_self(
             "depsonar",
