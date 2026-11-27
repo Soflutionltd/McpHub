@@ -759,6 +759,13 @@ pub struct PreparedLogin {
     _login: LoginGuard,
 }
 
+/// Les arguments de `open` pour la page de connexion : `-g` l'ouvre sans faire passer le navigateur
+/// devant, pour ne pas prendre l'ecran de la personne en plein travail. Elle va sur l'onglet quand elle veut.
+#[cfg(any(target_os = "macos", test))]
+fn background_open_args(auth_url: &str) -> [&str; 2] {
+    ["-g", auth_url]
+}
+
 pub async fn interactive_login(
     server: &str,
     url: &str,
@@ -766,12 +773,12 @@ pub async fn interactive_login(
 ) -> Result<(), String> {
     let prepared = prepare_login(server, url, www_authenticate).await?;
     eprintln!(
-        "[McpHub][OAUTH] {} : connexion ouverte dans le navigateur",
+        "[McpHub][OAUTH] {} : connexion ouverte dans un onglet du navigateur, en arriere-plan",
         server
     );
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open")
-        .arg(&prepared.auth_url)
+        .args(background_open_args(&prepared.auth_url))
         .spawn();
     #[cfg(not(target_os = "macos"))]
     eprintln!("[McpHub][OAUTH] Ouvrir : {}", prepared.auth_url);
@@ -1224,7 +1231,7 @@ pub async fn run_cli(args: &[String]) -> i32 {
             match r {
                 Ok(r) if r.status().is_success() => {
                     println!(
-                        "Connexion ouverte dans le navigateur pour {}. En attente (5 min max)...",
+                        "Connexion ouverte dans un onglet du navigateur, en arriere-plan, pour {}. En attente (5 min max)...",
                         server
                     );
                     let before = load(server).and_then(|s| s.tokens).map(|t| t.access_token);
@@ -1425,6 +1432,14 @@ pub async fn run_cli(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_the_login_page_opens_behind_the_window_the_person_works_in() {
+        assert_eq!(
+            background_open_args("https://example.com/authorize?x=1"),
+            ["-g", "https://example.com/authorize?x=1"]
+        );
+    }
 
     #[test]
     fn base64url_et_pkce() {
