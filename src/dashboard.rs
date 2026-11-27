@@ -2275,6 +2275,30 @@ async fn route(
         ("POST", "/api/connect/device") => handle_device_start(proxy, &req.body).await,
         ("POST", "/api/open") => handle_open(&req.body).await,
         ("GET", "/api/browsers") => handle_browsers().await,
+        ("GET", "/api/catalog") => {
+            let configured: Vec<(String, Option<String>)> = crate::tenant::configured_servers()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(name, raw)| {
+                    let url = raw.get("url").and_then(|u| u.as_str()).map(String::from);
+                    (name, url)
+                })
+                .collect();
+            json_ok(json!({ "services": crate::catalog::list_json(&configured) }))
+        }
+        ("POST", "/api/catalog/connect") => {
+            let name = serde_json::from_str::<Value>(&req.body)
+                .ok()
+                .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(String::from));
+            match (name, &proxy) {
+                (None, _) => json_err(400, "name requis"),
+                (_, None) => json_err(503, "connexion indisponible sans le demon"),
+                (Some(name), Some(p)) => match p.catalog_connect(&name, "dashboard").await {
+                    Ok(v) => json_ok(v),
+                    Err(e) => json_err(400, &e),
+                },
+            }
+        }
         ("GET", "/api/token-alerts") => {
             let alerts = tokio::task::spawn_blocking(crate::token_watch::alerts).await.unwrap_or_default();
             json_ok(json!({ "alerts": alerts.iter().map(|a| a.to_json()).collect::<Vec<_>>() }))
@@ -2289,9 +2313,20 @@ async fn route(
                 .map(|n| crate::http_guard::consume_login_nonce(&n))
                 .unwrap_or(false);
             if ok {
+                // `next=connect:SERVEUR:VARIABLE` (outil connect) : la page s'ouvre sur la fenêtre
+                // « Colle ta clé » de ce serveur. Caractères limités : rien d'autre ne passe.
+                let next = query_param(&req.path, "next")
+                    .filter(|n| {
+                        n.starts_with("connect:")
+                            && n.len() < 200
+                            && n.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '-' | '_'))
+                    })
+                    .map(|n| format!("#{}", n))
+                    .unwrap_or_default();
                 let body = format!(
-                    "<!doctype html><meta charset=utf-8><title>McpHub</title><script>try{{sessionStorage.setItem('mcphub_session','{}')}}catch(e){{}}location.replace('/');</script>",
-                    crate::http_guard::session_secret()
+                    "<!doctype html><meta charset=utf-8><title>McpHub</title><script>try{{sessionStorage.setItem('mcphub_session','{}')}}catch(e){{}}location.replace('/{}');</script>",
+                    crate::http_guard::session_secret(),
+                    next
                 );
                 http_response_with(200, "OK", "text/html; charset=utf-8", &body, headers)
             } else {

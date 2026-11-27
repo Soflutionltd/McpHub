@@ -198,6 +198,10 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
 .ta-box.ta-bad{border-color:var(--danger)}
 .ta-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:3px 0}
 .ta-row .ta-msg{flex:1;min-width:200px}
+.cat-box{border:1px solid var(--border);border-radius:10px;padding:10px 14px;margin-bottom:14px}
+.cat-title{font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-dim);margin-bottom:8px}
+.cat-list{display:flex;flex-wrap:wrap;gap:8px}
+.cat-item{display:flex;align-items:center;gap:6px;border:1px solid var(--border);border-radius:8px;padding:4px 6px 4px 10px;font-size:13px}
 .cl-browser{margin-top:6px;font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:6px}
 </style>
 </head><body>
@@ -230,6 +234,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
       <button class="btn btn-primary" onclick="showAddModal()">+ Add Server</button>
       <button class="btn btn-ghost" id="rebuild-btn" onclick="regenerateCache()">↻ Rebuild Cache</button>
     </div>
+    <div id="catalog-box"></div>
     <div class="grid" id="server-grid"></div>
     <div class="gen-log hidden" id="gen-log"></div>
   </div>
@@ -1336,4 +1341,43 @@ function tokenAlertRenew(i){
 }
 fetchTokenAlerts();
 setInterval(fetchTokenAlerts,5*60*1000);
+
+// ─── Bibliothèque de services (en sommeil tant qu'ils ne sont pas connectés) ───
+let catalogServices=[], catalogPoll=null;
+async function fetchCatalog(){
+  try{catalogServices=(await api('GET','/api/catalog')).services||[]}catch(e){catalogServices=[]}
+  renderCatalog();
+}
+function renderCatalog(){
+  const box=document.getElementById('catalog-box');
+  const todo=catalogServices.filter(s=>!s.installed);
+  if(!todo.length){box.innerHTML='';return}
+  box.innerHTML=`<div class="cat-box"><div class="cat-title">Connect a service</div><div class="cat-list">${todo.map(s=>`<div class="cat-item" title="${esc(s.description)}">${icon(s.name)} ${esc(s.label)}<button class="btn btn-ghost" data-name="${esc(s.name)}" onclick="catalogConnect(this.dataset.name)">Connect</button></div>`).join('')}</div></div>`;
+}
+async function catalogConnect(name){
+  let d;
+  try{d=await api('POST','/api/catalog/connect',{name})}catch(e){notify(e.message,'danger');return}
+  await fetchServers();fetchCatalog();
+  if(d.status==='ready'){notify(d.label+' connected · '+d.tools+' tools');return}
+  if(d.status==='needs_token'){hubKeyOpen(d.server,d.var);return}
+  if(d.status==='waiting_authorization'){
+    notify(d.label+': click Authorize in the browser tab opened in the background');
+    const started=Date.now();clearInterval(catalogPoll);
+    catalogPoll=setInterval(async()=>{
+      if(Date.now()-started>5*60*1000){clearInterval(catalogPoll);return}
+      try{const r=await api('GET','/api/servers');const s=(r.servers||[]).find(x=>x.name===d.server);
+        if(s&&s.oauth&&s.oauth.connected){clearInterval(catalogPoll);notify(d.label+' connected');fetchServers();fetchCatalog()}}catch(e){clearInterval(catalogPoll)}
+    },3000);
+  }
+}
+// Ouverture par l'outil connect : #connect:SERVEUR:VARIABLE ouvre la fenêtre « Colle ta clé ».
+async function catalogFromHash(){
+  const m=/^#connect:([A-Za-z0-9_-]+):([A-Za-z0-9_]+)$/.exec(location.hash||'');
+  if(!m)return;
+  history.replaceState(null,'',location.pathname);
+  for(let i=0;i<20&&!servers.find(s=>s.name===m[1]);i++){await new Promise(r=>setTimeout(r,500));await fetchServers()}
+  hubKeyOpen(m[1],m[2]);
+}
+fetchCatalog();
+catalogFromHash();
 </script></body></html>

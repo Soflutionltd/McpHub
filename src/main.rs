@@ -2,6 +2,7 @@ mod add;
 mod audit;
 mod benchmark;
 mod cache;
+mod catalog;
 pub mod child;
 mod codemode;
 mod config;

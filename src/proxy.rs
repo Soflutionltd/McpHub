@@ -1279,7 +1279,7 @@ impl ProxyServer {
         let mut tools = serde_json::json!([
             {
                 "name": "mcphub_search",
-                "description": "Search MCP tools across all connected servers using BM25. Call FIRST to find the right tool, then use `mcphub_call`. Compact by default (no schemas) — set expand=true to get inputSchemas. Nothing fits? mcphub_call server=mcphub tool=registry_search finds installable MCP servers. Manage servers: server=mcphub tool=servers_list | server_add | server_remove | server_enable | server_disable.",
+                "description": "Search MCP tools across all connected servers using BM25. Call FIRST to find the right tool, then use `mcphub_call`. Compact by default (no schemas) — set expand=true to get inputSchemas. Known services not connected yet (Notion, Linear, GitHub...) come back in `connectable`: server=mcphub tool=connect {name} opens their sign-in, the user only clicks Authorize. Before a task: server=mcphub tool=ready {server, tool?} says what is missing. Nothing fits? server=mcphub tool=registry_search finds installable MCP servers. Manage servers: server=mcphub tool=servers_list | server_add | server_remove | server_enable | server_disable | catalog_list.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1484,6 +1484,16 @@ impl ProxyServer {
         all_server_names.retain(|s| crate::toolguard::server_visible(s, profile.as_deref()));
         // Depuis le dossier d'un tenant : ses serveurs et les serveurs partagés seulement.
         let tenant_scoped = matches!(ctx, Context::Tenant(_));
+        // Services connus pas encore connectés qui répondent à la demande : une ligne chacun,
+        // sans leurs outils (compte McpHub seulement, un client ne connecte rien lui-même).
+        let connectable: Vec<serde_json::Value> = if tenant_scoped || query.trim().is_empty() {
+            Vec::new()
+        } else {
+            crate::catalog::suggestions(query, &self.configured_list().await)
+                .into_iter()
+                .map(crate::catalog::suggestion_json)
+                .collect()
+        };
         all_server_names.retain(|s| crate::tenant::visible(&ctx, s));
         let engine = self.search_engine.lock().await;
         let (effective_server_filter, filter_source) = infer_discover_server_filter(
@@ -1616,10 +1626,15 @@ impl ProxyServer {
                 },
                 "compact": !expand,
             });
+            if !connectable.is_empty() {
+                payload["connectable"] = serde_json::json!(connectable);
+            }
             if tools_json.is_empty() {
-                payload["hint"] = serde_json::json!(
+                payload["hint"] = serde_json::json!(if connectable.is_empty() {
                     "No tool matches. To find an MCP server to install: mcphub_call server=mcphub tool=registry_search arguments={\"query\": \"...\"}"
-                );
+                } else {
+                    "No connected tool matches, but a known service in `connectable` does: offer the user to connect it (mcphub_call server=mcphub tool=connect). They only click Authorize; the token never goes through the conversation."
+                });
             }
             if !expand && !tools_json.is_empty() {
                 payload["hint"] = serde_json::json!(
@@ -1744,7 +1759,7 @@ impl ProxyServer {
 
         let matches: Vec<serde_json::Value> = matches.into_iter().take(top_k).collect();
 
-        let text = serde_json::to_string(&serde_json::json!({
+        let mut fallback = serde_json::json!({
             "query": query,
             "server_filter": effective_server_filter,
             "routing": DiscoverRoutingInfo {
@@ -1761,7 +1776,11 @@ impl ProxyServer {
             "note": "Servers loading in background. Results based on server names. Use execute to call tools.",
             "available_servers": server_names,
             "results": matches,
-        })).unwrap();
+        });
+        if !connectable.is_empty() {
+            fallback["connectable"] = serde_json::json!(connectable);
+        }
+        let text = serde_json::to_string(&fallback).unwrap();
 
         self.record_discover_route(DiscoverRouteStrategy::ServerListFallback, filter_source)
             .await;
@@ -2073,6 +2092,393 @@ impl ProxyServer {
         )
     }
 
+    /// Serveurs de la config (nom, adresse) : ce qui est déjà connecté pour le catalogue.
+    async fn configured_list(&self) -> Vec<(String, Option<String>)> {
+        self.config
+            .lock()
+            .await
+            .servers
+            .iter()
+            .map(|(name, cfg)| (name.clone(), cfg.url.clone()))
+            .collect()
+    }
+
+    /// Outils internes du catalogue : `catalog_list`, `connect`, `ready`.
+    async fn handle_catalog_tool(
+        &self,
+        id: Option<serde_json::Value>,
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let arg = |key: &str| {
+            arguments
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(String::from)
+        };
+        let outcome = match tool {
+            "catalog_list" => Ok(serde_json::json!({
+                "services": crate::catalog::list_json(&self.configured_list().await),
+                "next": "mcphub_call server=mcphub tool=connect arguments={\"name\": \"<service>\"} for a service not installed yet.",
+            })),
+            "connect" => match arg("name") {
+                None => Err("name required (a service of catalog_list)".to_string()),
+                Some(name) => {
+                    let started = std::time::Instant::now();
+                    let result = self.catalog_connect(&name, "agent").await;
+                    self.record_audit(AuditEntry {
+                        server: "mcphub".into(),
+                        tool: format!("catalog/connect {}", name),
+                        mode: "admin",
+                        decision: "allow",
+                        policy: "catalog".into(),
+                        status: if result.is_ok() { "ok" } else { "error" },
+                        duration_ms: Some(started.elapsed().as_millis() as u64),
+                        error: result.as_ref().err().cloned(),
+                        ..Default::default()
+                    })
+                    .await;
+                    result
+                }
+            },
+            _ => match arg("server") {
+                None => Err("server required".to_string()),
+                Some(server) => Ok(self.readiness(&server, arg("tool").as_deref()).await),
+            },
+        };
+        let (payload, is_error) = match outcome {
+            Ok(v) => (v, false),
+            Err(e) => (serde_json::json!({ "error": e }), true),
+        };
+        JsonRpcResponse::success(
+            id,
+            serde_json::json!({
+                "content": [{ "type": "text", "text": serde_json::to_string(&payload).unwrap_or_default() }],
+                "isError": is_error,
+            }),
+        )
+    }
+
+    /// Connecte un service du catalogue pour le compte McpHub : recette ajoutée à la config si
+    /// besoin, puis autorisation (OAuth en arrière-plan, code d'appareil GitHub, ou jeton à
+    /// coller dans le tableau de bord). `by` : "agent" ou "dashboard". Le jeton ne passe jamais
+    /// par la réponse.
+    pub async fn catalog_connect(&self, name: &str, by: &str) -> Result<serde_json::Value, String> {
+        let service = crate::catalog::find(name)
+            .ok_or_else(|| format!("unknown service {} (see catalog_list)", name))?;
+        let configured = self.configured_list().await;
+        let server = match crate::catalog::installed_as(service, &configured) {
+            Some(existing) => existing,
+            None => {
+                let entry = crate::catalog::config_entry(service);
+                let path = crate::config::dedicated_config_path();
+                let by_owned = by.to_string();
+                let key = service.name.to_string();
+                tokio::task::spawn_blocking(move || {
+                    crate::config::update_raw_guarded(&path, None, |config| {
+                        let servers_key = if config.get("servers").and_then(|v| v.as_object()).is_some() {
+                            "servers"
+                        } else {
+                            "mcpServers"
+                        };
+                        if !config.get(servers_key).is_some_and(|v| v.is_object()) {
+                            config[servers_key] = serde_json::json!({});
+                        }
+                        let servers = config[servers_key].as_object_mut().ok_or("config illisible")?;
+                        if servers.keys().any(|k| k.eq_ignore_ascii_case(&key)) {
+                            return Ok(((), false));
+                        }
+                        let mut entry = entry;
+                        entry["addedBy"] = serde_json::json!({ "by": by_owned, "at": crate::audit::iso_utc_now() });
+                        servers.insert(key.clone(), entry);
+                        Ok(((), true))
+                    })
+                })
+                .await
+                .map_err(|e| e.to_string())??;
+                self.reload_config_now().await;
+                service.name.to_string()
+            }
+        };
+        let base = serde_json::json!({ "ok": true, "server": server, "label": service.label });
+        let with = |mut v: serde_json::Value, extra: serde_json::Value| {
+            if let (Some(o), Some(e)) = (v.as_object_mut(), extra.as_object()) {
+                o.extend(e.clone());
+            }
+            v
+        };
+        let ready = |tools: usize| {
+            serde_json::json!({
+                "status": "ready",
+                "tools": tools,
+                "next": format!("Ready: mcphub_search server={}", server),
+            })
+        };
+        match service.access {
+            crate::catalog::Access::Open => {
+                let tools = self.index_now(&server).await?;
+                Ok(with(base, ready(tools.len())))
+            }
+            crate::catalog::Access::OAuth => {
+                let srv = server.clone();
+                let has_tokens = tokio::task::spawn_blocking(move || {
+                    crate::oauth::load(&srv).and_then(|s| s.tokens).is_some()
+                })
+                .await
+                .unwrap_or(false);
+                if has_tokens {
+                    let tools = self.index_now(&server).await?;
+                    return Ok(with(base, ready(tools.len())));
+                }
+                let (manager, engine, srv, url) = (
+                    self.child_manager.clone(),
+                    self.search_engine.clone(),
+                    server.clone(),
+                    service.url.to_string(),
+                );
+                tokio::spawn(async move {
+                    match crate::oauth::interactive_login(&srv, &url, None).await {
+                        Ok(()) => {
+                            if let Err(e) = index_server(&manager, &engine, &srv).await {
+                                eprintln!(
+                                    "[McpHub][CATALOG] {} connecte, outils pas encore lus : {}",
+                                    srv, e
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[McpHub][CATALOG] {} : connexion non terminee : {}", srv, e)
+                        }
+                    }
+                });
+                Ok(with(
+                    base,
+                    serde_json::json!({
+                        "status": "waiting_authorization",
+                        "next": format!(
+                            "A {} sign-in tab is open in the background in the browser: ask the user to go to it and click Authorize (5 minutes). Then check with mcphub_call server=mcphub tool=ready arguments={{\"server\": \"{}\"}}.",
+                            service.label, server
+                        ),
+                    }),
+                ))
+            }
+            crate::catalog::Access::Token { var } => {
+                let present = {
+                    let v = var.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        std::env::var(&v).is_ok() || crate::vault::list_names().contains(&v)
+                    })
+                    .await
+                    .unwrap_or(false)
+                };
+                if present {
+                    let tools = self.index_now(&server).await?;
+                    return Ok(with(base, ready(tools.len())));
+                }
+                if by == "dashboard" {
+                    return Ok(with(
+                        base,
+                        serde_json::json!({ "status": "needs_token", "var": var }),
+                    ));
+                }
+                if let Some(client_id) =
+                    crate::connectors::github_client_id().filter(|_| service.name == "github")
+                {
+                    let start = crate::connectors::github_device_start(&client_id).await?;
+                    open_in_background(&start.verification_uri);
+                    let reply = with(
+                        base,
+                        serde_json::json!({
+                            "status": "waiting_device_code",
+                            "user_code": start.user_code,
+                            "verification_uri": start.verification_uri,
+                            "next": "Give this code to the user: the GitHub page is open in a background tab, they paste the code and click Authorize. The token goes straight to the Keychain.",
+                        }),
+                    );
+                    let (manager, engine, config, refresh, srv, v) = (
+                        self.child_manager.clone(),
+                        self.search_engine.clone(),
+                        self.config.clone(),
+                        self.catalog_refresh_in_progress.clone(),
+                        server.clone(),
+                        var.to_string(),
+                    );
+                    tokio::spawn(async move {
+                        let token = match crate::connectors::github_device_wait(start).await {
+                            Ok(t) => t,
+                            Err(e) => {
+                                eprintln!("[McpHub][CATALOG] {} : {}", srv, e);
+                                return;
+                            }
+                        };
+                        let (name, value) = (v.clone(), token.clone());
+                        let stored = tokio::task::spawn_blocking(move || {
+                            crate::vault::set(&name, &value)
+                                .map(|_| std::env::set_var(&name, &value))
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()));
+                        if let Err(e) = stored {
+                            eprintln!(
+                                "[McpHub][CATALOG] {} : jeton non enregistre : {}",
+                                srv,
+                                e.replace(&token, "***")
+                            );
+                            return;
+                        }
+                        apply_config_change(engine.clone(), config, manager.clone(), refresh).await;
+                        if let Err(e) = index_server(&manager, &engine, &srv).await {
+                            eprintln!(
+                                "[McpHub][CATALOG] {} connecte, outils pas encore lus : {}",
+                                srv, e
+                            );
+                        }
+                    });
+                    return Ok(reply);
+                }
+                // Sans app GitHub : le tableau de bord s'ouvre sur la fenêtre « Colle ta clé ».
+                let nonce =
+                    crate::http_guard::create_login_nonce().ok_or("cannot open the dashboard")?;
+                open_in_background(&format!(
+                    "http://127.0.0.1:{}/login?nonce={}&next=connect:{}:{}",
+                    crate::instance::port(),
+                    nonce,
+                    server,
+                    var
+                ));
+                Ok(with(
+                    base,
+                    serde_json::json!({
+                        "status": "needs_token",
+                        "next": format!(
+                            "A McpHub dashboard tab is open in the background on the {} connection window: ask the user to go to it, click Open pre-filled page, create the token and paste it there. The token never goes through this conversation.",
+                            service.label
+                        ),
+                    }),
+                ))
+            }
+        }
+    }
+
+    /// Démarre un serveur et range ses outils au catalogue partagé.
+    async fn index_now(&self, server: &str) -> Result<Vec<ToolDef>, String> {
+        index_server(&self.child_manager, &self.search_engine, server).await
+    }
+
+    /// Un outil est-il prêt ? Config, connexion, jetons, échéances, profil, quarantaine, dernière
+    /// erreur : chaque problème avec sa solution.
+    pub async fn readiness(&self, server: &str, tool: Option<&str>) -> serde_json::Value {
+        let mut issues: Vec<serde_json::Value> = Vec::new();
+        let mut issue = |problem: String, fix: String| {
+            issues.push(serde_json::json!({ "problem": problem, "fix": fix }))
+        };
+        let connect_hint = |name: &str| {
+            crate::catalog::find(name).map(|s| {
+                format!(
+                    "mcphub_call server=mcphub tool=connect arguments={{\"name\": \"{}\"}}",
+                    s.name
+                )
+            })
+        };
+        let Some(name) = self.child_manager.resolve_name(server).await else {
+            let fix = connect_hint(server).unwrap_or_else(|| {
+                "mcphub_call server=mcphub tool=registry_search to find and install it".into()
+            });
+            issue(
+                format!("{} is not configured (or is disabled)", server),
+                fix,
+            );
+            return serde_json::json!({ "server": server, "ready": false, "issues": issues });
+        };
+        let (url, oauth) = {
+            let config = self.config.lock().await;
+            config
+                .servers
+                .get(&name)
+                .map(|c| (c.url.clone(), c.oauth))
+                .unwrap_or((None, false))
+        };
+        let task_name = name.clone();
+        let (stored, alerts, raw) = tokio::task::spawn_blocking(move || {
+            let stored: std::collections::BTreeSet<String> =
+                crate::vault::list_names().into_iter().collect();
+            let alerts: Vec<String> = crate::token_watch::alerts()
+                .into_iter()
+                .filter(|a| a.tenant.is_none() && a.meta.servers.iter().any(|s| s == &task_name))
+                .map(|a| a.message())
+                .collect();
+            let raw = crate::tenant::configured_servers()
+                .ok()
+                .and_then(|m| m.get(&task_name).cloned());
+            (stored, alerts, raw)
+        })
+        .await
+        .unwrap_or_default();
+        if url.is_some() && oauth && !stored.contains(&crate::oauth::vault_name(&name)) {
+            issue(
+                format!("{} is not signed in (OAuth)", name),
+                connect_hint(&name).unwrap_or_else(|| {
+                    format!(
+                        "dashboard, Servers tab, card {}, button Connect (or `McpHub oauth login {}`)",
+                        name, name
+                    )
+                }),
+            );
+        }
+        if let Some(raw) = &raw {
+            for var in crate::tenant::referenced_vars(raw) {
+                if !stored.contains(&var) && std::env::var(&var).is_err() {
+                    issue(
+                        format!("{} is missing (used by {})", var, name),
+                        format!("dashboard, Servers tab, card {}, button Connect", name),
+                    );
+                }
+            }
+        }
+        for message in alerts {
+            issue(
+                message,
+                format!("dashboard, Servers tab, card {}, button Replace", name),
+            );
+        }
+        let profile = current_profile();
+        match tool {
+            Some(t) => {
+                if let Some(reason) =
+                    crate::toolguard::block_reason(&name, t, None, profile.as_deref())
+                {
+                    issue(
+                        format!("{}/{} is blocked: {}", name, t, reason),
+                        "review it in the dashboard or with `McpHub pins`".into(),
+                    );
+                }
+            }
+            None => {
+                if !crate::toolguard::server_visible(&name, profile.as_deref()) {
+                    issue(
+                        format!("{} is hidden by this client's profile", name),
+                        "change the profile in settings".into(),
+                    );
+                }
+            }
+        }
+        if let Some(error) = crate::cache::load_cache().and_then(|c| c.errors.get(&name).cloned()) {
+            issue(
+                format!("last start failed: {}", error),
+                "fix the cause above, then call again".into(),
+            );
+        }
+        let running = self.child_manager.is_running(&name).await;
+        serde_json::json!({
+            "server": name,
+            "ready": issues.is_empty(),
+            "running": running,
+            "issues": issues,
+        })
+    }
+
     /// Outils internes de McpHub (`mcphub_call` avec `server: "mcphub"`) : bibliothèque du
     /// registre officiel. Une installation est appliquée tout de suite et ses outils indexés.
     async fn handle_hub_tool(
@@ -2084,8 +2490,9 @@ impl ProxyServer {
     ) -> JsonRpcResponse {
         // Le profil du client s'applique aussi aux outils internes : un profil en lecture seule
         // ne désactive, n'ajoute ni n'installe aucun serveur.
-        let mutating =
-            crate::server_admin::is_write_tool(tool) || crate::registry::is_install_tool(tool);
+        let mutating = crate::server_admin::is_write_tool(tool)
+            || crate::registry::is_install_tool(tool)
+            || crate::catalog::is_catalog_write_tool(tool);
         if let Some(reason) =
             crate::toolguard::hub_block_reason(tool, mutating, current_profile().as_deref())
         {
@@ -2110,6 +2517,9 @@ impl ProxyServer {
             return self
                 .handle_admin_tool(id, tool, arguments, confirmation_token)
                 .await;
+        }
+        if crate::catalog::is_catalog_tool(tool) {
+            return self.handle_catalog_tool(id, tool, arguments).await;
         }
         if crate::registry::is_install_tool(tool) {
             if let PolicyGate::Respond(response) = self
@@ -2391,7 +2801,9 @@ impl ProxyServer {
             // dossier d'un tenant, sauf "mcphub" dans ses sharedServers.
             if let Context::Tenant(t) = &ctx {
                 // Lister aussi : la liste nomme les serveurs et les comptes clients qui les utilisent.
-                if crate::server_admin::is_admin_tool(&tool) {
+                if crate::server_admin::is_admin_tool(&tool)
+                    || crate::catalog::is_catalog_write_tool(&tool)
+                {
                     let reason = format!(
                         "gerer les serveurs McpHub est toujours refuse depuis le dossier du tenant {}",
                         t.id
@@ -3435,6 +3847,42 @@ fn spawn_catalog_refresh(
         .await;
         in_progress.store(false, Ordering::SeqCst);
     });
+}
+
+/// Ouvre une adresse dans un onglet d'arrière-plan, sans prendre l'écran (macOS : `open -g`).
+fn open_in_background(url: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("/usr/bin/open")
+            .args(["-g", url])
+            .spawn();
+    }
+    #[cfg(not(target_os = "macos"))]
+    eprintln!("[McpHub][CATALOG] Ouvrir : {}", url);
+}
+
+/// Démarre un serveur (ses outils lus et contrôlés) et les range au catalogue partagé et à
+/// l'index de recherche.
+async fn index_server(
+    manager: &Arc<ChildManager>,
+    engine: &Arc<Mutex<SearchEngine>>,
+    server: &str,
+) -> Result<Vec<ToolDef>, String> {
+    let tools = manager.start_server(server).await?;
+    let mut cache = crate::cache::load_cache().unwrap_or(crate::cache::SchemaCache {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        servers: HashMap::new(),
+        errors: HashMap::new(),
+        server_hashes: HashMap::new(),
+    });
+    cache.servers.insert(server.to_string(), tools.clone());
+    cache.errors.remove(server);
+    engine
+        .lock()
+        .await
+        .build_index(indexed_tools_from_servers(&cache.servers));
+    crate::cache::save_cache_state(&cache);
+    Ok(tools)
 }
 
 /// Relit les outils d'un serveur qui annonce un changement, puis met à jour le cache et l'index.

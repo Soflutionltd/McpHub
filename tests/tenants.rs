@@ -1132,3 +1132,93 @@ fn un_agent_apprend_qu_un_jeton_va_expirer() {
     assert!(!call(&mut hub, Some(&acme_src)).contains("expire dans"));
     hub.finish();
 }
+
+#[test]
+fn bibliotheque_de_services_et_diagnostic() {
+    let fx = Fixture::new("catalog");
+    let mut hub = fx.start();
+    let hub_tool = |hub: &mut Hub, tool: &str, args: Value, wd: Option<&Path>| -> (bool, Value) {
+        let mut call = json!({ "server": "mcphub", "tool": tool, "arguments": args });
+        if let Some(w) = wd {
+            call["_mcphub_context"] = json!({ "working_dir": w });
+        }
+        let resp = hub.request(
+            "tools/call",
+            json!({ "name": "mcphub_call", "arguments": call }),
+        );
+        if let Some(err) = resp.get("error") {
+            return (true, json!({ "error": err["message"] }));
+        }
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let is_error = resp["result"]["isError"] == json!(true);
+        (
+            is_error,
+            serde_json::from_str(&text).unwrap_or(json!({ "text": text })),
+        )
+    };
+
+    // Le catalogue : services en sommeil, rien d'installé.
+    let (err, list) = hub_tool(&mut hub, "catalog_list", json!({}), None);
+    assert!(!err, "{}", list);
+    let notion = list["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "notion")
+        .unwrap();
+    assert_eq!(notion["installed"], false);
+    assert_eq!(notion["access"], "oauth");
+
+    // Une recherche d'outil sans réponse propose le service à connecter, sans ses outils.
+    let resp = hub.request(
+        "tools/call",
+        json!({ "name": "mcphub_search", "arguments": { "query": "créer une page notion" } }),
+    );
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let search: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(search["connectable"][0]["name"], "notion", "{}", text);
+    assert!(search["connectable"][0]["connect"]
+        .as_str()
+        .unwrap()
+        .contains("tool=connect"));
+
+    // Service inconnu refusé ; depuis le dossier d'un client, connecter est refusé.
+    let (err, out) = hub_tool(&mut hub, "connect", json!({ "name": "inconnu" }), None);
+    assert!(
+        err && out["error"].as_str().unwrap().contains("unknown service"),
+        "{}",
+        out
+    );
+    let (err, out) = hub_tool(
+        &mut hub,
+        "connect",
+        json!({ "name": "notion" }),
+        Some(&fx.acme),
+    );
+    assert!(err, "{}", out);
+    assert!(!std::fs::read_to_string(fx.hub.join("config.json"))
+        .unwrap()
+        .contains("mcp.notion.com"));
+
+    // Diagnostic : un serveur prêt, un service pas encore connecté (avec la marche à suivre).
+    let (err, ready) = hub_tool(&mut hub, "ready", json!({ "server": "svc" }), None);
+    assert!(!err, "{}", ready);
+    assert_eq!(ready["ready"], true, "{}", ready);
+    let (_, missing) = hub_tool(&mut hub, "ready", json!({ "server": "notion" }), None);
+    assert_eq!(missing["ready"], false);
+    assert!(
+        missing["issues"][0]["fix"]
+            .as_str()
+            .unwrap()
+            .contains("tool=connect"),
+        "{}",
+        missing
+    );
+    hub.finish();
+}

@@ -2500,7 +2500,7 @@ pub async fn agent_call(tool: &str, args: &Value) -> Result<Value, String> {
             .await
         }
         other => Err(format!(
-            "unknown McpHub tool {}: use registry_search, registry_info, registry_install, {}",
+            "unknown McpHub tool {}: use registry_search, registry_info, registry_install, catalog_list, connect, ready, {}",
             other,
             crate::server_admin::ADMIN_TOOLS.join(", ")
         )),
