@@ -19,7 +19,11 @@ use serde_json::Value;
 pub const CALLBACK_PATH: &str = "/oauth/callback";
 
 pub fn redirect_uri() -> String {
-    format!("http://localhost:{}{}", crate::instance::port(), CALLBACK_PATH)
+    format!(
+        "http://localhost:{}{}",
+        crate::instance::port(),
+        CALLBACK_PATH
+    )
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -79,7 +83,13 @@ pub const VAULT_PREFIX: &str = "MCPHUB_OAUTH_";
 pub fn vault_name(server: &str) -> String {
     let norm: String = server
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
         .collect();
     format!("{}{}", VAULT_PREFIX, norm)
 }
@@ -88,7 +98,10 @@ pub fn vault_name(server: &str) -> String {
 /// tenant, jamais dans celui de McpHub.
 fn storage(server: &str) -> (crate::vault::Scope, String) {
     match crate::tenant::split_instance(server) {
-        Some((base, tenant)) => (crate::vault::Scope::Tenant(tenant.to_string()), vault_name(base)),
+        Some((base, tenant)) => (
+            crate::vault::Scope::Tenant(tenant.to_string()),
+            vault_name(base),
+        ),
         None => (crate::vault::Scope::Hub, vault_name(server)),
     }
 }
@@ -226,7 +239,11 @@ pub fn b64url(data: &[u8]) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::new();
     for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(A[(n >> 18) as usize & 63] as char);
         out.push(A[(n >> 12) as usize & 63] as char);
@@ -243,7 +260,10 @@ pub fn b64url(data: &[u8]) -> String {
 fn random_b64(n: usize) -> Option<String> {
     use std::io::Read;
     let mut buf = vec![0u8; n];
-    std::fs::File::open("/dev/urandom").ok()?.read_exact(&mut buf).ok()?;
+    std::fs::File::open("/dev/urandom")
+        .ok()?
+        .read_exact(&mut buf)
+        .ok()?;
     Some(b64url(&buf))
 }
 
@@ -300,7 +320,10 @@ pub fn secure_url(raw: &str) -> bool {
     match Url::parse(raw) {
         Ok(u) => match u.scheme() {
             "https" => true,
-            "http" => matches!(u.host_str(), Some("localhost") | Some("127.0.0.1") | Some("[::1]")),
+            "http" => matches!(
+                u.host_str(),
+                Some("localhost") | Some("127.0.0.1") | Some("[::1]")
+            ),
             _ => false,
         },
         Err(_) => false,
@@ -324,7 +347,10 @@ fn origin(u: &Url) -> String {
 }
 
 /// Découvre le serveur d'autorisation et la ressource d'un serveur MCP.
-pub async fn discover(url: &str, www_authenticate: Option<&str>) -> Result<(AuthServerMeta, Option<String>, Option<String>), String> {
+pub async fn discover(
+    url: &str,
+    www_authenticate: Option<&str>,
+) -> Result<(AuthServerMeta, Option<String>, Option<String>), String> {
     let client = http();
     let u = Url::parse(url).map_err(|e| format!("URL invalide : {}", e))?;
     let base = origin(&u);
@@ -337,7 +363,10 @@ pub async fn discover(url: &str, www_authenticate: Option<&str>) -> Result<(Auth
         }
     }
     if !path.is_empty() {
-        prm_urls.push(format!("{}/.well-known/oauth-protected-resource{}", base, path));
+        prm_urls.push(format!(
+            "{}/.well-known/oauth-protected-resource{}",
+            base, path
+        ));
     }
     prm_urls.push(format!("{}/.well-known/oauth-protected-resource", base));
 
@@ -362,13 +391,21 @@ pub async fn discover(url: &str, www_authenticate: Option<&str>) -> Result<(Auth
                 scope = v
                     .get("scopes_supported")
                     .and_then(|s| s.as_array())
-                    .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" "))
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
                     .filter(|s| !s.is_empty());
             }
             let resource = v.get("resource").and_then(|r| r.as_str()).map(String::from);
             if let Some(r) = &resource {
                 if !resource_matches(r, url) {
-                    return Err(format!("ressource annoncee ({}) sans rapport avec {} : refuse", r, url));
+                    return Err(format!(
+                        "ressource annoncee ({}) sans rapport avec {} : refuse",
+                        r, url
+                    ));
                 }
             }
             (issuer, resource)
@@ -376,7 +413,10 @@ pub async fn discover(url: &str, www_authenticate: Option<&str>) -> Result<(Auth
         None => (base.clone(), None),
     };
     if !secure_url(&issuer) {
-        return Err(format!("serveur d'autorisation non HTTPS refuse : {}", issuer));
+        return Err(format!(
+            "serveur d'autorisation non HTTPS refuse : {}",
+            issuer
+        ));
     }
 
     let iu = Url::parse(&issuer).map_err(|e| format!("issuer invalide : {}", e))?;
@@ -384,9 +424,18 @@ pub async fn discover(url: &str, www_authenticate: Option<&str>) -> Result<(Auth
     let ipath = iu.path().trim_end_matches('/').to_string();
     let mut meta_urls = Vec::new();
     if !ipath.is_empty() {
-        meta_urls.push(format!("{}/.well-known/oauth-authorization-server{}", ibase, ipath));
-        meta_urls.push(format!("{}/.well-known/openid-configuration{}", ibase, ipath));
-        meta_urls.push(format!("{}{}/.well-known/openid-configuration", ibase, ipath));
+        meta_urls.push(format!(
+            "{}/.well-known/oauth-authorization-server{}",
+            ibase, ipath
+        ));
+        meta_urls.push(format!(
+            "{}/.well-known/openid-configuration{}",
+            ibase, ipath
+        ));
+        meta_urls.push(format!(
+            "{}{}/.well-known/openid-configuration",
+            ibase, ipath
+        ));
     } else {
         meta_urls.push(format!("{}/.well-known/oauth-authorization-server", ibase));
         meta_urls.push(format!("{}/.well-known/openid-configuration", ibase));
@@ -399,9 +448,17 @@ pub async fn discover(url: &str, www_authenticate: Option<&str>) -> Result<(Auth
                 let auth_methods: Vec<String> = v
                     .get("token_endpoint_auth_methods_supported")
                     .and_then(|m| m.as_array())
-                    .map(|m| m.iter().filter_map(|x| x.as_str()).map(String::from).collect())
+                    .map(|m| {
+                        m.iter()
+                            .filter_map(|x| x.as_str())
+                            .map(String::from)
+                            .collect()
+                    })
                     .unwrap_or_default();
-                if !secure_url(&a) || !secure_url(&t) || reg.as_deref().is_some_and(|r| !secure_url(r)) {
+                if !secure_url(&a)
+                    || !secure_url(&t)
+                    || reg.as_deref().is_some_and(|r| !secure_url(r))
+                {
                     return Err("points d'acces OAuth non HTTPS refuses".into());
                 }
                 return Ok((
@@ -462,13 +519,26 @@ async fn register(meta: &AuthServerMeta) -> Result<ClientInfo, String> {
         .await
         .map_err(|e| format!("enregistrement du client : {}", e))?;
     let status = r.status();
-    let v: Value = r.json().await.map_err(|e| format!("enregistrement du client : {}", e))?;
+    let v: Value = r
+        .json()
+        .await
+        .map_err(|e| format!("enregistrement du client : {}", e))?;
     if !status.is_success() {
-        return Err(format!("enregistrement du client refuse ({}) : {}", status, v));
+        return Err(format!(
+            "enregistrement du client refuse ({}) : {}",
+            status, v
+        ));
     }
     Ok(ClientInfo {
-        client_id: v.get("client_id").and_then(|x| x.as_str()).ok_or("client_id absent")?.to_string(),
-        client_secret: v.get("client_secret").and_then(|x| x.as_str()).map(String::from),
+        client_id: v
+            .get("client_id")
+            .and_then(|x| x.as_str())
+            .ok_or("client_id absent")?
+            .to_string(),
+        client_secret: v
+            .get("client_secret")
+            .and_then(|x| x.as_str())
+            .map(String::from),
         token_endpoint_auth_method: v
             .get("token_endpoint_auth_method")
             .and_then(|x| x.as_str())
@@ -482,7 +552,12 @@ fn parse_tokens(v: &Value, previous_refresh: Option<String>) -> Result<Tokens, S
     let access = v
         .get("access_token")
         .and_then(|x| x.as_str())
-        .ok_or_else(|| format!("reponse sans access_token : {}", crate::redaction::redact_text(&v.to_string())))?;
+        .ok_or_else(|| {
+            format!(
+                "reponse sans access_token : {}",
+                crate::redaction::redact_text(&v.to_string())
+            )
+        })?;
     Ok(Tokens {
         access_token: access.to_string(),
         refresh_token: v
@@ -490,13 +565,22 @@ fn parse_tokens(v: &Value, previous_refresh: Option<String>) -> Result<Tokens, S
             .and_then(|x| x.as_str())
             .map(String::from)
             .or(previous_refresh),
-        expires_at: v.get("expires_in").and_then(|x| x.as_u64()).map(|s| now_ms() + s * 1000),
+        expires_at: v
+            .get("expires_in")
+            .and_then(|x| x.as_u64())
+            .map(|s| now_ms() + s * 1000),
         scope: v.get("scope").and_then(|x| x.as_str()).map(String::from),
     })
 }
 
-async fn token_request(meta: &AuthServerMeta, client: &ClientInfo, mut form: Vec<(&str, String)>) -> Result<Value, String> {
-    let mut req = http().post(&meta.token_endpoint).header("Accept", "application/json");
+async fn token_request(
+    meta: &AuthServerMeta,
+    client: &ClientInfo,
+    mut form: Vec<(&str, String)>,
+) -> Result<Value, String> {
+    let mut req = http()
+        .post(&meta.token_endpoint)
+        .header("Accept", "application/json");
     let basic = client.client_secret.is_some()
         && client.token_endpoint_auth_method.as_deref() != Some("client_secret_post");
     if basic {
@@ -507,12 +591,20 @@ async fn token_request(meta: &AuthServerMeta, client: &ClientInfo, mut form: Vec
             form.push(("client_secret", sec.clone()));
         }
     }
-    let r = req.form(&form).send().await.map_err(|e| format!("serveur de jetons : {}", e))?;
+    let r = req
+        .form(&form)
+        .send()
+        .await
+        .map_err(|e| format!("serveur de jetons : {}", e))?;
     let status = r.status();
     let text = r.text().await.unwrap_or_default();
     let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
     if !status.is_success() {
-        return Err(format!("jeton refuse ({}) : {}", status, crate::redaction::redact_text(&text.chars().take(300).collect::<String>())));
+        return Err(format!(
+            "jeton refuse ({}) : {}",
+            status,
+            crate::redaction::redact_text(&text.chars().take(300).collect::<String>())
+        ));
     }
     Ok(v)
 }
@@ -521,21 +613,29 @@ async fn token_request(meta: &AuthServerMeta, client: &ClientInfo, mut form: Vec
 pub async fn access_token(server: &str, url: &str) -> Result<Option<String>, String> {
     let lock = server_lock(server);
     let _g = lock.lock().await;
-    let Some(s) = load(server) else { return Ok(None) };
+    let Some(s) = load(server) else {
+        return Ok(None);
+    };
     if !same_target(&s.url, url) {
         // Jeton émis pour une autre adresse : ne jamais l'envoyer ailleurs.
         return Ok(None);
     }
-    let Some(tokens) = s.tokens.clone() else { return Ok(None) };
+    let Some(tokens) = s.tokens.clone() else {
+        return Ok(None);
+    };
     if is_fresh(&tokens) {
         return Ok(Some(tokens.access_token));
     }
     let _shared = cross_process_lock(server).await?;
-    let Some(mut s) = load_shared(server) else { return Ok(None) };
+    let Some(mut s) = load_shared(server) else {
+        return Ok(None);
+    };
     if !same_target(&s.url, url) {
         return Ok(None);
     }
-    let Some(tokens) = s.tokens.clone() else { return Ok(None) };
+    let Some(tokens) = s.tokens.clone() else {
+        return Ok(None);
+    };
     if is_fresh(&tokens) {
         return Ok(Some(tokens.access_token));
     }
@@ -544,15 +644,23 @@ pub async fn access_token(server: &str, url: &str) -> Result<Option<String>, Str
 
 /// Rafraîchit après un 401 (jeton révoqué avant son expiration annoncée). Si un autre
 /// processus a déjà remplacé le jeton refusé, on reprend le sien sans renouveler.
-pub async fn force_refresh(server: &str, url: &str, rejected: Option<&str>) -> Result<Option<String>, String> {
+pub async fn force_refresh(
+    server: &str,
+    url: &str,
+    rejected: Option<&str>,
+) -> Result<Option<String>, String> {
     let lock = server_lock(server);
     let _g = lock.lock().await;
     let _shared = cross_process_lock(server).await?;
-    let Some(mut s) = load_shared(server) else { return Ok(None) };
+    let Some(mut s) = load_shared(server) else {
+        return Ok(None);
+    };
     if !same_target(&s.url, url) {
         return Ok(None);
     }
-    let Some(tokens) = s.tokens.clone() else { return Ok(None) };
+    let Some(tokens) = s.tokens.clone() else {
+        return Ok(None);
+    };
     if replaced_since(rejected, &tokens) {
         return Ok(Some(tokens.access_token));
     }
@@ -568,7 +676,10 @@ fn same_target(stored: &str, url: &str) -> bool {
 
 async fn refresh_locked(server: &str, url: &str, s: &mut Stored) -> Result<String, String> {
     let tokens = s.tokens.clone().ok_or("aucun jeton")?;
-    let refresh = tokens.refresh_token.clone().ok_or("jeton expire et pas de refresh_token")?;
+    let refresh = tokens
+        .refresh_token
+        .clone()
+        .ok_or("jeton expire et pas de refresh_token")?;
     let client = s.client.clone().ok_or("client OAuth inconnu")?;
     if s.meta.is_none() {
         let (meta, resource, scope) = discover(url, None).await?;
@@ -578,7 +689,10 @@ async fn refresh_locked(server: &str, url: &str, s: &mut Stored) -> Result<Strin
     }
     let meta = s.meta.clone().unwrap_or_default();
     let refresh_form = |refresh: &str| {
-        let mut form = vec![("grant_type", "refresh_token".to_string()), ("refresh_token", refresh.to_string())];
+        let mut form = vec![
+            ("grant_type", "refresh_token".to_string()),
+            ("refresh_token", refresh.to_string()),
+        ];
         if let Some(r) = &s.resource {
             form.push(("resource", r.clone()));
         }
@@ -595,7 +709,10 @@ async fn refresh_locked(server: &str, url: &str, s: &mut Stored) -> Result<Strin
                     s.tokens = latest;
                     return Ok(access);
                 }
-                Recovery::RetryWith(next) => (token_request(&meta, &client, refresh_form(&next)).await?, next),
+                Recovery::RetryWith(next) => (
+                    token_request(&meta, &client, refresh_form(&next)).await?,
+                    next,
+                ),
                 Recovery::GiveUp => return Err(refused),
             }
         }
@@ -609,7 +726,8 @@ async fn refresh_locked(server: &str, url: &str, s: &mut Stored) -> Result<Strin
 }
 
 fn server_lock(server: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
-    static L: OnceLock<Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    static L: OnceLock<Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>> =
+        OnceLock::new();
     L.get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -622,8 +740,10 @@ fn server_lock(server: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
 
 type CallbackResult = Result<String, String>;
 
-fn pending() -> std::sync::MutexGuard<'static, HashMap<String, tokio::sync::oneshot::Sender<CallbackResult>>> {
-    static P: OnceLock<Mutex<HashMap<String, tokio::sync::oneshot::Sender<CallbackResult>>>> = OnceLock::new();
+fn pending(
+) -> std::sync::MutexGuard<'static, HashMap<String, tokio::sync::oneshot::Sender<CallbackResult>>> {
+    static P: OnceLock<Mutex<HashMap<String, tokio::sync::oneshot::Sender<CallbackResult>>>> =
+        OnceLock::new();
     P.get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -641,11 +761,19 @@ pub fn complete_callback(state: &str, result: CallbackResult) -> bool {
 /// localhost:24680 et affiche une erreur dont l'adresse contient le code). Renvoie l'état et
 /// le résultat à transmettre à `complete_callback`.
 pub fn parse_pasted_callback(raw: &str) -> Result<(String, CallbackResult), String> {
-    let u = Url::parse(raw.trim()).map_err(|_| "adresse illisible : coller l'adresse complete de la page".to_string())?;
+    let u = Url::parse(raw.trim())
+        .map_err(|_| "adresse illisible : coller l'adresse complete de la page".to_string())?;
     if u.path() != CALLBACK_PATH {
-        return Err(format!("ce n'est pas une adresse de retour McpHub ({}...)", CALLBACK_PATH));
+        return Err(format!(
+            "ce n'est pas une adresse de retour McpHub ({}...)",
+            CALLBACK_PATH
+        ));
     }
-    let param = |k: &str| u.query_pairs().find(|(key, _)| key == k).map(|(_, v)| v.into_owned());
+    let param = |k: &str| {
+        u.query_pairs()
+            .find(|(key, _)| key == k)
+            .map(|(_, v)| v.into_owned())
+    };
     let state = param("state").ok_or("adresse sans state")?;
     match (param("code"), param("error")) {
         (Some(code), _) => Ok((state, Ok(code))),
@@ -684,11 +812,27 @@ pub struct PreparedLogin {
     _login: LoginGuard,
 }
 
-pub async fn interactive_login(server: &str, url: &str, www_authenticate: Option<&str>) -> Result<(), String> {
+/// Les arguments de `open` pour la page de connexion : `-g` l'ouvre sans faire passer le navigateur
+/// devant, pour ne pas prendre l'ecran de la personne en plein travail. Elle va sur l'onglet quand elle veut.
+#[cfg(any(target_os = "macos", test))]
+fn background_open_args(auth_url: &str) -> [&str; 2] {
+    ["-g", auth_url]
+}
+
+pub async fn interactive_login(
+    server: &str,
+    url: &str,
+    www_authenticate: Option<&str>,
+) -> Result<(), String> {
     let prepared = prepare_login(server, url, www_authenticate).await?;
-    eprintln!("[McpHub][OAUTH] {} : connexion ouverte dans le navigateur", server);
+    eprintln!(
+        "[McpHub][OAUTH] {} : connexion ouverte dans un onglet du navigateur, en arriere-plan",
+        server
+    );
     #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(&prepared.auth_url).spawn();
+    let _ = std::process::Command::new("open")
+        .args(background_open_args(&prepared.auth_url))
+        .spawn();
     #[cfg(not(target_os = "macos"))]
     eprintln!("[McpHub][OAUTH] Ouvrir : {}", prepared.auth_url);
     finish_login(prepared).await
@@ -696,7 +840,11 @@ pub async fn interactive_login(server: &str, url: &str, www_authenticate: Option
 
 /// Prépare la connexion sans ouvrir de navigateur (tenants : la page doit s'ouvrir dans le
 /// profil de navigateur du client, pas dans celui connecté aux comptes McpHub).
-pub async fn prepare_login(server: &str, url: &str, www_authenticate: Option<&str>) -> Result<PreparedLogin, String> {
+pub async fn prepare_login(
+    server: &str,
+    url: &str,
+    www_authenticate: Option<&str>,
+) -> Result<PreparedLogin, String> {
     // Une seule connexion à la fois par serveur, et sans bloquer ses appels en attendant le
     // navigateur (le verrou du serveur n'est pris qu'à l'enregistrement final).
     if !logins_in_progress().insert(server.to_string()) {
@@ -707,7 +855,11 @@ pub async fn prepare_login(server: &str, url: &str, www_authenticate: Option<&st
     let stored = load(server).unwrap_or_default();
     let reuse = stored.client.as_ref().filter(|c| {
         c.redirect_uri.as_deref() == Some(redirect_uri().as_str())
-            && stored.meta.as_ref().map(|m| m.issuer == meta.issuer).unwrap_or(false)
+            && stored
+                .meta
+                .as_ref()
+                .map(|m| m.issuer == meta.issuer)
+                .unwrap_or(false)
     });
     let client = match reuse {
         Some(c) => c.clone(),
@@ -719,7 +871,10 @@ pub async fn prepare_login(server: &str, url: &str, www_authenticate: Option<&st
         return Err("page de connexion non HTTPS refusee".into());
     }
     // Scopes recommandés pour les services connus (Cloudflare n'annonce que la lecture).
-    let scope = crate::connectors::oauth_scope(url).map(String::from).or(scope).or(stored.scope);
+    let scope = crate::connectors::oauth_scope(url)
+        .map(String::from)
+        .or(scope)
+        .or(stored.scope);
     let mut auth = Url::parse(&meta.authorization_endpoint).map_err(|e| e.to_string())?;
     {
         let mut q = auth.query_pairs_mut();
@@ -793,20 +948,39 @@ pub async fn finish_login(p: PreparedLogin) -> Result<(), String> {
 /// Reprend client et jetons de mcp-remote (~/.mcp-auth/mcp-remote-*/<md5(url)>_*.json).
 pub fn import_mcp_remote(server: &str, url: &str) -> Result<bool, String> {
     use md5::{Digest, Md5};
-    let hash: String = Md5::digest(url.as_bytes()).iter().map(|b| format!("{:02x}", b)).collect();
-    let root = dirs::home_dir().ok_or("dossier personnel introuvable")?.join(".mcp-auth");
+    let hash: String = Md5::digest(url.as_bytes())
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    let root = dirs::home_dir()
+        .ok_or("dossier personnel introuvable")?
+        .join(".mcp-auth");
     let mut dirs_found: Vec<_> = std::fs::read_dir(&root)
         .map_err(|e| format!("{} : {}", root.display(), e))?
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.is_dir() && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("mcp-remote")))
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("mcp-remote"))
+        })
         .collect();
     // Les plus récents d'abord.
-    dirs_found.sort_by_key(|p| std::cmp::Reverse(std::fs::metadata(p.join(format!("{}_tokens.json", hash))).and_then(|m| m.modified()).ok()));
+    dirs_found.sort_by_key(|p| {
+        std::cmp::Reverse(
+            std::fs::metadata(p.join(format!("{}_tokens.json", hash)))
+                .and_then(|m| m.modified())
+                .ok(),
+        )
+    });
     for dir in dirs_found {
         let tok_path = dir.join(format!("{}_tokens.json", hash));
         let cli_path = dir.join(format!("{}_client_info.json", hash));
-        let (Ok(tok), Ok(cli)) = (std::fs::read_to_string(&tok_path), std::fs::read_to_string(&cli_path)) else {
+        let (Ok(tok), Ok(cli)) = (
+            std::fs::read_to_string(&tok_path),
+            std::fs::read_to_string(&cli_path),
+        ) else {
             continue;
         };
         let tv: Value = serde_json::from_str(&tok).map_err(|e| e.to_string())?;
@@ -816,9 +990,19 @@ pub fn import_mcp_remote(server: &str, url: &str) -> Result<bool, String> {
             tokens.expires_at = Some(e);
         }
         let client = ClientInfo {
-            client_id: cv.get("client_id").and_then(|x| x.as_str()).ok_or("client_id absent")?.to_string(),
-            client_secret: cv.get("client_secret").and_then(|x| x.as_str()).map(String::from),
-            token_endpoint_auth_method: cv.get("token_endpoint_auth_method").and_then(|x| x.as_str()).map(String::from),
+            client_id: cv
+                .get("client_id")
+                .and_then(|x| x.as_str())
+                .ok_or("client_id absent")?
+                .to_string(),
+            client_secret: cv
+                .get("client_secret")
+                .and_then(|x| x.as_str())
+                .map(String::from),
+            token_endpoint_auth_method: cv
+                .get("token_endpoint_auth_method")
+                .and_then(|x| x.as_str())
+                .map(String::from),
             redirect_uri: cv
                 .get("redirect_uris")
                 .and_then(|x| x.as_array())
@@ -828,7 +1012,10 @@ pub fn import_mcp_remote(server: &str, url: &str) -> Result<bool, String> {
         };
         let stored = Stored {
             url: url.to_string(),
-            scope: tv.get("requested_scope").and_then(|x| x.as_str()).map(String::from),
+            scope: tv
+                .get("requested_scope")
+                .and_then(|x| x.as_str())
+                .map(String::from),
             client: Some(client),
             tokens: Some(tokens),
             ..Default::default()
@@ -858,7 +1045,9 @@ async fn tenant_cli(tenant: &str, args: &[String]) -> i32 {
     if sub == "status" {
         for server in def.credentials.keys() {
             let instance = crate::tenant::instance_name(server, tenant);
-            let state = load(&instance).map(|s| describe(&s)).unwrap_or_else(|| "pas de jeton OAuth".into());
+            let state = load(&instance)
+                .map(|s| describe(&s))
+                .unwrap_or_else(|| "pas de jeton OAuth".into());
             println!("{:24} {}", server, state);
         }
         return 0;
@@ -868,7 +1057,10 @@ async fn tenant_cli(tenant: &str, args: &[String]) -> i32 {
         return 2;
     };
     if !def.owns(server) {
-        eprintln!("{} n'est pas un serveur du tenant {} (credentials dans projects.json)", server, tenant);
+        eprintln!(
+            "{} n'est pas un serveur du tenant {} (credentials dans projects.json)",
+            server, tenant
+        );
         return 1;
     }
     let instance = crate::tenant::instance_name(server, tenant);
@@ -876,8 +1068,16 @@ async fn tenant_cli(tenant: &str, args: &[String]) -> i32 {
     let body = serde_json::json!({ "server": server, "tenant": tenant });
     match sub {
         "login" => {
-            let url = format!("http://127.0.0.1:{}/api/oauth/login", crate::instance::port());
-            let r = reqwest::Client::new().post(&url).bearer_auth(token).json(&body).send().await;
+            let url = format!(
+                "http://127.0.0.1:{}/api/oauth/login",
+                crate::instance::port()
+            );
+            let r = reqwest::Client::new()
+                .post(&url)
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await;
             let auth_url = match r {
                 Ok(r) if r.status().is_success() => r
                     .json::<serde_json::Value>()
@@ -885,11 +1085,17 @@ async fn tenant_cli(tenant: &str, args: &[String]) -> i32 {
                     .ok()
                     .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(String::from)),
                 Ok(r) => {
-                    eprintln!("Refuse par le demon : {}", r.text().await.unwrap_or_default());
+                    eprintln!(
+                        "Refuse par le demon : {}",
+                        r.text().await.unwrap_or_default()
+                    );
                     return 1;
                 }
                 Err(e) => {
-                    eprintln!("Demon McpHub injoignable ({}). Il doit tourner (McpHub install).", e);
+                    eprintln!(
+                        "Demon McpHub injoignable ({}). Il doit tourner (McpHub install).",
+                        e
+                    );
                     return 1;
                 }
             };
@@ -898,16 +1104,28 @@ async fn tenant_cli(tenant: &str, args: &[String]) -> i32 {
                 return 1;
             };
             println!("Connexion de {} pour le tenant {}.", server, tenant);
-            println!("Ouvrir cette adresse dans un profil de navigateur connecte au compte du CLIENT");
-            println!("(pas celui de vos propres comptes), puis autoriser :\n\n{}\n", auth_url);
+            println!(
+                "Ouvrir cette adresse dans un profil de navigateur connecte au compte du CLIENT"
+            );
+            println!(
+                "(pas celui de vos propres comptes), puis autoriser :\n\n{}\n",
+                auth_url
+            );
             println!("En attente (5 min max)...");
-            let before = load(&instance).and_then(|s| s.tokens).map(|t| t.access_token);
+            let before = load(&instance)
+                .and_then(|s| s.tokens)
+                .map(|t| t.access_token);
             for _ in 0..150 {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 cache().remove(instance.as_str());
-                let now = load(&instance).and_then(|s| s.tokens).map(|t| t.access_token);
+                let now = load(&instance)
+                    .and_then(|s| s.tokens)
+                    .map(|t| t.access_token);
                 if now.is_some() && now != before {
-                    println!("{} : connecte pour le tenant {} (jetons dans son coffre).", server, tenant);
+                    println!(
+                        "{} : connecte pour le tenant {} (jetons dans son coffre).",
+                        server, tenant
+                    );
                     return 0;
                 }
             }
@@ -915,7 +1133,10 @@ async fn tenant_cli(tenant: &str, args: &[String]) -> i32 {
             1
         }
         "logout" => {
-            let url = format!("http://127.0.0.1:{}/api/oauth/logout", crate::instance::port());
+            let url = format!(
+                "http://127.0.0.1:{}/api/oauth/logout",
+                crate::instance::port()
+            );
             let via_daemon = reqwest::Client::new()
                 .post(&url)
                 .bearer_auth(token)
@@ -948,7 +1169,11 @@ async fn tenant_cli(tenant: &str, args: &[String]) -> i32 {
 
 fn remote_servers() -> Vec<(String, crate::config::ServerConfig)> {
     let cfg = crate::config::auto_detect();
-    let mut v: Vec<_> = cfg.servers.into_iter().filter(|(_, s)| s.url.is_some()).collect();
+    let mut v: Vec<_> = cfg
+        .servers
+        .into_iter()
+        .filter(|(_, s)| s.url.is_some())
+        .collect();
     v.sort_by(|a, b| a.0.cmp(&b.0));
     v
 }
@@ -965,7 +1190,11 @@ fn describe(s: &Stored) -> String {
             format!(
                 "connecte, {}{}",
                 exp,
-                if t.refresh_token.is_some() { ", rafraichissable" } else { "" }
+                if t.refresh_token.is_some() {
+                    ", rafraichissable"
+                } else {
+                    ""
+                }
             )
         }
     }
@@ -982,10 +1211,16 @@ fn mcp_remote_args(args: &[Value]) -> Option<(String, Vec<(String, String)>)> {
         .iter()
         .any(|a| a.starts_with("--") && *a != "--header" && !a.starts_with("--header="))
     {
-        eprintln!("[McpHub] migration ignoree : options mcp-remote non prises en charge ({})", strs.join(" "));
+        eprintln!(
+            "[McpHub] migration ignoree : options mcp-remote non prises en charge ({})",
+            strs.join(" ")
+        );
         return None;
     }
-    let url = strs.iter().find(|a| a.starts_with("http://") || a.starts_with("https://"))?.to_string();
+    let url = strs
+        .iter()
+        .find(|a| a.starts_with("http://") || a.starts_with("https://"))?
+        .to_string();
     let mut headers = Vec::new();
     let mut i = 0;
     while i < strs.len() {
@@ -1026,7 +1261,9 @@ pub async fn run_cli(args: &[String]) -> i32 {
                 let state = if !sc.oauth {
                     "en-tetes fixes (pas d'OAuth)".to_string()
                 } else {
-                    load(&name).map(|s| describe(&s)).unwrap_or_else(|| "non connecte : McpHub oauth login".into())
+                    load(&name)
+                        .map(|s| describe(&s))
+                        .unwrap_or_else(|| "non connecte : McpHub oauth login".into())
                 };
                 println!("{:24} {}", name, state);
             }
@@ -1038,7 +1275,10 @@ pub async fn run_cli(args: &[String]) -> i32 {
                 return 2;
             };
             let token = crate::dashboard::get_auth_token();
-            let url = format!("http://127.0.0.1:{}/api/oauth/login", crate::instance::port());
+            let url = format!(
+                "http://127.0.0.1:{}/api/oauth/login",
+                crate::instance::port()
+            );
             let r = reqwest::Client::new()
                 .post(&url)
                 .bearer_auth(token)
@@ -1047,7 +1287,10 @@ pub async fn run_cli(args: &[String]) -> i32 {
                 .await;
             match r {
                 Ok(r) if r.status().is_success() => {
-                    println!("Connexion ouverte dans le navigateur pour {}. En attente (5 min max)...", server);
+                    println!(
+                        "Connexion ouverte dans un onglet du navigateur, en arriere-plan, pour {}. En attente (5 min max)...",
+                        server
+                    );
                     let before = load(server).and_then(|s| s.tokens).map(|t| t.access_token);
                     for _ in 0..150 {
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -1062,11 +1305,17 @@ pub async fn run_cli(args: &[String]) -> i32 {
                     1
                 }
                 Ok(r) => {
-                    eprintln!("Refuse par le demon : {}", r.text().await.unwrap_or_default());
+                    eprintln!(
+                        "Refuse par le demon : {}",
+                        r.text().await.unwrap_or_default()
+                    );
                     1
                 }
                 Err(e) => {
-                    eprintln!("Demon McpHub injoignable ({}). Il doit tourner (McpHub install).", e);
+                    eprintln!(
+                        "Demon McpHub injoignable ({}). Il doit tourner (McpHub install).",
+                        e
+                    );
                     1
                 }
             }
@@ -1078,7 +1327,10 @@ pub async fn run_cli(args: &[String]) -> i32 {
             };
             // Passe par le démon pour qu'il oublie aussi sa copie en mémoire.
             let token = crate::dashboard::get_auth_token();
-            let url = format!("http://127.0.0.1:{}/api/oauth/logout", crate::instance::port());
+            let url = format!(
+                "http://127.0.0.1:{}/api/oauth/logout",
+                crate::instance::port()
+            );
             let via_daemon = reqwest::Client::new()
                 .post(&url)
                 .bearer_auth(token)
@@ -1107,7 +1359,11 @@ pub async fn run_cli(args: &[String]) -> i32 {
             // Convertit les serveurs `npx mcp-remote URL` en serveurs distants natifs, en
             // reprenant leurs jetons. Sauvegarde de config.json avant toute écriture.
             let dry = !args.iter().any(|a| a == "--apply");
-            let only: Vec<&String> = args.iter().skip(1).filter(|a| !a.starts_with("--")).collect();
+            let only: Vec<&String> = args
+                .iter()
+                .skip(1)
+                .filter(|a| !a.starts_with("--"))
+                .collect();
             let path = crate::instance::hub_dir().join("config.json");
             let raw = match std::fs::read_to_string(&path) {
                 Ok(r) => r,
@@ -1123,7 +1379,11 @@ pub async fn run_cli(args: &[String]) -> i32 {
                     return 1;
                 }
             };
-            let key = if json.get("mcpServers").is_some() { "mcpServers" } else { "servers" };
+            let key = if json.get("mcpServers").is_some() {
+                "mcpServers"
+            } else {
+                "servers"
+            };
             let Some(servers) = json.get_mut(key).and_then(|v| v.as_object_mut()) else {
                 eprintln!("Aucun serveur.");
                 return 1;
@@ -1133,10 +1393,16 @@ pub async fn run_cli(args: &[String]) -> i32 {
                 if !only.is_empty() && !only.contains(&name) {
                     continue;
                 }
-                let Some((url, headers)) = entry.get("args").and_then(|a| a.as_array()).and_then(|a| mcp_remote_args(a)) else {
+                let Some((url, headers)) = entry
+                    .get("args")
+                    .and_then(|a| a.as_array())
+                    .and_then(|a| mcp_remote_args(a))
+                else {
                     continue;
                 };
-                let has_auth = headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("authorization"));
+                let has_auth = headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("authorization"));
                 let imported = if has_auth {
                     "en-tete Authorization conserve".to_string()
                 } else if dry {
@@ -1144,8 +1410,12 @@ pub async fn run_cli(args: &[String]) -> i32 {
                 } else {
                     match import_mcp_remote(name, &url) {
                         Ok(true) => "jetons mcp-remote importes au Trousseau".into(),
-                        Ok(false) => "aucun jeton mcp-remote : McpHub oauth login necessaire".into(),
-                        Err(e) => format!("import impossible ({}) : McpHub oauth login necessaire", e),
+                        Ok(false) => {
+                            "aucun jeton mcp-remote : McpHub oauth login necessaire".into()
+                        }
+                        Err(e) => {
+                            format!("import impossible ({}) : McpHub oauth login necessaire", e)
+                        }
                     }
                 };
                 println!("{:24} {} -> {}", name, url, imported);
@@ -1158,11 +1428,20 @@ pub async fn run_cli(args: &[String]) -> i32 {
                 obj.remove("args");
                 obj.insert("url".into(), Value::String(url));
                 if !headers.is_empty() {
-                    let h: serde_json::Map<String, Value> =
-                        headers.into_iter().map(|(k, v)| (k, Value::String(v))).collect();
+                    let h: serde_json::Map<String, Value> = headers
+                        .into_iter()
+                        .map(|(k, v)| (k, Value::String(v)))
+                        .collect();
                     obj.insert("headers".into(), Value::Object(h));
                 }
-                obj.insert("auth".into(), Value::String(if has_auth { "none".into() } else { "oauth".into() }));
+                obj.insert(
+                    "auth".into(),
+                    Value::String(if has_auth {
+                        "none".into()
+                    } else {
+                        "oauth".into()
+                    }),
+                );
                 obj.insert("_mcpRemote".into(), backup);
                 if let Some(env) = obj.get_mut("env").and_then(|e| e.as_object_mut()) {
                     env.remove("PATH");
@@ -1170,7 +1449,9 @@ pub async fn run_cli(args: &[String]) -> i32 {
                 changed += 1;
             }
             if dry {
-                println!("\nApercu seulement. Appliquer : McpHub oauth migrate [SERVEUR...] --apply");
+                println!(
+                    "\nApercu seulement. Appliquer : McpHub oauth migrate [SERVEUR...] --apply"
+                );
                 return 0;
             }
             if changed == 0 {
@@ -1210,6 +1491,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_the_login_page_opens_behind_the_window_the_person_works_in() {
+        assert_eq!(
+            background_open_args("https://example.com/authorize?x=1"),
+            ["-g", "https://example.com/authorize?x=1"]
+        );
+    }
+
+    #[test]
     fn base64url_et_pkce() {
         assert_eq!(b64url(b"f"), "Zg");
         assert_eq!(b64url(b"fo"), "Zm8");
@@ -1226,20 +1515,25 @@ mod tests {
     fn methode_d_authentification_du_client() {
         let mut meta = AuthServerMeta::default();
         assert_eq!(client_auth_method(&meta), "none");
-        meta.token_endpoint_auth_methods_supported = vec!["client_secret_basic".into(), "client_secret_post".into()];
+        meta.token_endpoint_auth_methods_supported =
+            vec!["client_secret_basic".into(), "client_secret_post".into()];
         assert_eq!(client_auth_method(&meta), "client_secret_basic");
-        meta.token_endpoint_auth_methods_supported = vec!["client_secret_post".into(), "none".into()];
+        meta.token_endpoint_auth_methods_supported =
+            vec!["client_secret_post".into(), "none".into()];
         assert_eq!(client_auth_method(&meta), "none");
     }
 
     #[test]
     fn adresse_de_retour_collee() {
         let (state, result) =
-            parse_pasted_callback("http://localhost:24680/oauth/callback?code=abc&state=xyz").unwrap();
+            parse_pasted_callback("http://localhost:24680/oauth/callback?code=abc&state=xyz")
+                .unwrap();
         assert_eq!(state, "xyz");
         assert_eq!(result, Ok("abc".to_string()));
-        let (_, refused) =
-            parse_pasted_callback(" http://localhost:24680/oauth/callback?error=access_denied&state=s ").unwrap();
+        let (_, refused) = parse_pasted_callback(
+            " http://localhost:24680/oauth/callback?error=access_denied&state=s ",
+        )
+        .unwrap();
         assert_eq!(refused, Err("access_denied".to_string()));
         assert!(parse_pasted_callback("https://exemple.fr/autre?code=a&state=b").is_err());
         assert!(parse_pasted_callback("http://localhost:24680/oauth/callback?code=a").is_err());
@@ -1270,9 +1564,15 @@ mod tests {
     fn refus_apres_renouvellement_par_un_autre_processus() {
         // Le démon a renouvelé r0 en r1 ; le processus stdio présente encore r0.
         let renewed = tokens("a1", Some("r1"), 3_600_000);
-        assert_eq!(recovery_after_refusal("r0", Some(&renewed)), Recovery::UseStored("a1".into()));
+        assert_eq!(
+            recovery_after_refusal("r0", Some(&renewed)),
+            Recovery::UseStored("a1".into())
+        );
         let renewed_but_expired = tokens("a1", Some("r1"), -1);
-        assert_eq!(recovery_after_refusal("r0", Some(&renewed_but_expired)), Recovery::RetryWith("r1".into()));
+        assert_eq!(
+            recovery_after_refusal("r0", Some(&renewed_but_expired)),
+            Recovery::RetryWith("r1".into())
+        );
     }
 
     #[test]
@@ -1280,7 +1580,10 @@ mod tests {
         let same = tokens("a0", Some("r0"), -1);
         assert_eq!(recovery_after_refusal("r0", Some(&same)), Recovery::GiveUp);
         assert_eq!(recovery_after_refusal("r0", None), Recovery::GiveUp);
-        assert_eq!(recovery_after_refusal("r0", Some(&tokens("a1", None, -1))), Recovery::GiveUp);
+        assert_eq!(
+            recovery_after_refusal("r0", Some(&tokens("a1", None, -1))),
+            Recovery::GiveUp
+        );
     }
 
     #[test]
@@ -1303,7 +1606,9 @@ mod tests {
             let _second = lock_file(&waiting).expect("second verrou");
             tx.send(()).unwrap();
         });
-        assert!(rx.recv_timeout(std::time::Duration::from_millis(200)).is_err());
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_err());
         drop(first);
         assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok());
         handle.join().unwrap();
@@ -1323,20 +1628,41 @@ mod tests {
         assert!(!secure_url("http://a.com/x"));
         assert!(!secure_url("file:///Applications/Evil.app"));
         assert!(!secure_url("smb://host/share"));
-        assert!(resource_matches("https://mcp.sentry.dev/mcp", "https://mcp.sentry.dev/mcp"));
-        assert!(resource_matches("https://mcp.sentry.dev", "https://mcp.sentry.dev/mcp"));
-        assert!(!resource_matches("https://api.github.com", "https://mcp.sentry.dev/mcp"));
+        assert!(resource_matches(
+            "https://mcp.sentry.dev/mcp",
+            "https://mcp.sentry.dev/mcp"
+        ));
+        assert!(resource_matches(
+            "https://mcp.sentry.dev",
+            "https://mcp.sentry.dev/mcp"
+        ));
+        assert!(!resource_matches(
+            "https://api.github.com",
+            "https://mcp.sentry.dev/mcp"
+        ));
         assert!(same_target("https://a.com/mcp/", "https://a.com/mcp"));
         assert!(!same_target("https://a.com/mcp", "https://b.com/mcp"));
     }
 
     #[test]
     fn options_mcp_remote_non_prises_en_charge() {
-        let ok = serde_json::json!(["-y", "mcp-remote@0.15.1", "https://x.com/mcp", "--header", "Authorization: Bearer ${T}"]);
+        let ok = serde_json::json!([
+            "-y",
+            "mcp-remote@0.15.1",
+            "https://x.com/mcp",
+            "--header",
+            "Authorization: Bearer ${T}"
+        ]);
         let (u, h) = mcp_remote_args(ok.as_array().unwrap()).unwrap();
         assert_eq!(u, "https://x.com/mcp");
         assert_eq!(h[0].0, "Authorization");
-        let ko = serde_json::json!(["-y", "mcp-remote", "https://x.com/mcp", "--transport", "sse-only"]);
+        let ko = serde_json::json!([
+            "-y",
+            "mcp-remote",
+            "https://x.com/mcp",
+            "--transport",
+            "sse-only"
+        ]);
         assert!(mcp_remote_args(ko.as_array().unwrap()).is_none());
     }
 

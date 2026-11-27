@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { readFile, stat, writeFile } from 'node:fs/promises';
+import { open, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, normalize, parse, sep } from 'node:path';
@@ -16,6 +16,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
 import { encode as encodeToon } from '@toon-format/toon';
 import { z } from 'zod';
+import { resultTokens } from './tokens.js';
 
 // Instance nommée (un McpHub par client) : mêmes règles que le moteur Rust.
 const instanceName = process.env.MCPHUB_INSTANCE || undefined;
@@ -38,6 +39,7 @@ const hubDirectory =
   join(homedir(), instanceName ? `.McpHub-${instanceName}` : '.McpHub');
 const projectsPath = process.env.MCPHUB_PROJECTS ?? join(hubDirectory, 'projects.json');
 const usagePath = join(hubDirectory, 'client-usage-stats.json');
+const usageLockPath = `${usagePath}.lock`;
 const schemaCachePath = join(hubDirectory, 'schema-cache.json');
 const authTokenPath = join(hubDirectory, 'auth-token');
 const hubBinaryPath = process.env.MCPHUB_BINARY ?? join(homedir(), '.local', 'bin', 'McpHub');
@@ -50,8 +52,20 @@ const daemonApiUrl = new URL('/api/servers', daemonBaseUrl);
 // mais bornée pour ne jamais laisser une requête pendre indéfiniment.
 const childCallTimeoutMs = Number(process.env.MCPHUB_CALL_TIMEOUT_MS ?? 600_000);
 const daemonProbeTimeoutMs = 1_500;
+// Délai au-delà duquel un appel reçoit une réponse d'attente au lieu de laisser le
+// client MCP le couper, et nombre de résultats terminés gardés en attente de lecture.
+const answerBeforeMs = Number(process.env.MCPHUB_ANSWER_BEFORE_MS ?? 50_000);
+if (!Number.isFinite(answerBeforeMs) || answerBeforeMs < 100) {
+  throw new Error(
+    `Invalid MCPHUB_ANSWER_BEFORE_MS "${process.env.MCPHUB_ANSWER_BEFORE_MS}": expected a number of milliseconds, 100 or more.`
+  );
+}
+const pendingCallLimit = 20;
 const daemonRetryIntervalMs = Number(process.env.MCPHUB_DAEMON_RETRY_MS ?? 60_000);
 const usageFlushDelayMs = 2_000;
+// Verrou du fichier de statistiques : attente maximale, et âge au-delà duquel il est abandonné.
+const usageLockWaitMs = 2_000;
+const usageLockStaleMs = 5_000;
 const unknownSuggestionCount = 5;
 // Au-delà, le texte d'un résultat est coupé et le reste se lit par poignée.
 const defaultResultMaxChars = Number(process.env.MCPHUB_RESULT_MAX_CHARS ?? 60_000);
@@ -83,8 +97,12 @@ const hookInjectionsPath = process.env.MEMORYPILOT_DB
 // Au-delà, la session a pu être compactée ou reprise ailleurs : recall complet.
 const hookInjectionMaxAgeMs = 10 * 60_000;
 
-const projectsConfig = await readProjects(projectsPath);
-const serverOwners = buildServerOwners(projectsConfig.projects);
+// projects.json est relu dès qu'il change (date et taille) : une règle ajoutée ou
+// corrigée s'applique à l'appel suivant, sans relancer le client.
+let projectsConfig = { projects: {} };
+let serverOwners = new Map();
+let projectsFingerprint;
+await refreshProjects();
 
 /** @type {{ client: Client, transport: 'daemon' | 'stdio' } | undefined} */
 let hubConnection;
@@ -95,16 +113,71 @@ let lastDaemonProbeAt = 0;
 /** @type {Map<string, Promise<{ memory?: string, memoryError?: string }>>} */
 const pendingBootstraps = new Map();
 
-let usage = await readJson(usagePath, {
-  calls: 0,
-  searches: 0,
-  batches: 0,
-  bootstrapCalls: 0,
-  suggestionsServed: 0,
-  childResultBytes: 0,
-  startedAt: new Date().toISOString()
-});
-usage.suggestionsServed ??= 0;
+// Plusieurs fenêtres partagent client-usage-stats.json : chacune ne garde en mémoire que ce
+// qu'elle a compté depuis sa dernière écriture, et l'ajoute aux totaux du fichier.
+const usageCounters = [
+  'calls',
+  'searches',
+  'batches',
+  'bootstrapCalls',
+  'suggestionsServed',
+  'runs',
+  'runCalls',
+  'childResultBytes'
+];
+
+function emptyUsage() {
+  return {
+    ...Object.fromEntries(usageCounters.map((counter) => [counter, 0])),
+    // Sans prototype : un nom de serveur vient de l'agent et sert de clé.
+    byServer: Object.create(null)
+  };
+}
+
+const countOf = (value) => (Number.isFinite(value) && value > 0 ? value : 0);
+
+/** Les jetons d'un serveur : ceux comptés image comprise, plus octets / 4 pour les appels plus anciens. */
+function approximateTokens(resultBytes, tokens, tokenBytes) {
+  return Math.round(countOf(tokens) + Math.max(0, countOf(resultBytes) - countOf(tokenBytes)) / 4);
+}
+
+/** Gain de la réduction des résultats ; vide tant qu'aucune taille brute n'a été comptée. */
+function shapingSavings(rawBytes, deliveredBytes) {
+  if (!countOf(rawBytes)) return {};
+  const savedBytes = Math.max(0, rawBytes - deliveredBytes);
+  return {
+    rawBytes,
+    savedBytes,
+    savedPercent: Math.round((savedBytes / rawBytes) * 1000) / 10,
+    approximateTokensSaved: Math.round(savedBytes / 4)
+  };
+}
+
+function addUsage(target, added) {
+  for (const counter of usageCounters) target[counter] += countOf(added?.[counter]);
+  for (const [server, entry] of Object.entries(added?.byServer ?? {})) {
+    const total = (target.byServer[server] ??= { calls: 0, resultBytes: 0 });
+    total.calls += countOf(entry?.calls);
+    total.resultBytes += countOf(entry?.resultBytes);
+    // Comptés ensemble, appel par appel : le gain ne mélange pas d'anciens appels sans taille brute.
+    total.rawBytes = countOf(total.rawBytes) + countOf(entry?.rawBytes);
+    total.measuredBytes = countOf(total.measuredBytes) + countOf(entry?.measuredBytes);
+    // Jetons comptés image comprise, et les octets des appels qu'ils couvrent ; les plus anciens restent à octets / 4.
+    total.tokens = countOf(total.tokens) + countOf(entry?.tokens);
+    total.tokenBytes = countOf(total.tokenBytes) + countOf(entry?.tokenBytes);
+  }
+  return target;
+}
+
+async function readUsageTotals() {
+  const stored = await readJson(usagePath, {});
+  return {
+    ...addUsage(emptyUsage(), stored),
+    startedAt: typeof stored?.startedAt === 'string' ? stored.startedAt : new Date().toISOString()
+  };
+}
+
+let usage = emptyUsage();
 
 async function readJson(path, fallback) {
   try {
@@ -123,6 +196,28 @@ async function readProjects(path) {
     if (error.code === 'ENOENT') return { projects: {} };
     throw new Error(`Invalid McpHub projects file ${path}: ${error.message}`);
   }
+}
+
+async function readProjectsFingerprint() {
+  try {
+    const { mtimeMs, size } = await stat(projectsPath);
+    return `${mtimeMs}:${size}`;
+  } catch (error) {
+    if (error.code === 'ENOENT') return 'absent';
+    throw new Error(`Invalid McpHub projects file ${projectsPath}: ${error.message}`);
+  }
+}
+
+// Un fichier devenu invalide fait échouer chaque appel jusqu'à sa correction :
+// garder l'ancienne politique masquerait l'erreur.
+async function refreshProjects() {
+  const fingerprint = await readProjectsFingerprint();
+  if (fingerprint === projectsFingerprint) return;
+  const config = await readProjects(projectsPath);
+  const owners = buildServerOwners(config.projects);
+  projectsConfig = config;
+  serverOwners = owners;
+  projectsFingerprint = fingerprint;
 }
 
 // Un serveur rattaché à un client (ownedServers) n'appartient qu'à un projet :
@@ -166,15 +261,90 @@ function markUsageDirty() {
   usageFlushTimer.unref?.();
 }
 
+// Ce que l'agent reçoit réellement d'un serveur, après réduction du résultat (c'est ce volume
+// qui entre dans son contexte), et ce que le serveur avait renvoyé avant réduction.
+function recordServerUsage(server, raw, delivered) {
+  // Un nom de serveur inconnu (faute de frappe) n'est pas un serveur : rien à attribuer.
+  if (raw?.isError && unknownServerPattern.test(extractText(raw))) return;
+  const entry = (usage.byServer[server] ??= {
+    calls: 0,
+    resultBytes: 0,
+    rawBytes: 0,
+    measuredBytes: 0,
+    tokens: 0,
+    tokenBytes: 0
+  });
+  const deliveredBytes = Buffer.byteLength(JSON.stringify(delivered) ?? '');
+  entry.calls += 1;
+  entry.resultBytes += deliveredBytes;
+  entry.tokens = countOf(entry.tokens) + resultTokens(delivered);
+  entry.tokenBytes = countOf(entry.tokenBytes) + deliveredBytes;
+  entry.rawBytes += Buffer.byteLength(JSON.stringify(raw) ?? '');
+  entry.measuredBytes += deliveredBytes;
+  markUsageDirty();
+}
+
+async function withUsageLock(task) {
+  const deadline = Date.now() + usageLockWaitMs;
+  for (;;) {
+    try {
+      await (await open(usageLockPath, 'wx', 0o600)).close();
+      break;
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+      const lock = await stat(usageLockPath).catch(() => undefined);
+      if (!lock) continue;
+      if (Date.now() - lock.mtimeMs > usageLockStaleMs) {
+        // Une fenêtre arrêtée pendant son écriture a laissé le verrou.
+        await unlink(usageLockPath).catch(() => {});
+        continue;
+      }
+      if (Date.now() > deadline) throw new Error('client-usage-stats.json is locked by another window');
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+  try {
+    return await task();
+  } finally {
+    await unlink(usageLockPath).catch(() => {});
+  }
+}
+
+async function mergeUsageIntoFile() {
+  // Échangé avant toute attente : ce qui est compté pendant l'écriture part à la suivante.
+  const counted = usage;
+  usage = emptyUsage();
+  try {
+    await withUsageLock(async () => {
+      const totals = addUsage(await readUsageTotals(), counted);
+      const temporaryPath = `${usagePath}.${process.pid}.tmp`;
+      try {
+        await writeFile(temporaryPath, `${JSON.stringify(totals, null, 2)}\n`, { mode: 0o600 });
+        await rename(temporaryPath, usagePath);
+      } catch (error) {
+        await unlink(temporaryPath).catch(() => {});
+        throw error;
+      }
+    });
+  } catch {
+    // Les statistiques ne doivent jamais faire échouer un appel d'outil : ce qui
+    // n'a pas pu être écrit reste compté pour la prochaine écriture.
+    addUsage(usage, counted);
+    usageDirty = true;
+  }
+}
+
 function flushUsage() {
   if (!usageDirty) return usageFlushing;
   usageDirty = false;
-  usageFlushing = writeFile(usagePath, `${JSON.stringify(usage, null, 2)}\n`, {
-    mode: 0o600
-  }).catch(() => {
-    // Les statistiques ne doivent jamais faire échouer un appel d'outil.
-  });
+  usageFlushing = usageFlushing.then(mergeUsageIntoFile);
   return usageFlushing;
+}
+
+// Totaux de toutes les fenêtres, plus ce que celle-ci n'a pas encore pu écrire.
+async function readSharedUsage() {
+  await flushUsage();
+  return addUsage(await readUsageTotals(), usage);
 }
 
 for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
@@ -236,9 +406,9 @@ const shapingFields = {
     .optional()
     .describe('Cut the result text beyond this size; the rest stays readable by handle.'),
   format: z
-    .enum(['json', 'toon'])
+    .enum(['json', 'toon', 'csv'])
     .optional()
-    .describe('toon writes a JSON result as TOON: each list of rows as one header line plus one line per row.'),
+    .describe('toon writes a JSON result as TOON: each list of rows as one header line plus one line per row. csv is the most compact for a plain list of rows: one header line, one line per row.'),
   raw: z
     .boolean()
     .optional()
@@ -389,6 +559,26 @@ function shapeText(text, shaping, notes, server) {
     if (shaping.format === 'toon') {
       shaped = encodeToon(json);
       json = undefined;
+    } else if (shaping.format === 'csv') {
+      const csv = encodeCsv(json);
+      if (csv === undefined) {
+        notes.push('csv needs a list of rows (or an object holding one): sent as JSON.');
+      } else {
+        shaped = csv;
+        json = undefined;
+      }
+    }
+  } else if (/^\s*[{[]/.test(text)) {
+    // Du JSON que McpHub ne réécrit pas (nombre de 16 chiffres ou plus, texte coupé ou invalide) :
+    // il ressort tel quel, donc sans nettoyage non plus.
+    if (shaping.format && shaping.format !== 'json') {
+      notes.push(`format ${shaping.format} not applied: this JSON holds a number too large to rewrite safely, or is not complete.`);
+    }
+  } else {
+    const quiet = removeTerminalNoise(text);
+    if (quiet.length < text.length) {
+      notes.push(`Terminal noise removed (${text.length - quiet.length} chars: colour codes, progress redraws, long lines repeated in a row). raw: true gives the original.`);
+      shaped = quiet;
     }
   }
   const limit = shaping.max_chars ?? defaultResultMaxChars;
@@ -397,9 +587,89 @@ function shapeText(text, shaping, notes, server) {
   const handle = storeFullResult(shaped, server);
   const head = sliceText(shaped, 0, limit);
   notes.push(
-    `Result cut at ${head.length} of ${shaped.length} chars. Read the rest with mcphub_call server "mcphub", tool "read_result", arguments {"handle":"${handle}","offset":${head.length}}.`
+    `Result cut at ${head.length} of ${shaped.length} chars. To find something in the rest without reading it all: mcphub_call server "mcphub", tool "search_result", arguments {"handle":"${handle}","query":"words to find"}. To read on: tool "read_result", arguments {"handle":"${handle}","offset":${head.length}}.`
   );
   return { text: head, json: undefined };
+}
+
+// ---------------------------------------------------------------------------
+// CSV : pour une liste de lignes, une ligne d'en-tête puis une ligne par
+// enregistrement. Accepte un tableau de lignes, ou un objet qui en contient un
+// seul (ses autres champs passent en tête, un par ligne "# clé: valeur").
+// ---------------------------------------------------------------------------
+
+function csvCell(value) {
+  if (value === undefined || value === null) return '';
+  const text = typeof value === 'object' ? JSON.stringify(value) : String(value);
+  return /[",\n\r]/.test(text) || text !== text.trim() ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function encodeCsv(json) {
+  let rows = json;
+  const head = [];
+  if (!Array.isArray(json)) {
+    if (!isRow(json)) return undefined;
+    const lists = Object.entries(json).filter(([, value]) => Array.isArray(value) && value.some(isRow));
+    if (lists.length !== 1) return undefined;
+    rows = lists[0][1];
+    for (const [key, value] of Object.entries(json)) {
+      // Une valeur sur plusieurs lignes passerait pour des lignes de données : elle est écrite en JSON.
+      if (key !== lists[0][0]) head.push(`# ${key}: ${typeof value === 'object' || /[\n\r]/.test(String(value)) ? JSON.stringify(value) : value}`);
+    }
+    head.push(`# ${lists[0][0]}:`);
+  }
+  if (!rows.length || !rows.every(isRow)) return undefined;
+  const columns = [];
+  const known = new Set();
+  for (const row of rows) {
+    for (const key of Object.keys(row)) {
+      if (!known.has(key)) {
+        known.add(key);
+        columns.push(key);
+      }
+    }
+  }
+  if (!columns.length) return undefined;
+  return [...head, columns.map(csvCell).join(','), ...rows.map((row) => columns.map((key) => csvCell(row[key])).join(','))].join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Bruit de terminal : ce qu'un écran efface et qu'un journal garde. Codes de
+// couleur, barres de progression redessinées sur place (retour chariot), et
+// la même longue ligne répétée cinq fois ou plus. Une ligne courte répétée
+// ("0", "}", "---") est une donnée, pas du bruit : elle reste. Rien d'autre
+// n'est touché : un fichier source ou un texte ordinaire ressort identique.
+// ---------------------------------------------------------------------------
+
+const ansiSequence = /\u001b\[[0-9;?]*[ -/]*[@-~]|\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g;
+const repeatedLineMin = 5;
+const repeatedLineMinChars = 20;
+
+function removeTerminalNoise(text) {
+  if (!/[\u001b\r]/.test(text) && !/\n/.test(text)) return text;
+  const out = [];
+  let run = 0;
+  const flush = () => {
+    if (run >= repeatedLineMin) {
+      out.length -= run - 1;
+      out.push(`[McpHub: the line above came ${run} times in a row]`);
+    }
+    run = 0;
+  };
+  for (const rawLine of text.replace(ansiSequence, '').split('\n')) {
+    // Une barre de progression réécrit sa ligne : seul le dernier état compte.
+    // Une fin de ligne Windows (un seul retour chariot final) n'en est pas une : elle reste.
+    const body = rawLine.replace(/\r+$/, '');
+    const line = body.includes('\r') ? body.split('\r').pop() : rawLine;
+    if (run > 0 && line === out[out.length - 1] && line.trim().length >= repeatedLineMinChars) run += 1;
+    else {
+      flush();
+      run = 1;
+    }
+    out.push(line);
+  }
+  flush();
+  return out.join('\n');
 }
 
 // Renvoie le résultat allégé et, pour mcphub_batch, la valeur à insérer telle
@@ -457,6 +727,89 @@ function readStoredResult({ handle, offset = 0, length }, workingDirectory) {
       }
     ]
   };
+}
+
+// Cherche dans un résultat gardé sans le relire en entier : les passages où les mots de la
+// requête apparaissent, les plus complets d'abord, chacun avec sa position pour read_result.
+function searchStoredResult({ handle, query, context = 200, max_matches = 8 }, workingDirectory) {
+  const stored = typeof handle === 'string' ? storedResults.get(handle) : undefined;
+  const full = stored && ownerAllows(stored.server, workingDirectory) ? stored.text : undefined;
+  if (full === undefined) {
+    return textResult(
+      `Unknown result handle "${handle}": handles live in this McpHub client process and only the last ${storedResultLimit} cut results are kept. Call the tool again.`,
+      true
+    );
+  }
+  const terms = typeof query === 'string' ? [...new Set(query.toLowerCase().split(/\s+/).filter(Boolean))].slice(0, 12) : [];
+  if (!terms.length) return textResult('query must be one or more words to find.', true);
+  if (!Number.isInteger(context) || context < 20 || context > 2000) return textResult('context must be an integer between 20 and 2000.', true);
+  if (!Number.isInteger(max_matches) || max_matches < 1 || max_matches > 50) return textResult('max_matches must be an integer between 1 and 50.', true);
+
+  // Recherche sans tenir compte de la casse directement dans le texte : passer le texte en
+  // minuscules changerait sa longueur pour certaines lettres et fausserait toutes les positions.
+  // Chaque mot a son propre plafond : un mot très fréquent ne cache pas les autres.
+  const hits = [];
+  const hitLimitPerTerm = 5_000;
+  let capped = false;
+  const found = terms.map(() => false);
+  terms.forEach((term, index) => {
+    const pattern = new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+    let count = 0;
+    for (let match = pattern.exec(full); match; match = pattern.exec(full)) {
+      found[index] = true;
+      if (++count > hitLimitPerTerm) {
+        capped = true;
+        break;
+      }
+      hits.push({ at: match.index, end: match.index + match[0].length, index });
+    }
+  });
+  if (!hits.length) {
+    return textResult(`[McpHub] No match for ${terms.map((term) => JSON.stringify(term)).join(', ')} in the ${full.length} chars of ${handle}.`);
+  }
+  hits.sort((a, b) => a.at - b.at);
+  // Les occurrences proches forment un passage ; un passage qui réunit plus de mots passe devant.
+  const passages = [];
+  for (const hit of hits) {
+    const last = passages[passages.length - 1];
+    if (last && hit.at - last.end <= context && hit.end - last.start <= context * 6) {
+      last.end = Math.max(last.end, hit.end);
+      last.terms.add(hit.index);
+      last.count += 1;
+    } else passages.push({ start: hit.at, end: hit.end, terms: new Set([hit.index]), count: 1 });
+  }
+  // Un mot rare pèse plus qu'un mot présent partout : le passage qui tient « error » passe
+  // devant les milliers de passages qui ne tiennent que « the ».
+  const frequency = terms.map((_, index) => hits.reduce((count, hit) => count + (hit.index === index ? 1 : 0), 0));
+  const weight = (passage) => [...passage.terms].reduce((sum, index) => sum + 1 / frequency[index], 0);
+  const ranked = [...passages]
+    .map((passage) => ({ ...passage, weight: weight(passage) }))
+    .sort((a, b) => b.terms.size - a.terms.size || b.weight - a.weight || a.start - b.start)
+    .slice(0, max_matches);
+  // La réponse reste petite : les meilleurs passages d'abord, jusqu'au budget ; les autres sont
+  // seulement comptés. Ils sont ensuite rendus dans l'ordre du texte.
+  const budget = 20_000;
+  const chosen = [];
+  let used = 0;
+  for (const passage of ranked) {
+    let from = Math.max(0, passage.start - context);
+    if (from > 0 && isLowSurrogate(full.charCodeAt(from)) && isHighSurrogate(full.charCodeAt(from - 1))) from -= 1;
+    const excerpt = sliceText(full, from, passage.end - from + context);
+    if (chosen.length && used + excerpt.length > budget) continue;
+    used += excerpt.length;
+    chosen.push({ from, excerpt });
+  }
+  const content = chosen
+    .sort((a, b) => a.from - b.from)
+    .map(({ from, excerpt }) => ({ type: 'text', text: `[chars ${from} to ${from + excerpt.length}]\n${excerpt}` }));
+  const missing = terms.filter((_, index) => !found[index]);
+  content.push({
+    type: 'text',
+    text: `[McpHub] ${content.length} of ${passages.length} passages shown, ${hits.length}${capped ? '+' : ''} matches in ${full.length} chars.` +
+      (missing.length ? ` Never found: ${missing.map((term) => JSON.stringify(term)).join(', ')}.` : '') +
+      ' Read around one with read_result and its offset.'
+  });
+  return { content };
 }
 
 // ---------------------------------------------------------------------------
@@ -557,9 +910,16 @@ async function resetHubConnection() {
 // échec métier) est une réponse valide : on ne doit ni reconnecter ni rejouer.
 function isTransportFailure(error) {
   if (!(error instanceof McpError)) return true;
+  return error.code === ErrorCode.ConnectionClosed || isLocalTimeout(error);
+}
+
+// Le démon répond aussi -32001 pour ses refus (« Bloque par McpHub », serveur hors
+// profil) : ce sont des réponses, pas des coupures. Seul le délai levé ici par le SDK,
+// reconnaissable aux données qu'il joint, laisse l'issue de l'appel inconnue.
+function isLocalTimeout(error) {
   return (
-    error.code === ErrorCode.ConnectionClosed ||
-    error.code === ErrorCode.RequestTimeout
+    error.code === ErrorCode.RequestTimeout &&
+    (error.data?.timeout !== undefined || error.data?.maxTotalTimeout !== undefined)
   );
 }
 
@@ -728,7 +1088,9 @@ function enforceProjectPolicy({ projectName, projectConfig, server, tool, args, 
     securedArgs.project_id !== aliases.supabaseProjectId
   ) {
     throw new Error(
-      `Supabase project mismatch for ${projectName}: expected ${aliases.supabaseProjectId}.`
+      aliases.supabaseProjectId
+        ? `Supabase project mismatch for ${projectName}: expected ${aliases.supabaseProjectId}.`
+        : `No Supabase project is declared for ${projectName}: add aliases.supabaseProjectId to this project in ${projectsPath} (read again on the next call).`
     );
   }
 
@@ -1188,7 +1550,7 @@ const server = new McpServer(
   },
   {
     instructions:
-      'On mcphub_call and on each call of mcphub_batch, pass fields (keys to keep in each row) and max_rows whenever you expect a list (rows, logs, issues, invoices): the result comes back several times smaller.'
+      'On mcphub_call and on each call of mcphub_batch, pass fields (keys to keep in each row) and max_rows whenever you expect a list (rows, logs, issues, invoices): the result comes back several times smaller. When a task needs three or more tool calls and you do not have to read a result to decide the next call (loops, filters, lookups feeding each other), send one mcphub_run script instead of separate calls: one round trip, and only its return value comes back.'
   }
 );
 
@@ -1197,7 +1559,86 @@ const server = new McpServer(
 const hubTools = new Map();
 function registerHubTool(name, config, handler) {
   hubTools.set(name, config);
-  return server.registerTool(name, config, handler);
+  return server.registerTool(name, config, async (...handlerArgs) => {
+    await refreshProjects();
+    return answerInTime(name, handler(...handlerArgs));
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Appels longs : l'app Claude coupe un appel d'outil resté 60 s sans réponse
+// (« Request timed out », mesuré le 2026-11-25 ; elle ne fournit pas de jeton de
+// progression, donc rien ne repousse ce délai), et a déjà marqué McpHub
+// indisponible après une telle coupure. On répond donc avant : passé
+// answerBeforeMs, l'appel continue ici et son résultat se lit par poignée
+// (server "mcphub", tool "call_result").
+// ---------------------------------------------------------------------------
+
+const pendingCalls = new Map();
+let pendingCallCount = 0;
+
+function waitFor(outcome, delayMs) {
+  let timer;
+  const late = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(undefined), delayMs);
+  });
+  return Promise.race([outcome, late]).finally(() => clearTimeout(timer));
+}
+
+function deliver(settled) {
+  if (settled.error) throw settled.error;
+  return settled.value;
+}
+
+function pendingNotice(handle, { name, startedAt }) {
+  const seconds = Math.round((Date.now() - startedAt) / 1000);
+  return {
+    ...textResult(
+      `Still running after ${seconds} s: ${name} continues in the background. Do not call it again, it may already have had its effect. Get its result with mcphub_call server "mcphub", tool "call_result", arguments {"handle":"${handle}"}.`
+    ),
+    _meta: { mcphub: { status: 'pending', handle } }
+  };
+}
+
+async function answerInTime(name, work) {
+  const startedAt = Date.now();
+  // Jamais de rejet non géré quand l'appel se termine après la réponse d'attente.
+  const pending = { name, startedAt, finished: false };
+  pending.outcome = Promise.resolve(work)
+    .then(
+      (value) => ({ value }),
+      (error) => ({ error })
+    )
+    .finally(() => {
+      pending.finished = true;
+    });
+  const settled = await waitFor(pending.outcome, answerBeforeMs);
+  if (settled) return deliver(settled);
+  pendingCallCount += 1;
+  const handle = `c${pendingCallCount}`;
+  pendingCalls.set(handle, pending);
+  // Seuls des résultats terminés et jamais lus sont oubliés : un appel encore en
+  // cours garde sa poignée.
+  for (const [oldHandle, oldCall] of pendingCalls) {
+    if (pendingCalls.size <= pendingCallLimit) break;
+    if (oldCall.finished) pendingCalls.delete(oldHandle);
+  }
+  return pendingNotice(handle, pending);
+}
+
+async function readPendingCall({ handle }) {
+  const pending = typeof handle === 'string' ? pendingCalls.get(handle) : undefined;
+  if (!pending) {
+    return textResult(
+      `No pending call for handle "${handle}": its result was already read, or this McpHub client restarted since. Check the effect of the call before running it again.`,
+      true
+    );
+  }
+  // Plus court que answerBeforeMs : cette lecture passe elle-même par answerInTime.
+  const settled = await waitFor(pending.outcome, Math.round(answerBeforeMs * 0.8));
+  if (!settled) return pendingNotice(handle, pending);
+  pendingCalls.delete(handle);
+  return deliver(settled);
 }
 
 const projectFields = {
@@ -1352,6 +1793,8 @@ registerHubTool(
   }) => {
     try {
       if (childServer === hubLocalServer && tool === 'read_result') return readStoredResult(args, working_dir);
+      if (childServer === hubLocalServer && tool === 'search_result') return searchStoredResult(args, working_dir);
+      if (childServer === hubLocalServer && tool === 'call_result') return await readPendingCall(args);
       const [projectName, projectConfig] = resolveProject(project, working_dir);
       const securedArgs = enforceProjectPolicy({
         projectName,
@@ -1372,7 +1815,9 @@ registerHubTool(
         visible: serverVisibility(projectConfig, working_dir),
         workingDirectory: working_dir
       });
-      return shapeChildResult(result, pickShaping(shaping), childServer).result;
+      const shaped = shapeChildResult(result, pickShaping(shaping), childServer).result;
+      recordServerUsage(childServer, result, shaped);
+      return shaped;
     } catch (error) {
       return errorToResult(error);
     }
@@ -1428,6 +1873,7 @@ registerHubTool(
           });
           const status = callStatus(result);
           const shaped = shapeChildResult(result, pickShaping(call), call.server);
+          recordServerUsage(call.server, result, shaped.value);
           return {
             id: call.id,
             ok: status === 'ok',
@@ -1482,7 +1928,7 @@ registerHubTool(
           true
         );
       }
-      usage.runs = (usage.runs ?? 0) + 1;
+      usage.runs += 1;
       markUsageDirty();
       await assertTenantSupport(working_dir);
       const result = await callHubTool('mcphub_run', {
@@ -1494,8 +1940,14 @@ registerHubTool(
       // Le texte d'un très gros résultat est coupé par le moteur et ne se parse plus :
       // la mention se lit alors dans le texte lui-même.
       const runText = extractText(result);
-      const policyConfirmed =
-        parseJsonContainer(runText)?.policy === 'enforced' || /"policy":\s*"enforced"/.test(runText);
+      const runPayload = parseJsonContainer(runText);
+      const policyConfirmed = runPayload?.policy === 'enforced' || /"policy":\s*"enforced"/.test(runText);
+      // Appels faits par le script : autant d'allers-retours que l'agent n'a pas eu à faire.
+      const scriptCalls = runPayload?.calls ?? Number(/"calls":\s*(\d+)/.exec(runText)?.[1] ?? 0);
+      if (!result.isError && Number.isInteger(scriptCalls)) {
+        usage.runCalls += scriptCalls;
+        markUsageDirty();
+      }
       if (policy && !result.isError && !policyConfirmed) {
         return textResult(
           'mcphub_run ran but the daemon did not confirm that the project rules were enforced: result withheld. Update McpHub.',
@@ -1608,6 +2060,8 @@ registerHubTool(
   async () => {
     try {
       const catalog = await readSchemaCatalog();
+      const sharedUsage = await readSharedUsage();
+      const { byServer: serverUsage, ...totalUsage } = sharedUsage;
       const catalogSaved = Math.max(
         0,
         catalog.cursorCatalogBytes - hubCatalog.fullBytes
@@ -1660,7 +2114,29 @@ registerHubTool(
               ? 'Child servers are shared with every Cursor window through the McpHub daemon.'
               : 'Child servers are spawned per Cursor window. Start the daemon (McpHub install) to share them.'
         },
-        actualUsage: usage
+        codeMode: {
+          runs: sharedUsage.runs,
+          callsInsideScripts: sharedUsage.runCalls,
+          roundTripsSaved: Math.max(0, sharedUsage.runCalls - sharedUsage.runs),
+          note: 'Each mcphub_run is one round trip, whatever the number of tool calls its script makes.'
+        },
+        perServer: {
+          servers: Object.entries(serverUsage)
+            .map(([server, { calls, resultBytes, rawBytes, measuredBytes, tokens, tokenBytes }]) => ({
+              server,
+              calls,
+              resultBytes,
+              approximateTokens: approximateTokens(resultBytes, tokens, tokenBytes),
+              ...shapingSavings(rawBytes, measuredBytes)
+            }))
+            .sort((left, right) => right.approximateTokens - left.approximateTokens),
+          shaping: shapingSavings(
+            Object.values(serverUsage).reduce((sum, entry) => sum + countOf(entry.rawBytes), 0),
+            Object.values(serverUsage).reduce((sum, entry) => sum + countOf(entry.measuredBytes), 0)
+          ),
+          note: 'Result bytes delivered to the agent by mcphub_call and mcphub_batch, after shaping, counted since this field was added. rawBytes is what the child server returned before shaping, counted since it was added (calls recorded earlier have no raw size and are left out of the savings). Calls made inside mcphub_run scripts are not attributed to a server. approximateTokens counts text at four bytes a token and each image by its pixels, as Claude bills it (ceil(width/28) x ceil(height/28), after downscaling to 2576 px and 4784 tokens); calls recorded before images were counted that way stay at bytes divided by four.'
+        },
+        actualUsage: totalUsage
       });
     } catch (error) {
       return textResult(errorMessage(error), true);

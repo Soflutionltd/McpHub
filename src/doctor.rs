@@ -39,7 +39,10 @@ pub fn run(json: bool) {
     let failed = report.checks.iter().any(|c| c.status == "error")
         || report.servers.iter().any(|s| s.status == "error");
     if json {
-        println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_default()
+        );
     } else {
         print_report(&report);
     }
@@ -82,7 +85,10 @@ fn collect() -> Report {
             checks.push(Check {
                 name: "config",
                 status: "error",
-                detail: format!("{} (the daemon keeps its last valid config, or starts with no server)", e),
+                detail: format!(
+                    "{} (the daemon keeps its last valid config, or starts with no server)",
+                    e
+                ),
             });
             None
         }
@@ -125,7 +131,12 @@ fn collect() -> Report {
     });
 
     let mut servers: Vec<ServerCheck> = config
-        .map(|c| c.servers.into_iter().map(|(name, srv)| check_server(name, &srv)).collect())
+        .map(|c| {
+            c.servers
+                .into_iter()
+                .map(|(name, srv)| check_server(name, &srv))
+                .collect()
+        })
         .unwrap_or_default();
     servers.sort_by(|a, b| a.name.cmp(&b.name));
 
@@ -150,7 +161,13 @@ fn collect() -> Report {
 fn check_server(name: String, srv: &crate::config::ServerConfig) -> ServerCheck {
     if let Some(url) = &srv.url {
         // Only the host: the rest of a URL can carry a token.
-        let host = url.split("://").nth(1).unwrap_or(url).split(['/', '?']).next().unwrap_or("");
+        let host = url
+            .split("://")
+            .nth(1)
+            .unwrap_or(url)
+            .split(['/', '?'])
+            .next()
+            .unwrap_or("");
         return ServerCheck {
             name,
             kind: "remote",
@@ -189,7 +206,13 @@ fn print_report(report: &Report) {
     }
     println!("\nServers ({} total):", report.servers.len());
     for server in &report.servers {
-        println!("  {} {} ({}) {}", mark(server.status), server.name, server.kind, server.detail);
+        println!(
+            "  {} {} ({}) {}",
+            mark(server.status),
+            server.name,
+            server.kind,
+            server.detail
+        );
     }
     println!(
         "\nDisk Usage: {} uses {} MB",

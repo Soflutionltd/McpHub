@@ -5,7 +5,7 @@
 /// requêtes HTTP en parallèle, un processus local multiplexe les siennes par identifiant
 /// JSON-RPC (une tâche lectrice par processus, écritures sur stdin sérialisées par un verrou
 /// tenu le temps d'une ligne).
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -21,6 +21,86 @@ use crate::redaction::redact_text;
 
 /// Préfixe d'une erreur où la requête n'a jamais atteint le serveur : la relancer est sans risque.
 pub const NOT_SENT: &str = "[non transmis]";
+
+/// Clé `_meta` d'un `tools/call` qui porte le dossier de la session à l'origine de l'appel, au format
+/// d'une réponse `roots/list` : un serveur partagé par plusieurs sessions sait ainsi, appel par appel
+/// et sans aller-retour, dans quel projet il travaille.
+pub const ROOTS_META: &str = "com.soflution.mcphub/roots";
+
+tokio::task_local! {
+    /// Dossier de la session dont vient l'appel en cours (`working_dir`, sinon le dossier du client).
+    pub static CALL_ROOT: Option<std::path::PathBuf>;
+}
+
+/// Le dossier de la session à l'origine de l'appel en cours, s'il est connu.
+pub fn call_root() -> Option<std::path::PathBuf> {
+    CALL_ROOT.try_with(|root| root.clone()).ok().flatten()
+}
+
+/// URI `file://` d'un dossier absolu, chaque octet hors des caractères non réservés encodé en %XX.
+fn file_uri(path: &std::path::Path) -> String {
+    let mut uri = String::from("file://");
+    for byte in path.to_string_lossy().bytes() {
+        if byte.is_ascii_alphanumeric() || b"/-._~".contains(&byte) {
+            uri.push(byte as char);
+        } else {
+            uri.push_str(&format!("%{:02X}", byte));
+        }
+    }
+    uri
+}
+
+/// Instance d'un serveur propre à un dossier de projet : `serveur#<empreinte du dossier>`.
+/// Un serveur qui demande `roots/list` en reçoit une par projet : le dossier qu'il connaît ne
+/// change jamais, quel que soit le nombre de conversations en parallèle.
+pub fn is_root_instance(name: &str) -> bool {
+    name.contains('#')
+}
+
+/// Nom du serveur sans l'empreinte du dossier (`filesystem#3f2a` → `filesystem`).
+pub fn base_server(name: &str) -> &str {
+    name.split_once('#').map(|(base, _)| base).unwrap_or(name)
+}
+
+fn root_tag(root: &std::path::Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    root.hash(&mut hasher);
+    format!("{:08x}", hasher.finish() as u32)
+}
+
+/// Serveurs (clé de processus sans empreinte) qui ont demandé `roots/list` depuis le démarrage.
+fn roots_servers() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<String>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Serveur qui dépend du dossier du projet : il a demandé `roots/list`, ou c'est le serveur de
+/// fichiers officiel (ses dossiers autorisés sont les racines reçues).
+fn uses_roots(name: &str, config: &ServerConfig) -> bool {
+    roots_servers().contains(name)
+        || std::iter::once(&config.command)
+            .chain(config.args.iter())
+            .any(|a| a.contains("server-filesystem"))
+}
+
+/// Les racines d'une session, au format MCP de `roots/list` : le dossier, nommé par son dernier élément.
+pub fn roots_value(root: Option<&std::path::Path>) -> serde_json::Value {
+    let roots: Vec<serde_json::Value> = root
+        .map(|path| {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            serde_json::json!({ "uri": file_uri(path), "name": name })
+        })
+        .into_iter()
+        .collect();
+    serde_json::Value::Array(roots)
+}
 /// Préfixe d'une erreur où la requête a été transmise sans réponse : l'outil a pu s'exécuter.
 pub const UNKNOWN_OUTCOME: &str = "[issue inconnue]";
 
@@ -78,7 +158,12 @@ impl SendState {
     /// Côté écriture : faux si l'appelant a déjà renoncé, rien ne doit alors être écrit.
     fn begin_write(&self) -> bool {
         self.0
-            .compare_exchange(Self::QUEUED, Self::WRITING, Ordering::SeqCst, Ordering::SeqCst)
+            .compare_exchange(
+                Self::QUEUED,
+                Self::WRITING,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
             .is_ok()
     }
 
@@ -124,12 +209,16 @@ struct StdioShared {
     stdin: Mutex<tokio::process::ChildStdin>,
     waiting: std::sync::Mutex<Waiting>,
     next_id: AtomicU64,
+    /// Dossier de la session du dernier appel transmis : ce que `roots/list` répond.
+    root: std::sync::Mutex<Option<std::path::PathBuf>>,
 }
 
 impl StdioShared {
     fn waiting(&self) -> std::sync::MutexGuard<'_, Waiting> {
         // Aucune section critique ne peut paniquer en laissant la table incohérente.
-        self.waiting.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.waiting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn register(&self, id: u64, reply: oneshot::Sender<Reply>) -> Result<(), CallError> {
@@ -180,6 +269,9 @@ impl StdioShared {
                         server_method.to_string(),
                     ));
                 }
+                None if server_method == "notifications/tools/list_changed" => {
+                    notify_tools_changed(&self.server_name);
+                }
                 None if server_method == "notifications/message" => {
                     if let Some(params) = parsed.get("params") {
                         if let (Some(level), Some(data)) = (
@@ -208,7 +300,10 @@ impl StdioShared {
         };
         let outcome = match parsed.get("error") {
             Some(error) => Err(CallError::Server(format!("MCP error: {}", error))),
-            None => Ok(parsed.get("result").cloned().unwrap_or(serde_json::Value::Null)),
+            None => Ok(parsed
+                .get("result")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)),
         };
         // L'appelant a pu renoncer entre-temps : sa réponse tardive est simplement perdue.
         let _ = reply.send(outcome);
@@ -283,9 +378,13 @@ impl StdioProcess {
             stdin: Mutex::new(stdin),
             waiting: std::sync::Mutex::new(Waiting::default()),
             next_id: AtomicU64::new(1),
+            root: std::sync::Mutex::new(None),
         });
         tokio::spawn(read_replies(shared.clone(), BufReader::new(stdout).lines()));
-        Self { shared, child: Mutex::new(child) }
+        Self {
+            shared,
+            child: Mutex::new(child),
+        }
     }
 
     async fn kill(&self) {
@@ -315,7 +414,8 @@ impl StdioProcess {
             "method": method,
             "params": params,
         });
-        let mut line = serde_json::to_vec(&request).map_err(|e| CallError::Server(e.to_string()))?;
+        let mut line =
+            serde_json::to_vec(&request).map_err(|e| CallError::Server(e.to_string()))?;
         line.push(b'\n');
 
         let (reply, answered) = oneshot::channel();
@@ -336,6 +436,27 @@ impl StdioProcess {
             .unwrap_or_else(|_| Err(CallError::Lost("Server closed connection".into())))
     }
 
+    /// Note le dossier de la session de l'appel qui part ; s'il change, le serveur en est averti
+    /// (`notifications/roots/list_changed`) avant de recevoir l'appel.
+    async fn note_root(&self, root: &std::path::Path) {
+        let changed = {
+            let mut current = self
+                .shared
+                .root
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let changed = current.as_deref() != Some(root);
+            *current = Some(root.to_path_buf());
+            changed
+        };
+        if changed {
+            // Au mieux : un serveur qui ne lit plus recevra quand même l'appel et son `_meta`.
+            let _ = self
+                .notify("notifications/roots/list_changed", serde_json::json!({}))
+                .await;
+        }
+    }
+
     async fn notify(&self, method: &str, params: serde_json::Value) -> Result<(), String> {
         let notification = serde_json::json!({
             "jsonrpc": "2.0",
@@ -348,8 +469,11 @@ impl StdioProcess {
             .await
             .map_err(|e| format!("Write task stopped: {}", e))?
             .map_err(|e| match e {
-                CallError::Dead(e) | CallError::Busy(e) | CallError::Lost(e)
-                | CallError::NoReply(e) | CallError::Server(e) => e,
+                CallError::Dead(e)
+                | CallError::Busy(e)
+                | CallError::Lost(e)
+                | CallError::NoReply(e)
+                | CallError::Server(e) => e,
             })
     }
 }
@@ -383,7 +507,10 @@ impl Drop for InFlight<'_> {
 
 impl Instance {
     fn new(link: Link) -> Self {
-        Self { link, in_flight: AtomicUsize::new(0) }
+        Self {
+            link,
+            in_flight: AtomicUsize::new(0),
+        }
     }
 
     fn busy(&self) -> bool {
@@ -398,11 +525,21 @@ impl Instance {
     }
 
     /// Un échange JSON-RPC, sans verrou tenu pendant l'attente de la réponse.
+    /// Note le dossier de la session de l'appel qui part (serveurs locaux : seuls à demander `roots/list`).
+    async fn note_root(&self, root: &std::path::Path) {
+        if let Link::Stdio(proc) = &self.link {
+            proc.note_root(root).await;
+        }
+    }
+
     async fn request(&self, method: &str, params: serde_json::Value, state: &SendState) -> Reply {
         match &self.link {
             Link::Http(remote) => {
                 state.mark_sent();
-                remote.request(method, params).await.map_err(CallError::Server)
+                remote
+                    .request(method, params)
+                    .await
+                    .map_err(CallError::Server)
             }
             Link::Stdio(proc) => proc.request(method, params, state).await,
         }
@@ -449,13 +586,21 @@ fn now_ms() -> u64 {
 struct ServerPool {
     procs: Vec<Arc<Instance>>,
     handles: Vec<KillHandle>,
-    tools: Vec<ToolDef>,
+    /// Outils annoncés, relus quand le serveur signale un changement (`tools/list_changed`).
+    tools: std::sync::Mutex<Vec<ToolDef>>,
     request_timeout_secs: u64,
     next_idx: AtomicUsize,
     last_used_ms: AtomicU64,
 }
 
 impl ServerPool {
+    fn tools(&self) -> Vec<ToolDef> {
+        self.tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     fn touch(&self) {
         self.last_used_ms.store(now_ms(), Ordering::Relaxed);
     }
@@ -493,12 +638,60 @@ impl ServerPool {
     }
 }
 
+/// Serveurs qui ont annoncé un changement de leurs outils, lus par le proxy (catalogue).
+fn tools_changed_channel(
+) -> &'static std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>> {
+    static C: std::sync::OnceLock<
+        std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>,
+    > = std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Le proxy s'abonne aux changements d'outils annoncés par les serveurs.
+pub fn subscribe_tools_changed() -> tokio::sync::mpsc::UnboundedReceiver<String> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    *tools_changed_channel()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
+    rx
+}
+
+fn notify_tools_changed(server: &str) {
+    let guard = tools_changed_channel()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(tx) = guard.as_ref() {
+        let _ = tx.send(server.to_string());
+    }
+}
+
 /// Variables système transmises à tous les serveurs.
 const BASE_ENV: &[&str] = &[
-    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
-    "TERM", "__CF_USER_TEXT_ENCODING", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy",
-    "https_proxy", "no_proxy", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "TZ", "NVM_DIR",
-    "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME",
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "__CF_USER_TEXT_ENCODING",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "NODE_EXTRA_CA_CERTS",
+    "SSL_CERT_FILE",
+    "TZ",
+    "NVM_DIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_STATE_HOME",
 ];
 
 pub fn base_child_env(unsandboxed: bool, inherit: &[String]) -> Vec<(String, String)> {
@@ -525,19 +718,23 @@ pub fn base_child_env(unsandboxed: bool, inherit: &[String]) -> Vec<(String, Str
 /// Commande d'un serveur local, prête à lancer : sandbox, environnement minimal (jamais les
 /// secrets chargés dans le démon), ses propres variables, groupe de processus dédié.
 /// Utilisée par le démarrage normal et par le diagnostic du tableau de bord.
-pub fn local_command(name: &str, config: &ServerConfig) -> Command {
+pub fn local_command(name: &str, config: &ServerConfig) -> Result<Command, String> {
     let (program, program_args) = crate::sandbox::wrap(
         name,
         config.sandbox.as_ref(),
         &config.command,
         &config.args,
         &config.env,
-    );
+    )?;
     let mut cmd = Command::new(&program);
     cmd.args(&program_args).kill_on_drop(true);
     cmd.env_clear();
     // Instance d'un tenant : jamais l'agent SSH ni les variables héritées du démon.
-    let inherit: &[String] = if config.tenant.is_some() { &[] } else { &config.inherit_env };
+    let inherit: &[String] = if config.tenant.is_some() {
+        &[]
+    } else {
+        &config.inherit_env
+    };
     for (k, v) in base_child_env(config.sandbox.is_none() && config.tenant.is_none(), inherit) {
         cmd.env(k, v);
     }
@@ -546,7 +743,7 @@ pub fn local_command(name: &str, config: &ServerConfig) -> Command {
     }
     #[cfg(unix)]
     cmd.process_group(0);
-    cmd
+    Ok(cmd)
 }
 
 /// Sortie d'erreur d'un serveur enfant : ~/Library/Logs/McpHub/<serveur>.stderr.log (remise à zéro
@@ -566,10 +763,18 @@ fn child_stderr(name: &str) -> Stdio {
     }
     let safe: String = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let path = dir.join(format!("{}.stderr.log", safe));
-    let too_big = std::fs::metadata(&path).map(|m| m.len() > 1_000_000).unwrap_or(false);
+    let too_big = std::fs::metadata(&path)
+        .map(|m| m.len() > 1_000_000)
+        .unwrap_or(false);
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true);
     if too_big {
@@ -605,6 +810,32 @@ pub struct ChildManager {
     /// Augmente à chaque serveur perdu, relancé ou arrêté : les réponses mises en cache avant
     /// ne sont plus servies (l'état du serveur a pu changer).
     epoch: AtomicU64,
+    /// Serveurs préchauffés, épargnés par l'arrêt d'inactivité (voir `set_keep_warm`).
+    keep_warm: std::sync::RwLock<HashSet<String>>,
+}
+
+/// Erreur de démarrage qui ne disparaît pas en réessayant : authentification refusée ou à
+/// refaire, programme introuvable ou non exécutable. Tout le reste (connexion coupée, délai
+/// dépassé, serveur occupé) peut passer au second essai et reste réessayé.
+pub fn is_permanent_start_error(error: &str) -> bool {
+    let e = error.to_lowercase();
+    // « jeton refuse (503 ...) » ou (429) est un incident du serveur d'autorisation, passager :
+    // seuls les refus du jeton lui-même (400, 401, invalid_grant) sont définitifs.
+    const AUTH: [&str; 8] = [
+        "authentification refusee (401)",
+        "jeton refuse (400",
+        "jeton refuse (401",
+        "invalid_grant",
+        "invalid_client",
+        "connexion requise",
+        "not authenticated",
+        "api key is missing",
+    ];
+    AUTH.iter().any(|needle| e.contains(needle))
+        // Avec la parenthèse : « os error 2 » est aussi le début de 23, 24 (trop de fichiers
+        // ouverts) et 28 (disque plein), qui passent d'eux-mêmes.
+        || (e.contains("failed to spawn")
+            && (e.contains("(os error 2)") || e.contains("(os error 13)")))
 }
 
 impl ChildManager {
@@ -620,6 +851,7 @@ impl ChildManager {
             idle_timeout_ms,
             request_timeout_secs: request_timeout_secs.max(1),
             epoch: AtomicU64::new(0),
+            keep_warm: std::sync::RwLock::new(HashSet::new()),
         }
     }
 
@@ -663,11 +895,24 @@ impl ChildManager {
 
     /// Retire toutes les instances d'un tenant (configs et processus).
     pub async fn remove_tenant_instances(&self, tenant: &str) {
-        let of_tenant = |name: &String| {
-            crate::tenant::split_instance(name).is_some_and(|(_, t)| t == tenant)
-        };
-        let mut names: Vec<String> = self.configs.lock().await.keys().filter(|n| of_tenant(n)).cloned().collect();
-        names.extend(self.pools.lock().await.keys().filter(|n| of_tenant(n)).cloned());
+        let of_tenant =
+            |name: &String| crate::tenant::split_instance(name).is_some_and(|(_, t)| t == tenant);
+        let mut names: Vec<String> = self
+            .configs
+            .lock()
+            .await
+            .keys()
+            .filter(|n| of_tenant(n))
+            .cloned()
+            .collect();
+        names.extend(
+            self.pools
+                .lock()
+                .await
+                .keys()
+                .filter(|n| of_tenant(n))
+                .cloned(),
+        );
         names.sort();
         names.dedup();
         for name in names {
@@ -684,14 +929,19 @@ impl ChildManager {
         self.stop_server(name).await;
     }
 
-        pub async fn has_config(&self, name: &str) -> bool {
+    pub async fn has_config(&self, name: &str) -> bool {
         self.configs.lock().await.contains_key(name)
     }
 
     /// Nom exact d'une instance de tenant, sinon résolution normale.
     async fn resolve_internal(&self, name: &str) -> Option<String> {
-        if crate::tenant::is_instance_name(name) {
-            return self.configs.lock().await.contains_key(name).then(|| name.to_string());
+        if crate::tenant::is_instance_name(name) || is_root_instance(name) {
+            return self
+                .configs
+                .lock()
+                .await
+                .contains_key(name)
+                .then(|| name.to_string());
         }
         self.resolve_name(name).await
     }
@@ -702,7 +952,7 @@ impl ChildManager {
     /// Un nom venu de l'extérieur ne désigne jamais une instance de tenant (`serveur@tenant`) :
     /// celles-ci ne s'atteignent que par le routage des tenants (`resolve_instance`).
     pub async fn resolve_name(&self, name: &str) -> Option<String> {
-        if crate::tenant::is_instance_name(name) {
+        if crate::tenant::is_instance_name(name) || is_root_instance(name) {
             return None;
         }
         let configs = self.configs.lock().await;
@@ -710,13 +960,19 @@ impl ChildManager {
             return Some(name.to_string());
         }
         let lower = name.to_lowercase();
-        for key in configs.keys().filter(|k| !crate::tenant::is_instance_name(k)) {
+        for key in configs
+            .keys()
+            .filter(|k| !crate::tenant::is_instance_name(k) && !is_root_instance(k))
+        {
             if key.to_lowercase() == lower {
                 return Some(key.clone());
             }
         }
         let normalized = lower.replace(['-', '_'], "");
-        for key in configs.keys().filter(|k| !crate::tenant::is_instance_name(k)) {
+        for key in configs
+            .keys()
+            .filter(|k| !crate::tenant::is_instance_name(k) && !is_root_instance(k))
+        {
             let key_normalized = key.to_lowercase().replace(['-', '_'], "");
             if key_normalized == normalized {
                 return Some(key.clone());
@@ -748,6 +1004,39 @@ impl ChildManager {
         }
     }
 
+    /// Processus à utiliser pour l'appel en cours : le serveur lui-même, ou, s'il dépend du
+    /// dossier du projet, l'instance propre à ce dossier (créée au besoin, même config).
+    async fn root_instance(&self, name: &str) -> String {
+        let Some(root) = call_root() else {
+            return name.to_string();
+        };
+        let mut configs = self.configs.lock().await;
+        let Some(config) = configs.get(name).cloned() else {
+            return name.to_string();
+        };
+        if is_root_instance(name) || !uses_roots(name, &config) {
+            return name.to_string();
+        }
+        let key = format!("{}#{}", name, root_tag(&root));
+        configs.entry(key.clone()).or_insert(config);
+        key
+    }
+
+    /// Relit les outils d'un serveur en marche (après `notifications/tools/list_changed`) :
+    /// définitions contrôlées et épinglées comme au démarrage. `None` si le serveur est arrêté.
+    pub async fn refresh_tools(&self, name: &str) -> Option<Result<Vec<ToolDef>, String>> {
+        let pool = self.pool(name).await?;
+        let proc = pool.pick();
+        let result = list_tools(&proc, name, pool.request_timeout_secs).await;
+        if let Ok(tools) = &result {
+            *pool
+                .tools
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = tools.clone();
+        }
+        Some(result)
+    }
+
     pub async fn start_server(&self, name: &str) -> Result<Vec<ToolDef>, String> {
         let name_resolved = self
             .resolve_internal(name)
@@ -757,7 +1046,7 @@ impl ChildManager {
 
         if let Some(pool) = self.pool(name).await {
             pool.touch();
-            return Ok(pool.tools.clone());
+            return Ok(pool.tools());
         }
 
         let gate = {
@@ -767,7 +1056,7 @@ impl ChildManager {
         let mut last_failure = gate.lock().await;
         if let Some(pool) = self.pool(name).await {
             pool.touch();
-            return Ok(pool.tools.clone());
+            return Ok(pool.tools());
         }
         if let Some((at, error)) = last_failure.as_ref() {
             if at.elapsed() < START_FAILURE_MEMORY {
@@ -802,6 +1091,17 @@ impl ChildManager {
                 }
                 Err(e) => {
                     last_error = e;
+                    // Un refus d'authentification ou un programme introuvable ne se repare pas en
+                    // reessayant : l'agent a la reponse tout de suite au lieu d'attendre 3,5 s.
+                    if is_permanent_start_error(&last_error) {
+                        eprintln!(
+                            "[McpHub][WARN] {} failed: {} (not retried: needs a fix, not time)",
+                            name, last_error
+                        );
+                        let error = format!("{} (not retried)", last_error);
+                        *last_failure = Some((Instant::now(), error.clone()));
+                        return Err(error);
+                    }
                     if attempt < MAX_RETRIES - 1 {
                         eprintln!(
                             "[McpHub][WARN] {} failed: {} — retrying...",
@@ -856,7 +1156,7 @@ impl ChildManager {
         let pool = Arc::new(ServerPool {
             procs,
             handles,
-            tools: first_tools.clone(),
+            tools: std::sync::Mutex::new(first_tools.clone()),
             request_timeout_secs,
             next_idx: AtomicUsize::new(0),
             last_used_ms: AtomicU64::new(now_ms()),
@@ -881,6 +1181,11 @@ impl ChildManager {
         pool.touch();
         let instance = pool.pick();
         let _in_flight = InFlight::enter(&instance.in_flight);
+        if method == "tools/call" {
+            if let Some(root) = call_root() {
+                instance.note_root(&root).await;
+            }
+        }
         let secs = pool.request_timeout_secs;
         let state = SendState::new();
         let outcome = tokio::time::timeout(
@@ -953,6 +1258,7 @@ impl ChildManager {
             .resolve_internal(server_name)
             .await
             .ok_or_else(|| format!("Unknown server: {}", server_name))?;
+        let resolved = self.root_instance(&resolved).await;
         let server_name = resolved.as_str();
 
         self.start_server(server_name).await?;
@@ -960,7 +1266,10 @@ impl ChildManager {
             .pool(server_name)
             .await
             .ok_or_else(|| format!("Server not running: {}", server_name))?;
-        let params = serde_json::json!({ "name": tool_name, "arguments": arguments });
+        let mut params = serde_json::json!({ "name": tool_name, "arguments": arguments });
+        if let Some(root) = call_root() {
+            params["_meta"] = serde_json::json!({ ROOTS_META: roots_value(Some(&root)) });
+        }
 
         match self.exchange(&pool, "tools/call", params.clone()).await {
             Ok(result) => Ok(result),
@@ -972,7 +1281,9 @@ impl ChildManager {
                 self.discard(server_name, &pool).await;
                 self.start_server(server_name).await?;
                 // Le serveur relancé a pu changer ses définitions : re-contrôle avant l'envoi.
-                if let Some(reason) = crate::toolguard::quarantined(server_name, tool_name) {
+                if let Some(reason) =
+                    crate::toolguard::quarantined(base_server(server_name), tool_name)
+                {
                     return Err(format!(
                         "Bloque par McpHub apres redemarrage de {} : outil {} en quarantaine ({})",
                         server_name, tool_name, reason
@@ -1058,12 +1369,33 @@ impl ChildManager {
         results
     }
 
+    /// Serveurs à ne jamais arrêter pour inactivité : ceux que l'utilisateur a demandé de
+    /// préchauffer. Les arrêter après une pause les ferait redémarrer à froid à l'appel suivant.
+    pub fn set_keep_warm(&self, names: impl IntoIterator<Item = String>) {
+        *self.keep_warm.write().unwrap_or_else(|e| e.into_inner()) = names.into_iter().collect();
+    }
+
+    /// Après un rechargement de configuration : oublie les serveurs qui n'existent plus.
+    pub fn retain_keep_warm(&self, keep: impl Fn(&str) -> bool) {
+        self.keep_warm
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|name| keep(name));
+    }
+
+    fn kept_warm(&self, name: &str) -> bool {
+        self.keep_warm
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(name)
+    }
+
     /// Arrête les serveurs inactifs. Un serveur occupé (appel plus long que le délai
-    /// d'inactivité) n'est jamais considéré comme inactif.
+    /// d'inactivité) n'est jamais considéré comme inactif, un serveur gardé au chaud non plus.
     pub async fn reap_idle(&self) {
         let timeout = Duration::from_millis(self.idle_timeout_ms);
         for (name, pool) in self.snapshot().await {
-            if pool.idle_for() <= timeout || pool.busy() {
+            if pool.idle_for() <= timeout || pool.busy() || self.kept_warm(&name) {
                 continue;
             }
             if self.remove_if_same(&name, &pool).await {
@@ -1184,7 +1516,7 @@ async fn start_instance(
                 config.sandbox.as_ref().map(|s| s.mode)
             );
         }
-        let mut cmd = local_command(name, config);
+        let mut cmd = local_command(name, config)?;
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(child_stderr(name));
@@ -1234,7 +1566,8 @@ async fn initialize(
         "initialize",
         serde_json::json!({
             "protocolVersion": crate::protocol::LATEST_PROTOCOL_VERSION,
-            "capabilities": {},
+            // Les racines : le dossier de la session de chaque appel (`roots/list`, `_meta`).
+            "capabilities": { "roots": { "listChanged": true } },
             "clientInfo": { "name": "McpHub", "version": env!("CARGO_PKG_VERSION") }
         }),
         request_timeout_secs,
@@ -1244,7 +1577,10 @@ async fn initialize(
     if let Some(pv) = init_result.get("protocolVersion").and_then(|v| v.as_str()) {
         if index == 0 {
             if crate::protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&pv) {
-                eprintln!("[McpHub][INFO] Server '{}' negotiated protocol: {}", name, pv);
+                eprintln!(
+                    "[McpHub][INFO] Server '{}' negotiated protocol: {}",
+                    name, pv
+                );
             } else {
                 eprintln!(
                     "[McpHub][WARN] Server '{}' answered with protocol {} that McpHub does not implement; tools/list and tools/call are attempted anyway",
@@ -1254,8 +1590,17 @@ async fn initialize(
         }
     }
 
-    proc.notify("notifications/initialized", serde_json::json!({})).await?;
-    // tools/list est paginé (nextCursor) : on lit toutes les pages.
+    proc.notify("notifications/initialized", serde_json::json!({}))
+        .await?;
+    list_tools(proc, name, request_timeout_secs).await
+}
+
+/// Lit `tools/list` (paginé, nextCursor) puis épingle et contrôle les définitions annoncées.
+async fn list_tools(
+    proc: &Instance,
+    name: &str,
+    request_timeout_secs: u64,
+) -> Result<Vec<ToolDef>, String> {
     let mut tools: Vec<ToolDef> = Vec::new();
     let mut cursor: Option<String> = None;
     for _page in 0..50 {
@@ -1288,7 +1633,8 @@ async fn initialize(
 
     // Épinglage / détection d'empoisonnement sur la définition réellement annoncée,
     // pour chaque instance du pool.
-    crate::toolguard::review(name, &tools);
+    // Une instance par dossier partage les épingles de son serveur.
+    crate::toolguard::review(base_server(name), &tools);
     Ok(tools)
 }
 
@@ -1313,11 +1659,23 @@ async fn send_request(
     }
 }
 
-/// Réponse à une requête que le serveur adresse à McpHub (sampling, roots, elicitation) :
-/// sans réponse, le serveur attendrait jusqu'à son propre délai.
+/// Réponse à une requête que le serveur adresse à McpHub : `ping`, `roots/list` (le dossier de la
+/// session du dernier appel) ; sampling et elicitation refusés. Sans réponse, le serveur attendrait
+/// jusqu'à son propre délai.
 async fn answer_server_request(shared: Arc<StdioShared>, id: serde_json::Value, method: String) {
     let reply = if method == "ping" {
         serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} })
+    } else if method == "roots/list" {
+        let key = base_server(&shared.server_name).to_string();
+        if roots_servers().insert(key.clone()) {
+            eprintln!("[McpHub][INFO] {} demande son dossier (roots/list) : une instance par projet desormais", key);
+        }
+        let root = shared
+            .root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "roots": roots_value(root.as_deref()) } })
     } else {
         serde_json::json!({
             "jsonrpc": "2.0",
@@ -1340,7 +1698,9 @@ mod tests {
     /// écrit dans `mutations` puis ferme sans répondre, `slow` répond après 2 s en bloquant
     /// la lecture. `wait` (1 s) et `late` (3 s) répondent en tâche de fond, la lecture
     /// continue ; `hang` note l'appel dans `received` et ne répond jamais ; `stall` fait de
-    /// même puis cesse de lire stdin. Une réponse -32601 reçue de McpHub va dans `answers`.
+    /// même puis cesse de lire stdin. Une réponse de McpHub à une requête du serveur (-32601, ou
+    /// les racines de `roots/list`) va dans `answers` ; `where` note l'appel reçu dans `calls`
+    /// puis demande `roots/list` ; un changement de racines annoncé va dans `changed`.
     const FAKE_SERVER: &str = r#"#!/bin/sh
 echo $$ >> "$FAKE_DIR/pids"
 while IFS= read -r line; do
@@ -1350,7 +1710,13 @@ while IFS= read -r line; do
       if [ -n "$FAKE_HANG_INIT" ]; then sleep 60; fi
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fake","version":"1"}}}\n' "$id" ;;
     *'"method":"tools/list"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"mutate","description":"m","inputSchema":{"type":"object"}},{"name":"slow","description":"s","inputSchema":{"type":"object"}},{"name":"read_x","description":"r","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+      extra=''
+      if [ -f "$FAKE_DIR/grown" ]; then extra=',{"name":"extra","description":"e","inputSchema":{"type":"object"}}'; fi
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"mutate","description":"m","inputSchema":{"type":"object"}},{"name":"slow","description":"s","inputSchema":{"type":"object"}},{"name":"read_x","description":"r","inputSchema":{"type":"object"}}%s]}}\n' "$id" "$extra" ;;
+    *'"name":"grow"'*)
+      touch "$FAKE_DIR/grown"
+      printf '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}\n'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"grown"}]}}\n' "$id" ;;
     *'"name":"mutate"'*)
       echo done >> "$FAKE_DIR/mutations"
       exit 0 ;;
@@ -1366,8 +1732,14 @@ while IFS= read -r line; do
     *'"name":"stall"'*)
       echo "stall $id" >> "$FAKE_DIR/received"
       sleep 30 ;;
-    *'-32601'*)
+    *'-32601'*|*'"result":{"roots":'*)
       echo "$line" >> "$FAKE_DIR/answers" ;;
+    *'roots/list_changed'*)
+      echo changed >> "$FAKE_DIR/changed" ;;
+    *'"name":"where"'*)
+      echo "$line" >> "$FAKE_DIR/calls"
+      printf '{"jsonrpc":"2.0","id":99998,"method":"roots/list"}\n'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"here"}]}}\n' "$id" ;;
     *'"name":"read_x"'*)
       echo "read_x $id" >> "$FAKE_DIR/received"
       printf '{"jsonrpc":"2.0","id":99999,"method":"roots/list"}\n'
@@ -1433,7 +1805,12 @@ done
         let peak_seen = peak.clone();
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                tokio::spawn(fake_http_connection(stream, delay, running.clone(), peak_seen.clone()));
+                tokio::spawn(fake_http_connection(
+                    stream,
+                    delay,
+                    running.clone(),
+                    peak_seen.clone(),
+                ));
             }
         });
         (url, peak)
@@ -1496,7 +1873,8 @@ done
             let reply = match id {
                 Some(id) => {
                     let payload =
-                        serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string();
+                        serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result })
+                            .to_string();
                     format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                         payload.len(),
@@ -1544,9 +1922,17 @@ done
         let elapsed = began.elapsed();
         assert_eq!(first.unwrap()["content"][0]["text"], "slow");
         assert_eq!(second.unwrap()["content"][0]["text"], "slow");
-        assert_eq!(peak.load(Ordering::SeqCst), 2, "les deux appels doivent se chevaucher");
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            2,
+            "les deux appels doivent se chevaucher"
+        );
         assert!(elapsed >= delay, "trop court : {:?}", elapsed);
-        assert!(elapsed < delay * 2 - Duration::from_millis(200), "appels en file : {:?}", elapsed);
+        assert!(
+            elapsed < delay * 2 - Duration::from_millis(200),
+            "appels en file : {:?}",
+            elapsed
+        );
         manager.stop_all().await;
     }
 
@@ -1564,7 +1950,11 @@ done
             .await
             .unwrap_err();
         assert!(is_unknown_outcome(&err), "{}", err);
-        assert!(began.elapsed() < Duration::from_millis(1500), "delai non applique : {:?}", began.elapsed());
+        assert!(
+            began.elapsed() < Duration::from_millis(1500),
+            "delai non applique : {:?}",
+            began.elapsed()
+        );
         assert!(manager.is_running("fake-remote-lent").await);
         // L'appel abandonné ne compte plus : le serveur redevient arrêtable sur inactivité.
         let pool = manager.pool("fake-remote-lent").await.unwrap();
@@ -1584,8 +1974,15 @@ done
             .await
             .unwrap_err();
         assert!(is_unknown_outcome(&err), "{}", err);
-        assert_eq!(lines(&dir.join("mutations")).len(), 1, "la mutation ne doit partir qu'une fois");
-        assert!(!manager.is_running("fake-mutate").await, "le processus perdu est retire");
+        assert_eq!(
+            lines(&dir.join("mutations")).len(),
+            1,
+            "la mutation ne doit partir qu'une fois"
+        );
+        assert!(
+            !manager.is_running("fake-mutate").await,
+            "le processus perdu est retire"
+        );
 
         // Le prochain appel redémarre le serveur normalement.
         let ok = manager
@@ -1594,6 +1991,84 @@ done
             .unwrap();
         assert_eq!(ok["content"][0]["text"], "x");
         assert_eq!(lines(&dir.join("mutations")).len(), 1);
+        manager.stop_all().await;
+    }
+
+    #[test]
+    fn erreurs_definitives_reconnues() {
+        for e in [
+            "aqara : authentification refusee (401). Verifier le jeton dans headers.",
+            r#"jeton refuse (400 Bad Request) : {"error":"invalid_grant","error_description":"refresh token expired"}"#,
+            "docix : connexion requise. Lancer : McpHub oauth login docix",
+            r#"MCP error: {"code":-32001,"message":"Not authenticated - your API key is missing"}"#,
+            "Failed to spawn desktop-commander: No such file or directory (os error 2)",
+            "Failed to spawn outil: Permission denied (os error 13)",
+        ] {
+            assert!(is_permanent_start_error(e), "{}", e);
+        }
+        for e in [
+            "Server closed connection",
+            "Timeout: server did not respond within 30s",
+            "Failed to spawn outil: Resource temporarily unavailable (os error 35)",
+            "Failed to spawn outil: Too many open files (os error 24)",
+            "Failed to spawn outil: No space left on device (os error 28)",
+            "jeton refuse (503 Service Unavailable) : upstream",
+            "jeton refuse (429 Too Many Requests) : slow down",
+            r#"MCP error: {"code":-32000,"message":"upstream Unauthorized, retry later"}"#,
+            "HTTP 403 Forbidden",
+            "HTTP 401 on a proxy in front (401) of the server",
+            "HTTP 503 Service Unavailable",
+            "connection reset by peer",
+        ] {
+            assert!(!is_permanent_start_error(e), "{}", e);
+        }
+    }
+
+    #[tokio::test]
+    async fn programme_introuvable_pas_reessaye() {
+        let dir = fake_dir("absent");
+        let mut config = fake_config(&dir, &[], 10);
+        config.command = "/nonexistent/mcphub-test-binary".into();
+        let mut configs = HashMap::new();
+        configs.insert("absent".to_string(), config);
+        let manager = ChildManager::new(configs, 300_000, 10);
+        let began = Instant::now();
+        let error = manager.start_server("absent").await.unwrap_err();
+        // Trois essais auraient attendu 500 + 1000 + 2000 ms.
+        assert!(
+            began.elapsed() < Duration::from_millis(400),
+            "{:?}",
+            began.elapsed()
+        );
+        assert!(error.contains("not retried"), "{}", error);
+    }
+
+    #[tokio::test]
+    async fn serveur_garde_au_chaud_pas_arrete() {
+        let dir_warm = fake_dir("warm");
+        let dir_cold = fake_dir("cold");
+        let mut configs = HashMap::new();
+        configs.insert("warm".to_string(), fake_config(&dir_warm, &[], 10));
+        configs.insert("cold".to_string(), fake_config(&dir_cold, &[], 10));
+        // Délai d'inactivité de 1 ms : tout serveur au repos est arrêtable.
+        let manager = ChildManager::new(configs, 1, 10);
+        manager.set_keep_warm(["warm".to_string()]);
+        manager.start_server("warm").await.unwrap();
+        manager.start_server("cold").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        manager.reap_idle().await;
+        assert!(
+            manager.pool("warm").await.is_some(),
+            "le serveur garde au chaud a ete arrete"
+        );
+        assert!(
+            manager.pool("cold").await.is_none(),
+            "le serveur ordinaire devait etre arrete"
+        );
+        // Retiré de la liste, il redevient arrêtable.
+        manager.set_keep_warm(Vec::<String>::new());
+        manager.reap_idle().await;
+        assert!(manager.pool("warm").await.is_none());
         manager.stop_all().await;
     }
 
@@ -1610,7 +2085,8 @@ done
 
         let m1 = manager.clone();
         let slow = tokio::spawn(async move {
-            m1.call_tool("fake-slow", "slow", serde_json::json!({})).await
+            m1.call_tool("fake-slow", "slow", serde_json::json!({}))
+                .await
         });
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -1618,7 +2094,8 @@ done
         // que le serveur lent travaille : rien ne doit attendre la fin de l'appel lent.
         let m2 = manager.clone();
         let second_slow = tokio::spawn(async move {
-            m2.call_tool("fake-slow", "read_x", serde_json::json!({})).await
+            m2.call_tool("fake-slow", "read_x", serde_json::json!({}))
+                .await
         });
         let began = Instant::now();
         let dead = manager.health_check().await;
@@ -1630,10 +2107,17 @@ done
             .unwrap();
         assert!(dead.is_empty(), "{:?}", dead);
         assert_eq!(fast["content"][0]["text"], "x");
-        assert!(began.elapsed() < Duration::from_millis(1000), "bloque {:?}", began.elapsed());
+        assert!(
+            began.elapsed() < Duration::from_millis(1000),
+            "bloque {:?}",
+            began.elapsed()
+        );
 
         assert_eq!(slow.await.unwrap().unwrap()["content"][0]["text"], "slow");
-        assert_eq!(second_slow.await.unwrap().unwrap()["content"][0]["text"], "x");
+        assert_eq!(
+            second_slow.await.unwrap().unwrap()["content"][0]["text"],
+            "x"
+        );
         manager.stop_all().await;
     }
 
@@ -1646,7 +2130,12 @@ done
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        panic!("{} : {} ligne(s) attendue(s), trouve {:?}", path.display(), count, lines(path));
+        panic!(
+            "{} : {} ligne(s) attendue(s), trouve {:?}",
+            path.display(),
+            count,
+            lines(path)
+        );
     }
 
     fn kill_fake(dir: &Path) {
@@ -1686,14 +2175,147 @@ done
         assert_eq!(first.unwrap()["content"][0]["text"], "wait");
         assert_eq!(second.unwrap()["content"][0]["text"], "wait");
         assert_eq!(third.unwrap()["content"][0]["text"], "x");
-        assert!(elapsed >= Duration::from_millis(1000), "trop court : {:?}", elapsed);
-        assert!(elapsed < Duration::from_millis(1700), "appels en file : {:?}", elapsed);
+        assert!(
+            elapsed >= Duration::from_millis(1000),
+            "trop court : {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed < Duration::from_millis(1700),
+            "appels en file : {:?}",
+            elapsed
+        );
         assert_eq!(lines(&dir.join("pids")).len(), 1, "un seul processus");
 
-        // La requête roots/list émise par le serveur pendant read_x reçoit toujours -32601.
+        // La requête roots/list émise par le serveur pendant read_x reçoit toujours une réponse.
         let answers = wait_lines(&dir.join("answers"), 1).await;
         assert!(answers[0].contains("\"id\":99999"), "{}", answers[0]);
         manager.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn un_changement_d_outils_annonce_est_relu() {
+        let dir = fake_dir("outils-changes");
+        let manager = started(&dir, "fake-outils", 10);
+        let mut changes = subscribe_tools_changed();
+        assert_eq!(manager.start_server("fake-outils").await.unwrap().len(), 3);
+        manager
+            .call_tool("fake-outils", "grow", serde_json::json!({}))
+            .await
+            .unwrap();
+        let announced = tokio::time::timeout(Duration::from_secs(5), changes.recv())
+            .await
+            .unwrap();
+        assert_eq!(announced.as_deref(), Some("fake-outils"));
+        let tools = manager.refresh_tools("fake-outils").await.unwrap().unwrap();
+        assert!(
+            tools.iter().any(|t| t.name == "extra"),
+            "outil ajoute non relu"
+        );
+        // Le serveur en marche rend désormais la liste relue.
+        assert_eq!(manager.start_server("fake-outils").await.unwrap().len(), 4);
+        assert!(manager.refresh_tools("inconnu").await.is_none());
+        kill_fake(&dir);
+    }
+
+    #[tokio::test]
+    async fn le_dossier_de_la_session_suit_chaque_appel_et_roots_list_le_donne() {
+        let dir = fake_dir("racines");
+        let manager = started(&dir, "fake-racines", 10);
+        manager.start_server("fake-racines").await.unwrap();
+        let call = |root: Option<&str>| {
+            let manager = manager.clone();
+            let root = root.map(PathBuf::from);
+            async move {
+                CALL_ROOT
+                    .scope(root, async move {
+                        manager
+                            .call_tool("fake-racines", "where", serde_json::json!({}))
+                            .await
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+
+        call(Some("/tmp/Mon projet")).await;
+        let calls = wait_lines(&dir.join("calls"), 1).await;
+        assert!(
+            calls[0].contains(r#""_meta":{"com.soflution.mcphub/roots":[{"name":"Mon projet","uri":"file:///tmp/Mon%20projet"}]}"#),
+            "{}",
+            calls[0]
+        );
+        let answers = wait_lines(&dir.join("answers"), 1).await;
+        assert!(
+            answers[0].contains(r#""id":99998"#) && answers[0].contains("file:///tmp/Mon%20projet"),
+            "{}",
+            answers[0]
+        );
+        // Le serveur a demandé son dossier : chaque projet a désormais son propre processus,
+        // dont le dossier ne change jamais (deux conversations en parallèle ne s'emmêlent pas).
+        let before = lines(&dir.join("pids")).len();
+        call(Some("/tmp/Mon projet")).await;
+        call(Some("/tmp/autre")).await;
+        call(Some("/tmp/Mon projet")).await;
+        let answers = wait_lines(&dir.join("answers"), 4).await;
+        // Deux processus écrivent dans le même fichier : l'ordre entre eux n'est pas fixé.
+        let count = |uri: &str| answers[1..].iter().filter(|a| a.contains(uri)).count();
+        assert_eq!(count("file:///tmp/Mon%20projet"), 2, "{:?}", answers);
+        assert_eq!(count("file:///tmp/autre"), 1, "{:?}", answers);
+        assert_eq!(
+            lines(&dir.join("pids")).len(),
+            before + 2,
+            "un processus par dossier, reutilise"
+        );
+        // Un avis par processus, au premier dossier reçu ; le retour sur un projet n'en
+        // ajoute aucun.
+        assert_eq!(
+            lines(&dir.join("changed")).len(),
+            3,
+            "le dossier d'un processus ne change jamais"
+        );
+        // Une instance de dossier ne se désigne pas de l'extérieur.
+        let tagged = format!("fake-racines#{}", root_tag(Path::new("/tmp/autre")));
+        assert_eq!(manager.resolve_name(&tagged).await, None);
+
+        call(None).await;
+        let calls = wait_lines(&dir.join("calls"), 5).await;
+        assert_eq!(
+            calls.iter().filter(|c| !c.contains("_meta")).count(),
+            1,
+            "sans session connue, rien n'est ajouté : {:?}",
+            calls
+        );
+        manager.stop_all().await;
+    }
+
+    #[test]
+    fn serveur_de_fichiers_une_instance_par_projet() {
+        let dir = fake_dir("fs-detecte");
+        let mut fs = fake_config(&dir, &[], 5);
+        fs.args = vec![
+            "-y".into(),
+            "@modelcontextprotocol/server-filesystem".into(),
+        ];
+        assert!(uses_roots("filesystem", &fs));
+        assert!(!uses_roots(
+            "autre-serveur-jamais-vu",
+            &fake_config(&dir, &[], 5)
+        ));
+        assert_eq!(base_server("filesystem#3f2a01bc"), "filesystem");
+        assert_eq!(base_server("github@acme#3f2a01bc"), "github@acme");
+        assert_eq!(base_server("github"), "github");
+        assert_ne!(root_tag(Path::new("/a")), root_tag(Path::new("/b")));
+    }
+
+    #[test]
+    fn un_dossier_devient_une_racine_mcp() {
+        assert_eq!(roots_value(None), serde_json::json!([]));
+        assert_eq!(
+            roots_value(Some(Path::new("/Users/moi/Projets/Café & co"))),
+            serde_json::json!([{ "uri": "file:///Users/moi/Projets/Caf%C3%A9%20%26%20co", "name": "Café & co" }])
+        );
+        assert_eq!(call_root(), None, "hors d'un appel, aucun dossier");
     }
 
     #[tokio::test]
@@ -1712,7 +2334,11 @@ done
             let err = call.await.unwrap().unwrap_err();
             assert!(is_unknown_outcome(&err), "{}", err);
         }
-        assert!(began.elapsed() < Duration::from_secs(2), "bloque {:?}", began.elapsed());
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "bloque {:?}",
+            began.elapsed()
+        );
         // Transmis : aucun des deux n'est rejoué, ni sur l'ancien processus ni sur un nouveau.
         assert_eq!(lines(&dir.join("pids")).len(), 1);
         assert_eq!(lines(&dir.join("received")).len(), 2);
@@ -1739,7 +2365,12 @@ done
         let sent = spawn_call(&manager, "fake-file", "stall", serde_json::json!({}));
         wait_lines(&dir.join("received"), 1).await;
         let pad = "x".repeat(200_000);
-        let writing = spawn_call(&manager, "fake-file", "read_x", serde_json::json!({ "pad": pad }));
+        let writing = spawn_call(
+            &manager,
+            "fake-file",
+            "read_x",
+            serde_json::json!({ "pad": pad }),
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
         let queued = spawn_call(&manager, "fake-file", "read_x", serde_json::json!({}));
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1752,8 +2383,18 @@ done
         assert_eq!(queued.await.unwrap().unwrap()["content"][0]["text"], "x");
         assert_eq!(lines(&dir.join("pids")).len(), 2, "un seul redemarrage");
         let received = lines(&dir.join("received"));
-        assert_eq!(received.iter().filter(|l| l.starts_with("stall")).count(), 1, "{:?}", received);
-        assert_eq!(received.iter().filter(|l| l.starts_with("read_x")).count(), 2, "{:?}", received);
+        assert_eq!(
+            received.iter().filter(|l| l.starts_with("stall")).count(),
+            1,
+            "{:?}",
+            received
+        );
+        assert_eq!(
+            received.iter().filter(|l| l.starts_with("read_x")).count(),
+            2,
+            "{:?}",
+            received
+        );
         manager.stop_all().await;
     }
 
@@ -1771,8 +2412,15 @@ done
         let err = late.unwrap_err();
         assert!(is_unknown_outcome(&err), "{}", err);
         assert_eq!(wait.unwrap()["content"][0]["text"], "wait");
-        assert!(began.elapsed() < Duration::from_millis(2800), "{:?}", began.elapsed());
-        assert!(manager.is_running("fake-delai").await, "un delai depasse ne tue pas le serveur");
+        assert!(
+            began.elapsed() < Duration::from_millis(2800),
+            "{:?}",
+            began.elapsed()
+        );
+        assert!(
+            manager.is_running("fake-delai").await,
+            "un delai depasse ne tue pas le serveur"
+        );
 
         // La réponse tardive de `late` arrive vers 3 s : elle est ignorée, le processus sert
         // toujours et l'appel suivant reçoit bien sa propre réponse.
@@ -1797,7 +2445,12 @@ done
         let sent = spawn_call(&manager, "fake-attente", "stall", serde_json::json!({}));
         wait_lines(&dir.join("received"), 1).await;
         let pad = "x".repeat(200_000);
-        let writing = spawn_call(&manager, "fake-attente", "hang", serde_json::json!({ "pad": pad }));
+        let writing = spawn_call(
+            &manager,
+            "fake-attente",
+            "hang",
+            serde_json::json!({ "pad": pad }),
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
         let queued = spawn_call(&manager, "fake-attente", "hang", serde_json::json!({}));
 
@@ -1809,7 +2462,11 @@ done
         // Jamais écrit, et ne le sera jamais : sans risque à relancer.
         let err = queued.await.unwrap().unwrap_err();
         assert!(is_not_sent(&err), "{}", err);
-        assert_eq!(lines(&dir.join("pids")).len(), 1, "aucun redemarrage, aucun rejeu");
+        assert_eq!(
+            lines(&dir.join("pids")).len(),
+            1,
+            "aucun redemarrage, aucun rejeu"
+        );
         assert_eq!(lines(&dir.join("received")).len(), 1);
         manager.stop_all().await;
     }
@@ -1825,7 +2482,8 @@ done
             .map(|_| {
                 let m = manager.clone();
                 tokio::spawn(async move {
-                    m.call_tool("fake-burst", "read_x", serde_json::json!({})).await
+                    m.call_tool("fake-burst", "read_x", serde_json::json!({}))
+                        .await
                 })
             })
             .collect();

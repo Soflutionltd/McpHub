@@ -115,7 +115,10 @@ impl UsageWriter {
             writer.state().flush_scheduled = false;
             let flushed = tokio::task::spawn_blocking(move || writer.flush()).await;
             if let Err(e) = flushed {
-                eprintln!("[McpHub][WARN] usage-stats.json : ecriture interrompue : {}", e);
+                eprintln!(
+                    "[McpHub][WARN] usage-stats.json : ecriture interrompue : {}",
+                    e
+                );
             }
         });
     }
@@ -169,7 +172,10 @@ mod tests {
 
         let mut m = ToolMetrics::default();
         m.record_call(7, true);
-        assert_eq!((m.percentile_ms(50), m.percentile_ms(95)), (Some(7), Some(7)));
+        assert_eq!(
+            (m.percentile_ms(50), m.percentile_ms(95)),
+            (Some(7), Some(7))
+        );
     }
 
     #[test]
@@ -183,7 +189,11 @@ mod tests {
         }
         assert_eq!(m.calls, 500);
         assert_eq!(m.latencies_ms.len(), LATENCY_WINDOW);
-        assert_eq!(m.percentile_ms(95), Some(10), "les anciennes durees sont sorties de la fenetre");
+        assert_eq!(
+            m.percentile_ms(95),
+            Some(10),
+            "les anciennes durees sont sorties de la fenetre"
+        );
     }
 
     #[test]
@@ -211,7 +221,8 @@ mod tests {
     }
 
     fn temp_stats(name: &str) -> (PathBuf, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("mcphub-usage-{}-{}", name, std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("mcphub-usage-{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("usage-stats.json");
@@ -233,7 +244,11 @@ mod tests {
         assert!(!path.exists());
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert_eq!(writer.writes(), 1);
-        assert_eq!(read_stats(&path)["s__get_x"], 20, "le dernier etat est celui ecrit");
+        assert_eq!(
+            read_stats(&path)["s__get_x"],
+            20,
+            "le dernier etat est celui ecrit"
+        );
         // Ecriture atomique : aucun fichier temporaire ne reste a cote.
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         // Une nouvelle rafale apres l'intervalle donne une nouvelle ecriture, pas plus.
@@ -258,7 +273,11 @@ mod tests {
         assert_eq!(writer.writes(), 1);
         assert_eq!(read_stats(&path)["s__get_x"], 3);
         writer.flush();
-        assert_eq!(writer.writes(), 1, "un second flush sans nouveaute n'ecrit pas");
+        assert_eq!(
+            writer.writes(),
+            1,
+            "un second flush sans nouveaute n'ecrit pas"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -61,10 +61,16 @@ pub enum Outcome {
     UpToDate,
     Paused(String),
     /// Hors de la part servie pour l'instant ; servie au plus tard à `full_at`.
-    NotYet { version: String, full_at: u64 },
+    NotYet {
+        version: String,
+        full_at: u64,
+    },
     /// Version revenue en arrière sur cette machine après un plantage.
     Rejected(String),
-    Installed { version: String, client_error: Option<String> },
+    Installed {
+        version: String,
+        client_error: Option<String>,
+    },
 }
 
 /// `McpHub update [--check]`.
@@ -83,7 +89,10 @@ async fn run_inner(check_only: bool) -> Result<(), String> {
     if check_only {
         let manifest = fetch_manifest().await?;
         if is_newer(&manifest.version, VERSION) {
-            println!("v{} is available. Run `McpHub update` to install it.", manifest.version);
+            println!(
+                "v{} is available. Run `McpHub update` to install it.",
+                manifest.version
+            );
         } else {
             println!("McpHub is up to date (v{}).", VERSION);
         }
@@ -92,9 +101,14 @@ async fn run_inner(check_only: bool) -> Result<(), String> {
     match check_and_install(Trigger::Manual).await? {
         Outcome::UpToDate => println!("McpHub is up to date (v{}).", VERSION),
         Outcome::Paused(v) => println!("The rollout of v{} is paused, nothing installed.", v),
-        Outcome::NotYet { version, .. } => println!("v{} is not served to this machine yet.", version),
+        Outcome::NotYet { version, .. } => {
+            println!("v{} is not served to this machine yet.", version)
+        }
         Outcome::Rejected(v) => println!("v{} was rolled back on this machine, skipped.", v),
-        Outcome::Installed { version, client_error } => {
+        Outcome::Installed {
+            version,
+            client_error,
+        } => {
             println!("Updated to v{}.", version);
             if let Some(e) = client_error {
                 println!("! Node client not updated: {}", e);
@@ -131,8 +145,13 @@ pub async fn check_and_install(trigger: Trigger) -> Result<Outcome, String> {
         }
     }
 
-    let asset = asset_for(env::consts::OS, env::consts::ARCH)
-        .ok_or_else(|| format!("no pre-built binary for {}/{}", env::consts::OS, env::consts::ARCH))?;
+    let asset = asset_for(env::consts::OS, env::consts::ARCH).ok_or_else(|| {
+        format!(
+            "no pre-built binary for {}/{}",
+            env::consts::OS,
+            env::consts::ARCH
+        )
+    })?;
     let archive = download_verified(&manifest, asset).await?;
 
     let work = PrivateDir::create()?;
@@ -228,11 +247,18 @@ async fn fetch(url: &str, limit: usize) -> Result<Vec<u8>, String> {
         .await
         .and_then(|r| r.error_for_status())
         .map_err(|e| format!("download failed ({}): {}", url, e))?;
-    if response.content_length().is_some_and(|len| len > limit as u64) {
+    if response
+        .content_length()
+        .is_some_and(|len| len > limit as u64)
+    {
         return Err(format!("{} is larger than expected", url));
     }
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|e| format!("download failed ({}): {}", url, e))? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("download failed ({}): {}", url, e))?
+    {
         if body.len() + chunk.len() > limit {
             return Err(format!("{} is larger than expected", url));
         }
@@ -260,7 +286,10 @@ fn check_sha256(bytes: &[u8], expected: &str) -> Result<(), String> {
     if actual.eq_ignore_ascii_case(expected) {
         Ok(())
     } else {
-        Err(format!("checksum mismatch (expected {}, got {})", expected, actual))
+        Err(format!(
+            "checksum mismatch (expected {}, got {})",
+            expected, actual
+        ))
     }
 }
 
@@ -286,9 +315,16 @@ async fn extract(dir: &Path, archive: &Path) -> Result<PathBuf, String> {
     if !status.success() {
         return Err("extraction failed".into());
     }
-    let binary = dir.join(if cfg!(windows) { "McpHub.exe" } else { "McpHub" });
+    let binary = dir.join(if cfg!(windows) {
+        "McpHub.exe"
+    } else {
+        "McpHub"
+    });
     if !binary.is_file() {
-        return Err(format!("extracted binary not found at {}", binary.display()));
+        return Err(format!(
+            "extracted binary not found at {}",
+            binary.display()
+        ));
     }
     #[cfg(unix)]
     set_executable(&binary)?;
@@ -332,7 +368,8 @@ fn install_binary(exe: &Path, new_binary: &Path, version: &str) -> Result<(), St
     let old = old_binary(exe);
     let staged = exe.with_extension("new");
     let _ = fs::remove_file(&staged);
-    fs::copy(new_binary, &staged).map_err(|e| format!("cannot write next to {}: {}", exe.display(), e))?;
+    fs::copy(new_binary, &staged)
+        .map_err(|e| format!("cannot write next to {}: {}", exe.display(), e))?;
     #[cfg(unix)]
     set_executable(&staged)?;
     let _ = fs::remove_file(&old);
@@ -343,7 +380,10 @@ fn install_binary(exe: &Path, new_binary: &Path, version: &str) -> Result<(), St
     if let Err(e) = fs::rename(&staged, exe) {
         let _ = fs::rename(&old, exe);
         let _ = fs::remove_file(&staged);
-        return Err(format!("cannot install the new binary: {} ; previous version kept", e));
+        return Err(format!(
+            "cannot install the new binary: {} ; previous version kept",
+            e
+        ));
     }
     let mut state = read_state(exe);
     state.pending = Some(Pending {
@@ -398,7 +438,10 @@ fn old_binary(exe: &Path) -> PathBuf {
 }
 
 fn state_path(exe: &Path) -> PathBuf {
-    let name = exe.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = exe
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     exe.with_file_name(format!(".{}.update.json", name))
 }
 
@@ -477,7 +520,10 @@ fn confirm_healthy(exe: &Path) {
         if let Err(e) = write_state(exe, &state) {
             eprintln!("[McpHub][UPDATE] {}", e);
         }
-        eprintln!("[McpHub][UPDATE] v{} confirmed (previous: v{})", VERSION, from);
+        eprintln!(
+            "[McpHub][UPDATE] v{} confirmed (previous: v{})",
+            VERSION, from
+        );
     }
 }
 
@@ -519,7 +565,10 @@ pub fn spawn_daemon_tasks(proxy: Arc<crate::proxy::ProxyServer>) {
         loop {
             if auto_update_enabled() {
                 match check_and_install(Trigger::Automatic).await {
-                    Ok(Outcome::Installed { version, client_error }) => {
+                    Ok(Outcome::Installed {
+                        version,
+                        client_error,
+                    }) => {
                         eprintln!("[McpHub][UPDATE] v{} installed", version);
                         if let Some(e) = client_error {
                             eprintln!("[McpHub][UPDATE] Node client not updated: {}", e);
@@ -529,9 +578,14 @@ pub fn spawn_daemon_tasks(proxy: Arc<crate::proxy::ProxyServer>) {
                         "[McpHub][UPDATE] v{} available, served here from {} at the latest",
                         version, full_at
                     ),
-                    Ok(Outcome::Paused(v)) => eprintln!("[McpHub][UPDATE] rollout of v{} paused", v),
+                    Ok(Outcome::Paused(v)) => {
+                        eprintln!("[McpHub][UPDATE] rollout of v{} paused", v)
+                    }
                     Ok(Outcome::Rejected(v)) => {
-                        eprintln!("[McpHub][UPDATE] v{} was rolled back on this machine, skipped", v)
+                        eprintln!(
+                            "[McpHub][UPDATE] v{} was rolled back on this machine, skipped",
+                            v
+                        )
                     }
                     Ok(Outcome::UpToDate) => {}
                     Err(e) => eprintln!("[McpHub][UPDATE] check failed: {}", e),
@@ -564,7 +618,10 @@ fn auto_update_enabled() -> bool {
         crate::config::Dedicated::Valid(config) => config.auto_update,
         crate::config::Dedicated::Missing => true,
         crate::config::Dedicated::Invalid(e) => {
-            eprintln!("[McpHub][UPDATE] config invalid, update check skipped: {}", e);
+            eprintln!(
+                "[McpHub][UPDATE] config invalid, update check skipped: {}",
+                e
+            );
             false
         }
     }
@@ -580,7 +637,11 @@ async fn restart_when_idle(proxy: &crate::proxy::ProxyServer, exe: &Path) {
     let mut idle_checks = 0;
     while idle_checks < 2 {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        idle_checks = if proxy.in_flight() == 0 { idle_checks + 1 } else { 0 };
+        idle_checks = if proxy.in_flight() == 0 {
+            idle_checks + 1
+        } else {
+            0
+        };
     }
     eprintln!("[McpHub][UPDATE] new binary installed: restarting");
     proxy.shutdown().await;
@@ -602,7 +663,9 @@ fn restart_process(exe: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        let error = std::process::Command::new(exe).args(env::args_os().skip(1)).exec();
+        let error = std::process::Command::new(exe)
+            .args(env::args_os().skip(1))
+            .exec();
         eprintln!("[McpHub][UPDATE] restart failed: {}", error);
         std::process::exit(1);
     }
@@ -701,7 +764,8 @@ impl PrivateDir {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or_default();
-        let path = env::temp_dir().join(format!("mcphub-update-{}-{:x}", std::process::id(), nanos));
+        let path =
+            env::temp_dir().join(format!("mcphub-update-{}-{:x}", std::process::id(), nanos));
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
         {
@@ -740,13 +804,24 @@ mod tests {
 
     #[test]
     fn manifeste_signe_accepte() {
-        let manifest = verify_manifest(FIXTURE.as_bytes(), FIXTURE_SIG, FIXTURE_KEY.trim()).unwrap();
+        let manifest =
+            verify_manifest(FIXTURE.as_bytes(), FIXTURE_SIG, FIXTURE_KEY.trim()).unwrap();
         assert_eq!(manifest.version, "9.0.0");
         assert_eq!(manifest.rollout.percent, 10);
-        assert!(manifest.assets.contains_key("McpHub-macos-universal.tar.gz"));
+        assert!(manifest
+            .assets
+            .contains_key("McpHub-macos-universal.tar.gz"));
         assert!(manifest.assets.contains_key(CLIENT_ASSET));
-        check_sha256(b"universal", &manifest.assets["McpHub-macos-universal.tar.gz"]).unwrap();
-        assert!(check_sha256(b"tampered", &manifest.assets["McpHub-macos-universal.tar.gz"]).is_err());
+        check_sha256(
+            b"universal",
+            &manifest.assets["McpHub-macos-universal.tar.gz"],
+        )
+        .unwrap();
+        assert!(check_sha256(
+            b"tampered",
+            &manifest.assets["McpHub-macos-universal.tar.gz"]
+        )
+        .is_err());
     }
 
     #[test]
@@ -755,12 +830,15 @@ mod tests {
         assert!(verify_manifest(tampered.as_bytes(), FIXTURE_SIG, FIXTURE_KEY.trim()).is_err());
         // La vraie clé de release ne valide pas une signature de test.
         assert!(verify_manifest(FIXTURE.as_bytes(), FIXTURE_SIG, UPDATE_PUBLIC_KEY).is_err());
-        assert!(verify_manifest(FIXTURE.as_bytes(), "not a signature", FIXTURE_KEY.trim()).is_err());
+        assert!(
+            verify_manifest(FIXTURE.as_bytes(), "not a signature", FIXTURE_KEY.trim()).is_err()
+        );
     }
 
     #[test]
     fn deploiement_progressif() {
-        let manifest = verify_manifest(FIXTURE.as_bytes(), FIXTURE_SIG, FIXTURE_KEY.trim()).unwrap();
+        let manifest =
+            verify_manifest(FIXTURE.as_bytes(), FIXTURE_SIG, FIXTURE_KEY.trim()).unwrap();
         let before = manifest.rollout.full_at - 1;
         assert!(rollout_allows(&manifest, 0, before));
         assert!(rollout_allows(&manifest, 9, before));
@@ -777,7 +855,11 @@ mod tests {
     #[test]
     fn version_qui_plante_au_demarrage_retiree() {
         let mut state = UpdateState {
-            pending: Some(Pending { from: "5.9.1".into(), to: "5.10.0".into(), boots: 0 }),
+            pending: Some(Pending {
+                from: "5.9.1".into(),
+                to: "5.10.0".into(),
+                boots: 0,
+            }),
             rejected: vec![],
         };
         for _ in 0..MAX_PROBATION_BOOTS {
@@ -788,7 +870,11 @@ mod tests {
         assert_eq!(state.rejected, vec!["5.10.0".to_string()]);
 
         let mut other = UpdateState {
-            pending: Some(Pending { from: "5.9.1".into(), to: "5.10.0".into(), boots: 2 }),
+            pending: Some(Pending {
+                from: "5.9.1".into(),
+                to: "5.10.0".into(),
+                boots: 2,
+            }),
             rejected: vec![],
         };
         // Un processus plus ancien n'efface pas la période d'essai de la nouvelle version.
@@ -811,12 +897,21 @@ mod tests {
         assert_eq!(fs::read(old_binary(&exe)).unwrap(), b"old");
         let state = read_state(&exe);
         assert_eq!(state.pending.as_ref().map(|p| p.to.as_str()), Some("9.0.0"));
-        assert_eq!(state.pending.as_ref().map(|p| p.from.as_str()), Some(VERSION));
+        assert_eq!(
+            state.pending.as_ref().map(|p| p.from.as_str()),
+            Some(VERSION)
+        );
     }
 
     #[test]
     fn macos_toujours_universel() {
-        assert_eq!(asset_for("macos", "aarch64"), Some("McpHub-macos-universal.tar.gz"));
-        assert_eq!(asset_for("macos", "x86_64"), Some("McpHub-macos-universal.tar.gz"));
+        assert_eq!(
+            asset_for("macos", "aarch64"),
+            Some("McpHub-macos-universal.tar.gz")
+        );
+        assert_eq!(
+            asset_for("macos", "x86_64"),
+            Some("McpHub-macos-universal.tar.gz")
+        );
     }
 }

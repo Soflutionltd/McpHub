@@ -6,7 +6,11 @@ use std::path::PathBuf;
 
 #[cfg(target_os = "macos")]
 fn xml_escape(value: &str) -> String {
-    value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 pub fn install() {
@@ -26,7 +30,13 @@ pub fn install() {
         let env_entries: String = instance
             .service_env()
             .iter()
-            .map(|(key, value)| format!("\n        <key>{}</key>\n        <string>{}</string>", key, xml_escape(value)))
+            .map(|(key, value)| {
+                format!(
+                    "\n        <key>{}</key>\n        <string>{}</string>",
+                    key,
+                    xml_escape(value)
+                )
+            })
             .collect();
 
         let plist = format!(
@@ -225,7 +235,10 @@ pub fn is_installed() -> bool {
         dirs::home_dir()
             .map(|home| {
                 home.join("Library/LaunchAgents")
-                    .join(format!("{}.plist", crate::instance::current().launchd_label()))
+                    .join(format!(
+                        "{}.plist",
+                        crate::instance::current().launchd_label()
+                    ))
                     .exists()
             })
             .unwrap_or(false)
@@ -243,7 +256,12 @@ pub fn is_installed() -> bool {
     #[cfg(target_os = "windows")]
     {
         std::process::Command::new("reg")
-            .args(["query", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run", "/v", "McpHub"])
+            .args([
+                "query",
+                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                "/v",
+                "McpHub",
+            ])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
@@ -258,9 +276,10 @@ pub fn uninstall() {
     #[cfg(target_os = "macos")]
     {
         let home = dirs::home_dir().expect("Cannot find home directory");
-        let plist_path = home
-            .join("Library/LaunchAgents")
-            .join(format!("{}.plist", crate::instance::current().launchd_label()));
+        let plist_path = home.join("Library/LaunchAgents").join(format!(
+            "{}.plist",
+            crate::instance::current().launchd_label()
+        ));
 
         if plist_path.exists() {
             let _ = std::process::Command::new("launchctl")

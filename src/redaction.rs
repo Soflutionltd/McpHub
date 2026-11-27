@@ -150,10 +150,14 @@ fn redact_json_value_with_parent(parent_key: Option<&str>, value: &Value) -> Val
                                 }
                                 if let Some((key, value)) = argument.split_once('=') {
                                     if key.starts_with('-') && is_sensitive_flag(key) {
-                                        return Value::String(format!("{key}={}", redact_value(value)));
+                                        return Value::String(format!(
+                                            "{key}={}",
+                                            redact_value(value)
+                                        ));
                                     }
                                 }
-                                after_sensitive_flag = argument.starts_with('-') && is_sensitive_flag(argument);
+                                after_sensitive_flag =
+                                    argument.starts_with('-') && is_sensitive_flag(argument);
                                 Value::String(redact_text(argument))
                             }
                             other => {
@@ -290,8 +294,24 @@ mod tests {
         let redacted = redact_json_value(&json!({
             "args": ["-y", "pkg", "--token", "abc", "--password=hunter2", "--verbose", "keep"]
         }));
-        let args: Vec<&str> = redacted["args"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
-        assert_eq!(args, vec!["-y", "pkg", "--token", "[REDACTED:3]", "--password=[REDACTED:7]", "--verbose", "keep"]);
+        let args: Vec<&str> = redacted["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "-y",
+                "pkg",
+                "--token",
+                "[REDACTED:3]",
+                "--password=[REDACTED:7]",
+                "--verbose",
+                "keep"
+            ]
+        );
     }
 
     #[test]

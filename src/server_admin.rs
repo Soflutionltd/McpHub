@@ -6,7 +6,13 @@
 use serde_json::{json, Map, Value};
 use std::path::Path;
 
-pub const ADMIN_TOOLS: &[&str] = &["servers_list", "server_add", "server_remove", "server_enable", "server_disable"];
+pub const ADMIN_TOOLS: &[&str] = &[
+    "servers_list",
+    "server_add",
+    "server_remove",
+    "server_enable",
+    "server_disable",
+];
 
 pub fn is_admin_tool(tool: &str) -> bool {
     ADMIN_TOOLS.contains(&tool)
@@ -21,7 +27,9 @@ pub fn is_write_tool(tool: &str) -> bool {
 /// autorisé, sinon la raison affichée dans la confirmation.
 pub fn default_confirmation(tool: &str) -> Option<&'static str> {
     match tool {
-        "server_add" => Some("ajoute un serveur MCP : la commande ou l'adresse sera lancee sur cette machine"),
+        "server_add" => {
+            Some("ajoute un serveur MCP : la commande ou l'adresse sera lancee sur cette machine")
+        }
         "server_remove" => Some("retire un serveur MCP de la config McpHub (sauvegarde gardee)"),
         "server_enable" => Some("reactive un serveur MCP : sa commande sera relancee"),
         _ => None,
@@ -44,12 +52,18 @@ pub fn call(tool: &str, args: &Value, env: &Env) -> Result<Value, String> {
         "server_remove" => remove(name_arg(args)?, revision, env),
         "server_enable" => set_disabled(name_arg(args)?, false, revision, env),
         "server_disable" => set_disabled(name_arg(args)?, true, revision, env),
-        other => Err(format!("unknown McpHub tool {}: {}", other, ADMIN_TOOLS.join(", "))),
+        other => Err(format!(
+            "unknown McpHub tool {}: {}",
+            other,
+            ADMIN_TOOLS.join(", ")
+        )),
     }
 }
 
 fn name_arg(args: &Value) -> Result<&str, String> {
-    args.get("name").and_then(|v| v.as_str()).ok_or_else(|| "name required".to_string())
+    args.get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "name required".to_string())
 }
 
 fn servers_key(config: &Value) -> &'static str {
@@ -65,7 +79,9 @@ fn servers_mut(config: &mut Value) -> &mut Map<String, Value> {
     if !config.get(key).is_some_and(|v| v.is_object()) {
         config[key] = json!({});
     }
-    config[key].as_object_mut().expect("objet cree juste au-dessus")
+    config[key]
+        .as_object_mut()
+        .expect("objet cree juste au-dessus")
 }
 
 /// Tenants qui dépendent d'un serveur (identifiants propres ou serveur partagé).
@@ -93,7 +109,10 @@ fn list(env: &Env) -> Result<Value, String> {
     let config = config.unwrap_or_else(|| json!({}));
     let cache = crate::cache::load_cache();
     let empty = Map::new();
-    let servers = config.get(servers_key(&config)).and_then(|v| v.as_object()).unwrap_or(&empty);
+    let servers = config
+        .get(servers_key(&config))
+        .and_then(|v| v.as_object())
+        .unwrap_or(&empty);
     let mut rows = Vec::new();
     for (name, entry) in servers {
         let mut row = json!({
@@ -109,7 +128,11 @@ fn list(env: &Env) -> Result<Value, String> {
             let args: Vec<String> = entry
                 .get("args")
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             row["kind"] = json!("command");
             row["command"] = json!(crate::redaction::redact_command_preview(
@@ -141,10 +164,17 @@ fn list(env: &Env) -> Result<Value, String> {
 // ─── Validation d'un ajout ───────────────────────────────────
 
 fn valid_name(name: &str) -> Result<(), String> {
-    let ok_chars = name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-    let starts_ok = name.chars().next().is_some_and(|c| c.is_ascii_alphanumeric());
+    let ok_chars = name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    let starts_ok = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric());
     if name.is_empty() || name.len() > 64 || !ok_chars || !starts_ok {
-        return Err("name: 1 to 64 letters, digits, - or _, starting with a letter or digit".into());
+        return Err(
+            "name: 1 to 64 letters, digits, - or _, starting with a letter or digit".into(),
+        );
     }
     if name.eq_ignore_ascii_case("mcphub") {
         return Err("name \"mcphub\" is reserved".into());
@@ -181,21 +211,35 @@ const SCHEME_WORDS: &[&str] = &["bearer", "basic", "token"];
 
 /// Une valeur saisie par l'agent : jamais de secret en clair. Pour une clé sensible, seule une
 /// référence `${VAR}` (éventuellement précédée de Bearer / Basic / Token) est acceptée.
-fn check_value(label: &str, key: Option<&str>, value: &str, vars: &mut Vec<String>) -> Result<(), String> {
+fn check_value(
+    label: &str,
+    key: Option<&str>,
+    value: &str,
+    vars: &mut Vec<String>,
+) -> Result<(), String> {
     let (found, rest) = split_vars(value);
     let sensitive = key.is_some_and(crate::redaction::is_sensitive_key);
     let hint = "store the value with `McpHub vault set NAME` (the user types it) and reference it as ${NAME}";
     for token in rest.split_whitespace() {
         let lone = token.trim_matches(|c: char| !c.is_ascii_alphanumeric());
-        if sensitive && !lone.is_empty() && !SCHEME_WORDS.contains(&lone.to_ascii_lowercase().as_str()) {
-            return Err(format!("{}: a secret field accepts only ${{VAR}} references; {}", label, hint));
+        if sensitive
+            && !lone.is_empty()
+            && !SCHEME_WORDS.contains(&lone.to_ascii_lowercase().as_str())
+        {
+            return Err(format!(
+                "{}: a secret field accepts only ${{VAR}} references; {}",
+                label, hint
+            ));
         }
         if crate::redaction::looks_like_secret_value(token) {
             return Err(format!("{}: looks like a secret value; {}", label, hint));
         }
     }
     if sensitive && found.is_empty() && !rest.trim().is_empty() {
-        return Err(format!("{}: a secret field accepts only ${{VAR}} references; {}", label, hint));
+        return Err(format!(
+            "{}: a secret field accepts only ${{VAR}} references; {}",
+            label, hint
+        ));
     }
     for v in found {
         if v.is_empty() || !v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
@@ -206,14 +250,26 @@ fn check_value(label: &str, key: Option<&str>, value: &str, vars: &mut Vec<Strin
     Ok(())
 }
 
-fn string_map(field: &str, value: Option<&Value>, vars: &mut Vec<String>) -> Result<Option<Map<String, Value>>, String> {
+fn string_map(
+    field: &str,
+    value: Option<&Value>,
+    vars: &mut Vec<String>,
+) -> Result<Option<Map<String, Value>>, String> {
     let Some(value) = value else { return Ok(None) };
-    let obj = value.as_object().ok_or_else(|| format!("{} must be an object of strings", field))?;
+    let obj = value
+        .as_object()
+        .ok_or_else(|| format!("{} must be an object of strings", field))?;
     for (k, v) in obj {
-        let s = v.as_str().ok_or_else(|| format!("{}.{} must be a string", field, k))?;
+        let s = v
+            .as_str()
+            .ok_or_else(|| format!("{}.{} must be a string", field, k))?;
         check_value(&format!("{}.{}", field, k), Some(k), s, vars)?;
     }
-    Ok(if obj.is_empty() { None } else { Some(obj.clone()) })
+    Ok(if obj.is_empty() {
+        None
+    } else {
+        Some(obj.clone())
+    })
 }
 
 fn check_args(args: &[String], vars: &mut Vec<String>) -> Result<(), String> {
@@ -228,7 +284,8 @@ fn check_args(args: &[String], vars: &mut Vec<String>) -> Result<(), String> {
             .filter(|p| p.starts_with('-') && !p.contains('='));
         if let Some((flag, value)) = arg.split_once('=').filter(|(f, _)| f.starts_with('-')) {
             check_value(&label, Some(flag.trim_start_matches('-')), value, vars)?;
-        } else if let Some(flag) = previous_flag.filter(|f| crate::redaction::is_sensitive_flag(f)) {
+        } else if let Some(flag) = previous_flag.filter(|f| crate::redaction::is_sensitive_flag(f))
+        {
             check_value(&label, Some(flag.trim_start_matches('-')), arg, vars)?;
         } else {
             check_value(&label, None, arg, vars)?;
@@ -244,7 +301,10 @@ fn check_url(raw: &str, vars: &mut Vec<String>) -> Result<(), String> {
         return Err("url: ${VAR} is not allowed in the address; put secrets in headers".into());
     }
     let url = reqwest::Url::parse(raw).map_err(|e| format!("url: {}", e))?;
-    let local = matches!(url.host_str(), Some("localhost") | Some("127.0.0.1") | Some("[::1]"));
+    let local = matches!(
+        url.host_str(),
+        Some("localhost") | Some("127.0.0.1") | Some("[::1]")
+    );
     match url.scheme() {
         "https" => {}
         "http" if local => {}
@@ -266,7 +326,9 @@ fn build_entry(args: &Value, settings: Option<&Value>) -> Result<(Value, Vec<Str
     let mut vars = Vec::new();
     let mut entry = Map::new();
     match (command, url) {
-        (Some(_), Some(_)) | (None, None) => return Err("give either command (local server) or url (remote server)".into()),
+        (Some(_), Some(_)) | (None, None) => {
+            return Err("give either command (local server) or url (remote server)".into())
+        }
         (Some(cmd), None) => {
             if cmd.trim().is_empty() || cmd.contains('\n') || cmd.contains('\0') {
                 return Err("command must be a non-empty single line".into());
@@ -276,7 +338,11 @@ fn build_entry(args: &Value, settings: Option<&Value>) -> Result<(Value, Vec<Str
                 None => Vec::new(),
                 Some(Value::Array(a)) => a
                     .iter()
-                    .map(|x| x.as_str().map(String::from).ok_or_else(|| "args must be an array of strings".to_string()))
+                    .map(|x| {
+                        x.as_str()
+                            .map(String::from)
+                            .ok_or_else(|| "args must be an array of strings".to_string())
+                    })
                     .collect::<Result<_, _>>()?,
                 Some(_) => return Err("args must be an array of strings".into()),
             };
@@ -287,19 +353,32 @@ fn build_entry(args: &Value, settings: Option<&Value>) -> Result<(Value, Vec<Str
                 entry.insert("env".into(), Value::Object(env));
             }
             // Bac à sable bouclier par défaut, comme une installation depuis le registre (sauf
-            // réglage global, qui s'applique alors). L'agent ne peut pas le retirer.
-            match args.get("sandbox") {
-                Some(Value::Bool(false)) => return Err("sandbox: an agent cannot turn the sandbox off (the user can, in the dashboard)".into()),
-                Some(Value::String(s)) if s.eq_ignore_ascii_case("off") => {
+            // réglage global, qui s'applique alors). L'agent ne peut pas le retirer : le réglage
+            // est jugé une fois interprété, quelle que soit sa forme (false, "none",
+            // {"mode": "off"}...), et un serveur exempté par défaut reçoit un bouclier explicite.
+            if let Some(v) = args.get("sandbox") {
+                entry.insert("sandbox".into(), v.clone());
+            }
+            let global = settings.and_then(|s| s.get("sandbox"));
+            let label = args
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("server");
+            let effective = |entry: &Map<String, Value>| {
+                crate::sandbox::resolve(label, &Value::Object(entry.clone()), global, cmd, &list)
+            };
+            match effective(&entry)? {
+                Some(spec) if spec.run_if_unavailable && args.get("sandbox").is_some() => {
+                    return Err("sandbox: an agent cannot allow running without isolation (ifUnavailable: run is for the user)".into())
+                }
+                Some(_) => {}
+                None if args.get("sandbox").is_some() => {
                     return Err("sandbox: an agent cannot turn the sandbox off (the user can, in the dashboard)".into())
                 }
-                Some(v) => {
-                    entry.insert("sandbox".into(), v.clone());
-                }
                 None => {
-                    let global = settings.and_then(|s| s.get("sandbox")).filter(|v| !matches!(v, Value::Bool(false)));
-                    if global.is_none() {
-                        entry.insert("sandbox".into(), json!("shield"));
+                    entry.insert("sandbox".into(), json!("shield"));
+                    if effective(&entry)?.is_none() {
+                        return Err("sandbox: isolation could not be applied to this server".into());
                     }
                 }
             }
@@ -324,7 +403,12 @@ fn build_entry(args: &Value, settings: Option<&Value>) -> Result<(Value, Vec<Str
     }
     let entry = Value::Object(entry);
     // Même analyse que le démon au chargement (bac à sable compris), variables laissées telles quelles.
-    crate::config::parse_server_entry("server_add", &entry, settings, &|s: &str| Ok(s.to_string()))?;
+    crate::config::parse_server_entry(
+        "server_add",
+        &entry,
+        settings,
+        &|s: &str| Ok(s.to_string()),
+    )?;
     vars.sort();
     vars.dedup();
     Ok((entry, vars))
@@ -338,14 +422,20 @@ fn add(args: &Value, revision: Option<&str>, env: &Env) -> Result<Value, String>
         let (mut entry, vars) = build_entry(args, settings.as_ref())?;
         let servers = servers_mut(config);
         if let Some(existing) = servers.keys().find(|k| k.eq_ignore_ascii_case(&name)) {
-            return Err(format!("a server named {} already exists (server_remove it first, or pick another name)", existing));
+            return Err(format!(
+                "a server named {} already exists (server_remove it first, or pick another name)",
+                existing
+            ));
         }
         entry["addedBy"] = json!({ "by": "agent", "at": crate::audit::iso_utc_now() });
         servers.insert(name.clone(), entry.clone());
         Ok(((entry, vars), true))
     })?;
     let (entry, vars) = done.value;
-    let missing: Vec<&String> = vars.iter().filter(|v| std::env::var(v.as_str()).is_err()).collect();
+    let missing: Vec<&String> = vars
+        .iter()
+        .filter(|v| std::env::var(v.as_str()).is_err())
+        .collect();
     let remote = entry.get("url").is_some();
     let oauth = remote
         && match entry.get("auth").and_then(|v| v.as_str()) {
@@ -422,12 +512,23 @@ fn remove(name: &str, revision: Option<&str>, env: &Env) -> Result<Value, String
     }))
 }
 
-fn set_disabled(name: &str, disabled: bool, revision: Option<&str>, env: &Env) -> Result<Value, String> {
+fn set_disabled(
+    name: &str,
+    disabled: bool,
+    revision: Option<&str>,
+    env: &Env,
+) -> Result<Value, String> {
     let done = crate::config::update_raw_guarded(env.config_path, revision, |config| {
         let servers = servers_mut(config);
         let key = find_name(servers, name)?;
-        let entry = servers.get_mut(&key).and_then(|v| v.as_object_mut()).ok_or_else(|| format!("{}: invalid entry", key))?;
-        let current = entry.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false);
+        let entry = servers
+            .get_mut(&key)
+            .and_then(|v| v.as_object_mut())
+            .ok_or_else(|| format!("{}: invalid entry", key))?;
+        let current = entry
+            .get("disabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         if current == disabled {
             return Ok(((key, false), false));
         }
@@ -463,10 +564,15 @@ mod tests {
 
     impl Fixture {
         fn new(tag: &str, config: Value) -> Self {
-            let dir = std::env::temp_dir().join(format!("mcphub-admin-{}-{}", tag, std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("mcphub-admin-{}-{}", tag, std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(dir.join("servers")).unwrap();
-            std::fs::write(dir.join("config.json"), serde_json::to_string(&config).unwrap()).unwrap();
+            std::fs::write(
+                dir.join("config.json"),
+                serde_json::to_string(&config).unwrap(),
+            )
+            .unwrap();
             let tenant = TenantDef {
                 id: "acme".into(),
                 project: "acme".into(),
@@ -475,17 +581,31 @@ mod tests {
                 keep_env: BTreeMap::new(),
                 shared_servers: BTreeSet::from(["context7".to_string()]),
             };
-            Fixture { dir, tenants: Tenants { tenants: vec![tenant] } }
+            Fixture {
+                dir,
+                tenants: Tenants {
+                    tenants: vec![tenant],
+                },
+            }
         }
 
         fn call(&self, tool: &str, args: Value) -> Result<Value, String> {
             let config_path = self.dir.join("config.json");
             let servers_dir = self.dir.join("servers");
-            call(tool, &args, &Env { config_path: &config_path, servers_dir: &servers_dir, tenants: &self.tenants })
+            call(
+                tool,
+                &args,
+                &Env {
+                    config_path: &config_path,
+                    servers_dir: &servers_dir,
+                    tenants: &self.tenants,
+                },
+            )
         }
 
         fn config(&self) -> Value {
-            serde_json::from_str(&std::fs::read_to_string(self.dir.join("config.json")).unwrap()).unwrap()
+            serde_json::from_str(&std::fs::read_to_string(self.dir.join("config.json")).unwrap())
+                .unwrap()
         }
     }
 
@@ -510,18 +630,34 @@ mod tests {
         let rev = listed["revision"].as_str().unwrap().to_string();
         assert_eq!(listed["servers"].as_array().unwrap().len(), 3);
 
-        let off = f.call("server_disable", json!({"name": "cloudflare", "revision": rev})).unwrap();
+        let off = f
+            .call(
+                "server_disable",
+                json!({"name": "cloudflare", "revision": rev}),
+            )
+            .unwrap();
         assert_eq!(off["unchanged"], false);
         assert_eq!(f.config()["mcpServers"]["cloudflare"]["disabled"], true);
 
-        let again = f.call("server_disable", json!({"name": "cloudflare"})).unwrap();
+        let again = f
+            .call("server_disable", json!({"name": "cloudflare"}))
+            .unwrap();
         assert_eq!(again["unchanged"], true);
 
-        let stale = f.call("server_enable", json!({"name": "cloudflare", "revision": rev}));
+        let stale = f.call(
+            "server_enable",
+            json!({"name": "cloudflare", "revision": rev}),
+        );
         assert!(stale.unwrap_err().contains("a change"));
 
-        f.call("server_enable", json!({"name": "Cloudflare", "revision": off["revision"]})).unwrap();
-        assert!(f.config()["mcpServers"]["cloudflare"].get("disabled").is_none());
+        f.call(
+            "server_enable",
+            json!({"name": "Cloudflare", "revision": off["revision"]}),
+        )
+        .unwrap();
+        assert!(f.config()["mcpServers"]["cloudflare"]
+            .get("disabled")
+            .is_none());
     }
 
     #[test]
@@ -555,15 +691,41 @@ mod tests {
         assert_eq!(entry["addedBy"]["by"], "agent");
         assert_eq!(entry["env"]["WEATHER_TOKEN"], "${MCPHUB_TEST_ABSENT_VAR}");
 
-        let dup = f.call("server_add", json!({"name": "WEATHER", "command": "x"})).unwrap_err();
+        let dup = f
+            .call("server_add", json!({"name": "WEATHER", "command": "x"}))
+            .unwrap_err();
         assert!(dup.contains("already exists"));
+
+        // Un nom exempté d'isolation par défaut reçoit quand même un bouclier explicite.
+        f.call(
+            "server_add",
+            json!({"name": "kilnshell-copy", "command": "npx", "args": ["kilnshell"]}),
+        )
+        .unwrap();
+        assert_eq!(
+            f.config()["mcpServers"]["kilnshell-copy"]["sandbox"],
+            "shield"
+        );
+        // Un mode strict demandé par l'agent est gardé.
+        f.call(
+            "server_add",
+            json!({"name": "tight", "command": "npx", "sandbox": {"mode": "strict"}}),
+        )
+        .unwrap();
+        assert_eq!(
+            f.config()["mcpServers"]["tight"]["sandbox"]["mode"],
+            "strict"
+        );
     }
 
     #[test]
     fn ajout_distant_oauth() {
         let f = Fixture::new("remote", base());
         let out = f
-            .call("server_add", json!({"name": "linear", "url": "https://mcp.linear.app/mcp", "auth": "oauth"}))
+            .call(
+                "server_add",
+                json!({"name": "linear", "url": "https://mcp.linear.app/mcp", "auth": "oauth"}),
+            )
             .unwrap();
         assert_eq!(out["oauth"], true);
         let bearer = f
@@ -590,7 +752,12 @@ mod tests {
         ];
         for case in cases {
             let err = f.call("server_add", case.clone()).unwrap_err();
-            assert!(err.contains("secret") || err.contains("credentials") || err.contains("VAR"), "{} -> {}", case, err);
+            assert!(
+                err.contains("secret") || err.contains("credentials") || err.contains("VAR"),
+                "{} -> {}",
+                case,
+                err
+            );
         }
         assert_eq!(f.config(), base(), "rien n'est ecrit");
     }
@@ -607,6 +774,12 @@ mod tests {
             json!({"name": "x", "url": "https://${HOST}/mcp"}),
             json!({"name": "x", "command": "npx", "sandbox": false}),
             json!({"name": "x", "command": "npx", "sandbox": "off"}),
+            json!({"name": "x", "command": "npx", "sandbox": "OFF"}),
+            json!({"name": "x", "command": "npx", "sandbox": "none"}),
+            json!({"name": "x", "command": "npx", "sandbox": "false"}),
+            json!({"name": "x", "command": "npx", "sandbox": {"mode": "off"}}),
+            json!({"name": "x", "command": "npx", "sandbox": {"mode": "none", "network": false}}),
+            json!({"name": "x", "command": "npx", "sandbox": {"mode": "shield", "ifUnavailable": "run"}}),
             json!({"name": "x", "command": "npx", "args": "-y pkg"}),
             json!({"name": "x", "url": "https://a.example.com", "auth": "basic"}),
         ];

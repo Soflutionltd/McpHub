@@ -2,8 +2,8 @@ mod add;
 mod audit;
 mod benchmark;
 mod cache;
-mod codemode;
 pub mod child;
+mod codemode;
 mod config;
 mod confirm_dialog;
 mod connectors;
@@ -18,8 +18,8 @@ mod install;
 mod instance;
 mod logs;
 mod metrics;
-mod permissions;
 mod oauth;
+mod permissions;
 mod protocol;
 mod proxy;
 mod redaction;
@@ -27,12 +27,12 @@ mod registry;
 mod remote;
 mod response_cache;
 mod sandbox;
-mod server_admin;
 mod search;
+mod server_admin;
 mod sse;
 mod sync;
-mod token_watch;
 mod tenant;
+mod token_watch;
 mod toolguard;
 mod untrusted;
 mod update;
@@ -400,7 +400,13 @@ async fn main() {
                         let label = sc
                             .sandbox
                             .as_ref()
-                            .map(|s| format!("{:?}{}", s.mode, if s.network { "" } else { ", sans reseau" }))
+                            .map(|s| {
+                                format!(
+                                    "{:?}{}",
+                                    s.mode,
+                                    if s.network { "" } else { ", sans reseau" }
+                                )
+                            })
                             .unwrap_or_else(|| "sans isolation".into());
                         println!("{:28} {}", n, label);
                     }
@@ -410,7 +416,9 @@ async fn main() {
         Some("pins") => std::process::exit(toolguard::cmd_pins(&args[2..])),
         Some("oauth") => std::process::exit(oauth::run_cli(&args[2..]).await),
         Some("sync") => std::process::exit(sync::run_cli(&args[2..])),
-        Some("registry") | Some("library") => std::process::exit(registry::run_cli(&args[2..]).await),
+        Some("registry") | Some("library") => {
+            std::process::exit(registry::run_cli(&args[2..]).await)
+        }
         _ => {
             // Default: stdio proxy + HTTP server with SSE
             eprintln!("McpHub v{} — starting...", VERSION);

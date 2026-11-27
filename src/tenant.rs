@@ -40,7 +40,9 @@ pub fn is_valid_id(id: &str) -> bool {
     (1..=32).contains(&id.len())
         && !id.starts_with('-')
         && !id.ends_with('-')
-        && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 pub fn is_instance_name(name: &str) -> bool {
@@ -158,7 +160,10 @@ fn dir_key(path: &Path) -> PathBuf {
         if let Ok(real) = std::fs::canonicalize(&existing) {
             break rest.iter().rev().fold(real, |acc, c| acc.join(c));
         }
-        match (existing.file_name().map(|f| f.to_os_string()), existing.parent()) {
+        match (
+            existing.file_name().map(|f| f.to_os_string()),
+            existing.parent(),
+        ) {
             (Some(name), Some(parent)) => {
                 rest.push(name);
                 existing = parent.to_path_buf();
@@ -174,7 +179,12 @@ fn dir_key(path: &Path) -> PathBuf {
 }
 
 /// Nom de secret d'une référence `vault:<tenant>/<NOM>` : le tenant doit être le sien.
-fn parse_vault_ref(tenant: &str, server: &str, var: &str, reference: &str) -> Result<String, String> {
+fn parse_vault_ref(
+    tenant: &str,
+    server: &str,
+    var: &str,
+    reference: &str,
+) -> Result<String, String> {
     let rest = reference.strip_prefix(VAULT_REF_PREFIX).ok_or_else(|| {
         format!(
             "tenant {} : {}.{} doit valoir \"vault:{}/NOM\" (jamais une valeur en clair)",
@@ -182,7 +192,10 @@ fn parse_vault_ref(tenant: &str, server: &str, var: &str, reference: &str) -> Re
         )
     })?;
     let (owner, name) = rest.split_once('/').ok_or_else(|| {
-        format!("tenant {} : {}.{} : reference \"{}\" sans /NOM", tenant, server, var, reference)
+        format!(
+            "tenant {} : {}.{} : reference \"{}\" sans /NOM",
+            tenant, server, var, reference
+        )
     })?;
     if owner != tenant {
         return Err(format!(
@@ -191,7 +204,10 @@ fn parse_vault_ref(tenant: &str, server: &str, var: &str, reference: &str) -> Re
         ));
     }
     if !crate::vault::is_valid_name(name) {
-        return Err(format!("tenant {} : nom de secret invalide \"{}\"", tenant, name));
+        return Err(format!(
+            "tenant {} : nom de secret invalide \"{}\"",
+            tenant, name
+        ));
     }
     Ok(name.to_string())
 }
@@ -201,7 +217,11 @@ fn string_list(value: Option<&Value>, what: &str) -> Result<Vec<String>, String>
         None => Ok(Vec::new()),
         Some(Value::Array(items)) => items
             .iter()
-            .map(|v| v.as_str().map(String::from).ok_or_else(|| format!("{} : liste de textes attendue", what)))
+            .map(|v| {
+                v.as_str()
+                    .map(String::from)
+                    .ok_or_else(|| format!("{} : liste de textes attendue", what))
+            })
             .collect(),
         Some(_) => Err(format!("{} : liste de textes attendue", what)),
     }
@@ -213,7 +233,9 @@ pub fn parse_projects(json: &Value) -> Result<Tenants, String> {
     let Some(projects) = json.get("projects") else {
         return Ok(Tenants::default());
     };
-    let projects = projects.as_object().ok_or("\"projects\" doit etre un objet")?;
+    let projects = projects
+        .as_object()
+        .ok_or("\"projects\" doit etre un objet")?;
     let mut tenants: Vec<TenantDef> = Vec::new();
     for (project, cfg) in projects {
         let Some(tenant) = cfg.get("tenant") else {
@@ -227,21 +249,33 @@ pub fn parse_projects(json: &Value) -> Result<Tenants, String> {
         let id = tenant
             .as_str()
             .filter(|id| is_valid_id(id))
-            .ok_or_else(|| format!("projet {} : \"tenant\" doit etre un id (1 a 32 minuscules, chiffres, tirets)", project))?
+            .ok_or_else(|| {
+                format!(
+                    "projet {} : \"tenant\" doit etre un id (1 a 32 minuscules, chiffres, tirets)",
+                    project
+                )
+            })?
             .to_string();
         if tenants.iter().any(|t| t.id == id) {
             return Err(format!("tenant {} declare par deux projets", id));
         }
-        let workspaces: Vec<PathBuf> = string_list(cfg.get("workspaces"), &format!("projet {} : workspaces", project))?
-            .into_iter()
-            .map(PathBuf::from)
-            .collect();
+        let workspaces: Vec<PathBuf> = string_list(
+            cfg.get("workspaces"),
+            &format!("projet {} : workspaces", project),
+        )?
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
         if workspaces.is_empty() {
             return Err(format!("tenant {} : aucun dossier (workspaces)", id));
         }
         for w in &workspaces {
             if !w.is_absolute() {
-                return Err(format!("tenant {} : dossier non absolu {}", id, w.display()));
+                return Err(format!(
+                    "tenant {} : dossier non absolu {}",
+                    id,
+                    w.display()
+                ));
             }
         }
         let mut credentials = BTreeMap::new();
@@ -251,19 +285,25 @@ pub fn parse_projects(json: &Value) -> Result<Tenants, String> {
                 .ok_or_else(|| format!("tenant {} : \"credentials\" doit etre un objet", id))?;
             for (server, vars) in creds {
                 if is_instance_name(server) {
-                    return Err(format!("tenant {} : nom de serveur invalide {}", id, server));
+                    return Err(format!(
+                        "tenant {} : nom de serveur invalide {}",
+                        id, server
+                    ));
                 }
-                let vars = vars
-                    .as_object()
-                    .ok_or_else(|| format!("tenant {} : credentials.{} doit etre un objet", id, server))?;
+                let vars = vars.as_object().ok_or_else(|| {
+                    format!("tenant {} : credentials.{} doit etre un objet", id, server)
+                })?;
                 let mut map = BTreeMap::new();
                 for (var, reference) in vars {
                     if !crate::vault::is_valid_name(var) {
-                        return Err(format!("tenant {} : variable invalide {}.{}", id, server, var));
+                        return Err(format!(
+                            "tenant {} : variable invalide {}.{}",
+                            id, server, var
+                        ));
                     }
-                    let reference = reference
-                        .as_str()
-                        .ok_or_else(|| format!("tenant {} : {}.{} doit etre un texte", id, server, var))?;
+                    let reference = reference.as_str().ok_or_else(|| {
+                        format!("tenant {} : {}.{} doit etre un texte", id, server, var)
+                    })?;
                     map.insert(var.clone(), parse_vault_ref(&id, server, var, reference)?);
                 }
                 credentials.insert(server.clone(), map);
@@ -276,15 +316,23 @@ pub fn parse_projects(json: &Value) -> Result<Tenants, String> {
                 .ok_or_else(|| format!("tenant {} : \"keepEnv\" doit etre un objet", id))?;
             for (server, vars) in keep {
                 if !credentials.contains_key(server) {
-                    return Err(format!("tenant {} : keepEnv.{} sans credentials.{}", id, server, server));
+                    return Err(format!(
+                        "tenant {} : keepEnv.{} sans credentials.{}",
+                        id, server, server
+                    ));
                 }
-                keep_env.insert(server.clone(), string_list(Some(vars), &format!("tenant {} : keepEnv.{}", id, server))?);
+                keep_env.insert(
+                    server.clone(),
+                    string_list(Some(vars), &format!("tenant {} : keepEnv.{}", id, server))?,
+                );
             }
         }
-        let shared_servers: BTreeSet<String> =
-            string_list(cfg.get("sharedServers"), &format!("tenant {} : sharedServers", id))?
-                .into_iter()
-                .collect();
+        let shared_servers: BTreeSet<String> = string_list(
+            cfg.get("sharedServers"),
+            &format!("tenant {} : sharedServers", id),
+        )?
+        .into_iter()
+        .collect();
         if let Some(both) = shared_servers.iter().find(|s| credentials.contains_key(*s)) {
             return Err(format!(
                 "tenant {} : {} est a la fois dans credentials et sharedServers",
@@ -357,7 +405,10 @@ impl CallOrigin {
                 .map(PathBuf::from)
                 .filter(|p| p.is_absolute())
         };
-        Self { working_dir: dir("working_dir"), cwd: dir("cwd") }
+        Self {
+            working_dir: dir("working_dir"),
+            cwd: dir("cwd"),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -396,7 +447,10 @@ impl Context {
 /// Un client lancé dans le dossier d'un tenant ne peut pas viser un autre dossier.
 pub fn resolve_context(tenants: &Tenants, origin: &CallOrigin) -> Result<Context, String> {
     let from_cwd = origin.cwd.as_deref().and_then(|d| tenants.for_dir(d));
-    let from_wd = origin.working_dir.as_deref().and_then(|d| tenants.for_dir(d));
+    let from_wd = origin
+        .working_dir
+        .as_deref()
+        .and_then(|d| tenants.for_dir(d));
     let chosen = match (&origin.working_dir, from_wd, from_cwd) {
         (Some(_), wd, Some(cwd)) if wd.map(|t| &t.id) != Some(&cwd.id) => {
             return Err(format!(
@@ -419,7 +473,11 @@ pub enum Route {
     /// Serveur McpHub normal.
     Hub(String),
     /// Instance `serveur@tenant`.
-    Tenant { server: String, tenant: String, instance: String },
+    Tenant {
+        server: String,
+        tenant: String,
+        instance: String,
+    },
 }
 
 impl Route {
@@ -444,6 +502,15 @@ pub fn route(ctx: &Context, server: &str) -> Result<Route, String> {
     if is_instance_name(server) {
         return Err(format!(
             "serveur \"{}\" refuse : une instance de tenant ne s'appelle jamais par son nom, elle se deduit du dossier de travail",
+            server
+        ));
+    }
+    // Instance propre à un dossier de projet (`serveur#empreinte`) : choisie par McpHub d'après
+    // le dossier de l'appel, jamais désignée par l'appelant (elle échapperait aux règles du
+    // serveur de base).
+    if crate::child::is_root_instance(server) {
+        return Err(format!(
+            "serveur \"{}\" refuse : l'instance d'un dossier se deduit du dossier de travail, pas de son nom",
             server
         ));
     }
@@ -526,7 +593,8 @@ pub fn derive_config(
         obj.remove("inheritEnv");
         if let Some(env) = obj.get_mut("env").and_then(|e| e.as_object_mut()) {
             env.retain(|k, _| {
-                !secrets.contains_key(k) && (keep.contains(k.as_str()) || ALWAYS_KEPT_ENV.contains(&k.as_str()))
+                !secrets.contains_key(k)
+                    && (keep.contains(k.as_str()) || ALWAYS_KEPT_ENV.contains(&k.as_str()))
             });
         }
     }
@@ -559,11 +627,25 @@ pub fn derive_config(
             config.env.insert(var.clone(), value.clone());
         }
         let home = tenant_home(&tenant.id);
-        config.env.insert("HOME".into(), home.to_string_lossy().into_owned());
-        config.env.insert("XDG_CONFIG_HOME".into(), home.join(".config").to_string_lossy().into_owned());
-        config.env.insert("XDG_DATA_HOME".into(), home.join(".local/share").to_string_lossy().into_owned());
-        config.env.insert("XDG_STATE_HOME".into(), home.join(".local/state").to_string_lossy().into_owned());
-        config.env.insert("XDG_CACHE_HOME".into(), home.join(".cache").to_string_lossy().into_owned());
+        config
+            .env
+            .insert("HOME".into(), home.to_string_lossy().into_owned());
+        config.env.insert(
+            "XDG_CONFIG_HOME".into(),
+            home.join(".config").to_string_lossy().into_owned(),
+        );
+        config.env.insert(
+            "XDG_DATA_HOME".into(),
+            home.join(".local/share").to_string_lossy().into_owned(),
+        );
+        config.env.insert(
+            "XDG_STATE_HOME".into(),
+            home.join(".local/state").to_string_lossy().into_owned(),
+        );
+        config.env.insert(
+            "XDG_CACHE_HOME".into(),
+            home.join(".cache").to_string_lossy().into_owned(),
+        );
         // Le cache npm (paquets publics, aucun jeton) reste partagé : npx garde sa vitesse.
         if let Some(real_home) = dirs::home_dir() {
             config
@@ -579,15 +661,30 @@ pub fn derive_config(
 /// Config brute d'un serveur et réglages globaux, lus dans config.json.
 pub fn raw_server_config(server: &str) -> Result<(Value, Option<Value>), String> {
     let path = crate::config::dedicated_config_path();
-    let json = crate::config::read_raw(&path)?
-        .ok_or_else(|| format!("{} absent : les tenants exigent une config McpHub dediee", path.display()))?;
-    let servers = json.get("mcpServers").or_else(|| json.get("servers")).unwrap_or(&json);
+    let json = crate::config::read_raw(&path)?.ok_or_else(|| {
+        format!(
+            "{} absent : les tenants exigent une config McpHub dediee",
+            path.display()
+        )
+    })?;
+    let servers = json
+        .get("mcpServers")
+        .or_else(|| json.get("servers"))
+        .unwrap_or(&json);
     let raw = servers
         .get(server)
         .cloned()
         .ok_or_else(|| format!("serveur {} absent de {}", server, path.display()))?;
-    if raw.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false) {
-        return Err(format!("serveur {} desactive dans {}", server, path.display()));
+    if raw
+        .get("disabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "serveur {} desactive dans {}",
+            server,
+            path.display()
+        ));
     }
     Ok((raw, json.get("settings").cloned()))
 }
@@ -623,7 +720,11 @@ pub struct Registry {
 
 impl Registry {
     pub fn new(path: PathBuf) -> Self {
-        Self { path, cached: Mutex::new(None), derived_at: Mutex::new(HashMap::new()) }
+        Self {
+            path,
+            cached: Mutex::new(None),
+            derived_at: Mutex::new(HashMap::new()),
+        }
     }
 
     pub fn tenants(&self) -> Arc<Result<Tenants, String>> {
@@ -662,7 +763,9 @@ impl Registry {
             return true;
         }
         let derived = self.derived_at.lock().unwrap_or_else(|e| e.into_inner());
-        derived.get(instance).is_none_or(|at| at.elapsed() >= INSTANCE_CONFIG_TTL)
+        derived
+            .get(instance)
+            .is_none_or(|at| at.elapsed() >= INSTANCE_CONFIG_TTL)
     }
 
     /// Oublie les dérivations du tenant : ses instances relisent coffre et config au prochain appel.
@@ -686,7 +789,8 @@ impl Registry {
 // ---------------------------------------------------------------------------
 
 /// Refus d'écriture : projects.json a changé depuis l'affichage de l'écran.
-pub const STALE_PROJECTS: &str = "projects.json a change depuis l'affichage : recharger l'ecran avant de modifier";
+pub const STALE_PROJECTS: &str =
+    "projects.json a change depuis l'affichage : recharger l'ecran avant de modifier";
 
 /// Écritures du tableau de bord sérialisées : deux requêtes ne lisent pas la même version.
 static EDIT_LOCK: Mutex<()> = Mutex::new(());
@@ -754,7 +858,10 @@ pub fn configured_servers() -> Result<BTreeMap<String, Value>, String> {
     let Some(json) = crate::config::read_raw(&path)? else {
         return Ok(BTreeMap::new());
     };
-    let servers = json.get("mcpServers").or_else(|| json.get("servers")).unwrap_or(&json);
+    let servers = json
+        .get("mcpServers")
+        .or_else(|| json.get("servers"))
+        .unwrap_or(&json);
     let Some(servers) = servers.as_object() else {
         return Err(format!("{} : liste de serveurs illisible", path.display()));
     };
@@ -763,7 +870,10 @@ pub fn configured_servers() -> Result<BTreeMap<String, Value>, String> {
         .filter(|(name, raw)| {
             !is_instance_name(name)
                 && (raw.get("command").is_some() || raw.get("url").is_some())
-                && !raw.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false)
+                && !raw
+                    .get("disabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
         })
         .map(|(name, raw)| (name.clone(), raw.clone()))
         .collect())
@@ -836,10 +946,15 @@ pub fn set_servers(
 ) -> Result<(), String> {
     let mut candidate = json.clone();
     let tenants = parse_projects(&candidate)?;
-    let def = tenants.get(id).ok_or_else(|| format!("tenant {} inconnu", id))?;
+    let def = tenants
+        .get(id)
+        .ok_or_else(|| format!("tenant {} inconnu", id))?;
     for server in servers.keys().chain(shared.iter()) {
         if !known.contains(server) {
-            return Err(format!("serveur {} absent de config.json (ou desactive)", server));
+            return Err(format!(
+                "serveur {} absent de config.json (ou desactive)",
+                server
+            ));
         }
     }
     let mut credentials = serde_json::Map::new();
@@ -858,7 +973,10 @@ pub fn set_servers(
                 .and_then(|m| m.get(var))
                 .cloned()
                 .unwrap_or_else(|| var.clone());
-            map.insert(var.clone(), json!(format!("{}{}/{}", VAULT_REF_PREFIX, id, secret)));
+            map.insert(
+                var.clone(),
+                json!(format!("{}{}/{}", VAULT_REF_PREFIX, id, secret)),
+            );
         }
         credentials.insert(server.clone(), Value::Object(map));
     }
@@ -902,7 +1020,11 @@ pub fn check_server(tenant: &TenantDef, server: &str) -> Result<String, String> 
 /// le retire de projects.json (le projet et ses dossiers restent). Renvoie le compte rendu.
 /// Le coffre est effacé en premier : en cas d'échec, rien d'autre n'est touché.
 /// `expected_version` (tableau de bord) : refus si projects.json a changé depuis l'affichage.
-pub fn purge_tenant(path: &Path, id: &str, expected_version: Option<&str>) -> Result<Vec<String>, String> {
+pub fn purge_tenant(
+    path: &Path,
+    id: &str,
+    expected_version: Option<&str>,
+) -> Result<Vec<String>, String> {
     if !is_valid_id(id) {
         return Err(format!("id invalide : {}", id));
     }
@@ -917,14 +1039,21 @@ pub fn purge_tenant(path: &Path, id: &str, expected_version: Option<&str>) -> Re
             for server in def.credentials.keys() {
                 // Vide aussi le cache des jetons du processus courant (démon).
                 if let Err(e) = crate::oauth::forget(&instance_name(server, id)) {
-                    report.push(format!("Avertissement : jetons OAuth de {} : {}", server, e));
+                    report.push(format!(
+                        "Avertissement : jetons OAuth de {} : {}",
+                        server, e
+                    ));
                 }
             }
         }
     }
     let scope = Scope::Tenant(id.to_string());
-    let erased = crate::vault::purge(&scope).map_err(|e| format!("rien d'autre n'a ete touche : {}", e))?;
-    report.push(format!("Coffre du tenant {} efface ({} elements).", id, erased));
+    let erased =
+        crate::vault::purge(&scope).map_err(|e| format!("rien d'autre n'a ete touche : {}", e))?;
+    report.push(format!(
+        "Coffre du tenant {} efface ({} elements).",
+        id, erased
+    ));
     for dir in [tenant_dir(id), tenant_home(id)] {
         match std::fs::remove_dir_all(&dir) {
             Ok(()) => report.push(format!("Supprime : {}", dir.display())),
@@ -958,8 +1087,8 @@ pub fn cf_orchestrator_projects(path: &Path, tenant: &str) -> Result<Vec<Value>,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(format!("{} illisible : {}", path.display(), e)),
     };
-    let json: Value =
-        serde_json::from_str(&text).map_err(|e| format!("{} : JSON invalide ({})", path.display(), e))?;
+    let json: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("{} : JSON invalide ({})", path.display(), e))?;
     let projects = json
         .get("projects")
         .and_then(|p| p.as_object())
@@ -1059,9 +1188,13 @@ fn write_projects(path: &Path, json: &Value, label: &str) -> Result<Option<PathB
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let file = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+        let file = path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let backup = path.with_file_name(format!("{}.avant-{}-{}", file, label, stamp));
-        std::fs::copy(path, &backup).map_err(|e| format!("sauvegarde {} : {}", backup.display(), e))?;
+        std::fs::copy(path, &backup)
+            .map_err(|e| format!("sauvegarde {} : {}", backup.display(), e))?;
         crate::vault::restrict_permissions(&backup);
         Some(backup)
     } else {
@@ -1081,7 +1214,10 @@ pub fn add_tenant(json: &mut Value, id: &str, dir: &Path, project: &str) -> Resu
 
 fn add_tenant_to(json: &mut Value, id: &str, dir: &Path, project: &str) -> Result<(), String> {
     if !is_valid_id(id) {
-        return Err(format!("id invalide : {} (1 a 32 minuscules, chiffres, tirets)", id));
+        return Err(format!(
+            "id invalide : {} (1 a 32 minuscules, chiffres, tirets)",
+            id
+        ));
     }
     if !dir.is_absolute() {
         return Err(format!("dossier non absolu : {}", dir.display()));
@@ -1090,7 +1226,9 @@ fn add_tenant_to(json: &mut Value, id: &str, dir: &Path, project: &str) -> Resul
     if existing.get(id).is_some() {
         return Err(format!("le tenant {} existe deja", id));
     }
-    let root = json.as_object_mut().ok_or("projects.json : la racine doit etre un objet")?;
+    let root = json
+        .as_object_mut()
+        .ok_or("projects.json : la racine doit etre un objet")?;
     let projects = root
         .entry("projects")
         .or_insert_with(|| json!({}))
@@ -1099,7 +1237,9 @@ fn add_tenant_to(json: &mut Value, id: &str, dir: &Path, project: &str) -> Resul
     let dir_text = dir.to_string_lossy().into_owned();
     match projects.get_mut(project) {
         Some(entry) => {
-            let obj = entry.as_object_mut().ok_or_else(|| format!("projet {} invalide", project))?;
+            let obj = entry
+                .as_object_mut()
+                .ok_or_else(|| format!("projet {} invalide", project))?;
             if obj.contains_key("tenant") {
                 return Err(format!("le projet {} a deja un tenant", project));
             }
@@ -1108,7 +1248,10 @@ fn add_tenant_to(json: &mut Value, id: &str, dir: &Path, project: &str) -> Resul
                 .or_insert_with(|| json!([]))
                 .as_array_mut()
                 .ok_or_else(|| format!("projet {} : workspaces invalide", project))?;
-            if !workspaces.iter().any(|w| w.as_str() == Some(dir_text.as_str())) {
+            if !workspaces
+                .iter()
+                .any(|w| w.as_str() == Some(dir_text.as_str()))
+            {
                 workspaces.push(json!(dir_text));
             }
             obj.insert("tenant".into(), json!(id));
@@ -1134,13 +1277,23 @@ fn add_tenant_to(json: &mut Value, id: &str, dir: &Path, project: &str) -> Resul
 /// Retire le tenant de son projet (le projet et ses dossiers restent).
 pub fn remove_tenant(json: &mut Value, id: &str) -> Result<String, String> {
     let tenants = parse_projects(json)?;
-    let project = tenants.get(id).ok_or_else(|| format!("tenant {} inconnu", id))?.project.clone();
+    let project = tenants
+        .get(id)
+        .ok_or_else(|| format!("tenant {} inconnu", id))?
+        .project
+        .clone();
     let entry = json
         .get_mut("projects")
         .and_then(|p| p.get_mut(&project))
         .and_then(|e| e.as_object_mut())
         .ok_or_else(|| format!("projet {} introuvable", project))?;
-    for key in ["tenant", "credentials", "keepEnv", "sharedServers", "browser"] {
+    for key in [
+        "tenant",
+        "credentials",
+        "keepEnv",
+        "sharedServers",
+        "browser",
+    ] {
         entry.remove(key);
     }
     Ok(project)
@@ -1167,7 +1320,12 @@ pub fn run_cli(args: &[String]) -> i32 {
             });
             match result {
                 Ok(backup) => {
-                    println!("Tenant {} ajoute au projet {} ({}).", id, project, path.display());
+                    println!(
+                        "Tenant {} ajoute au projet {} ({}).",
+                        id,
+                        project,
+                        path.display()
+                    );
                     if let Some(b) = backup {
                         println!("Sauvegarde : {}", b.display());
                     }
@@ -1265,17 +1423,38 @@ fn print_tenant(t: &TenantDef) {
         let oauth_stored = stored.contains(&crate::oauth::vault_name(server));
         let secrets: Vec<String> = vars
             .values()
-            .map(|n| format!("{}{}", n, if stored.contains(n) { "" } else { " (MANQUANT)" }))
+            .map(|n| {
+                format!(
+                    "{}{}",
+                    n,
+                    if stored.contains(n) {
+                        ""
+                    } else {
+                        " (MANQUANT)"
+                    }
+                )
+            })
             .collect();
         println!(
             "  serveur   {:24} {}{}",
             server,
-            if secrets.is_empty() { "-".to_string() } else { secrets.join(", ") },
+            if secrets.is_empty() {
+                "-".to_string()
+            } else {
+                secrets.join(", ")
+            },
             if oauth_stored { "  [OAuth]" } else { "" }
         );
     }
     if !t.shared_servers.is_empty() {
-        println!("  partages  {}", t.shared_servers.iter().cloned().collect::<Vec<_>>().join(", "));
+        println!(
+            "  partages  {}",
+            t.shared_servers
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
 }
 
@@ -1339,7 +1518,10 @@ mod tests {
     }
 
     fn origin(wd: Option<&str>, cwd: Option<&str>) -> CallOrigin {
-        CallOrigin { working_dir: wd.map(PathBuf::from), cwd: cwd.map(PathBuf::from) }
+        CallOrigin {
+            working_dir: wd.map(PathBuf::from),
+            cwd: cwd.map(PathBuf::from),
+        }
     }
 
     fn ctx(wd: Option<&str>, cwd: Option<&str>) -> Result<Context, String> {
@@ -1352,7 +1534,10 @@ mod tests {
         assert_eq!(t.tenants.len(), 1);
         let acme = t.get("acme").unwrap();
         assert_eq!(acme.project, "acme");
-        assert_eq!(acme.credentials["cloudflare-api"]["CLOUDFLARE_MCP_TOKEN"], "CF_TOKEN");
+        assert_eq!(
+            acme.credentials["cloudflare-api"]["CLOUDFLARE_MCP_TOKEN"],
+            "CF_TOKEN"
+        );
         assert!(acme.credentials["stripe"].is_empty());
         assert!(acme.shared_servers.contains("context7"));
     }
@@ -1380,7 +1565,11 @@ mod tests {
                 "b": {"workspaces": ["/b"], "tenant": "t"}}}),
         ];
         for case in cases {
-            assert!(parse_projects(&case).is_err(), "devait etre refuse : {}", case);
+            assert!(
+                parse_projects(&case).is_err(),
+                "devait etre refuse : {}",
+                case
+            );
         }
     }
 
@@ -1388,16 +1577,37 @@ mod tests {
     fn contexte_selon_le_dossier() {
         assert_eq!(ctx(None, None).unwrap(), Context::Hub);
         assert_eq!(ctx(Some("/w/App/Sofapp"), None).unwrap(), Context::Hub);
-        assert_eq!(ctx(Some("/w/Clients/Acme/site/src"), None).unwrap().tenant_id(), Some("acme"));
+        assert_eq!(
+            ctx(Some("/w/Clients/Acme/site/src"), None)
+                .unwrap()
+                .tenant_id(),
+            Some("acme")
+        );
         // Préfixe de nom sans être le dossier : pas le tenant.
         assert_eq!(ctx(Some("/w/Clients/Acme2"), None).unwrap(), Context::Hub);
         // `..` ne fait pas sortir du dossier en apparence seulement.
-        assert_eq!(ctx(Some("/w/Clients/Acme/../Autre"), None).unwrap(), Context::Hub);
+        assert_eq!(
+            ctx(Some("/w/Clients/Acme/../Autre"), None).unwrap(),
+            Context::Hub
+        );
         // Sans working_dir : le dossier courant du client.
-        assert_eq!(ctx(None, Some("/w/Clients/Acme")).unwrap().tenant_id(), Some("acme"));
-        assert_eq!(ctx(Some("/w/Clients/Acme"), Some("/w/Clients/Acme/x")).unwrap().tenant_id(), Some("acme"));
+        assert_eq!(
+            ctx(None, Some("/w/Clients/Acme")).unwrap().tenant_id(),
+            Some("acme")
+        );
+        assert_eq!(
+            ctx(Some("/w/Clients/Acme"), Some("/w/Clients/Acme/x"))
+                .unwrap()
+                .tenant_id(),
+            Some("acme")
+        );
         // Un working_dir de tenant depuis un client lancé ailleurs reste le tenant.
-        assert_eq!(ctx(Some("/w/Clients/Acme"), Some("/w/App/Sofapp")).unwrap().tenant_id(), Some("acme"));
+        assert_eq!(
+            ctx(Some("/w/Clients/Acme"), Some("/w/App/Sofapp"))
+                .unwrap()
+                .tenant_id(),
+            Some("acme")
+        );
     }
 
     #[cfg(unix)]
@@ -1411,7 +1621,10 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let json = json!({"projects": {"acme": {"workspaces": [real], "tenant": "acme"}}});
         let t = parse_projects(&json).unwrap();
-        assert_eq!(t.for_dir(&link.join("site")).map(|d| d.id.as_str()), Some("acme"));
+        assert_eq!(
+            t.for_dir(&link.join("site")).map(|d| d.id.as_str()),
+            Some("acme")
+        );
         if cfg!(target_os = "macos") {
             let other_case = PathBuf::from(real.to_string_lossy().to_uppercase());
             assert_eq!(t.for_dir(&other_case).map(|d| d.id.as_str()), Some("acme"));
@@ -1435,7 +1648,10 @@ mod tests {
         assert!(matches!(&r, Route::Tenant { tenant, .. } if tenant == "acme"));
         assert_eq!(r.server(), "cloudflare-api");
         // Serveur partagé : instance normale.
-        assert_eq!(route(&acme, "context7").unwrap(), Route::Hub("context7".into()));
+        assert_eq!(
+            route(&acme, "context7").unwrap(),
+            Route::Hub("context7".into())
+        );
         // Tout autre serveur : refusé, même s'il existe côté McpHub.
         assert!(route(&acme, "github").is_err());
         assert!(route(&acme, "app-store-connect").is_err());
@@ -1444,11 +1660,18 @@ mod tests {
     #[test]
     fn mcphub_ne_joint_jamais_un_tenant() {
         let hub = ctx(Some("/w/App/Sofapp"), None).unwrap();
-        assert_eq!(route(&hub, "cloudflare-api").unwrap(), Route::Hub("cloudflare-api".into()));
+        assert_eq!(
+            route(&hub, "cloudflare-api").unwrap(),
+            Route::Hub("cloudflare-api".into())
+        );
         assert!(route(&hub, "cloudflare-api@acme").is_err());
         // Sans aucun dossier connu non plus.
-        assert_eq!(route(&Context::Hub, "supabase").unwrap(), Route::Hub("supabase".into()));
+        assert_eq!(
+            route(&Context::Hub, "supabase").unwrap(),
+            Route::Hub("supabase".into())
+        );
         assert!(route(&Context::Hub, "supabase@acme").is_err());
+        assert!(route(&Context::Hub, "filesystem#3f2a01bc").is_err());
         // Ni depuis un tenant par le nom de l'instance.
         let acme = ctx(Some("/w/Clients/Acme"), None).unwrap();
         assert!(route(&acme, "supabase@acme").is_err());
@@ -1555,31 +1778,58 @@ mod tests {
         let mut json = projects();
         add_tenant(&mut json, "beta", Path::new("/w/Clients/Beta"), "beta").unwrap();
         let t = parse_projects(&json).unwrap();
-        assert_eq!(t.get("beta").unwrap().workspaces, vec![PathBuf::from("/w/Clients/Beta")]);
+        assert_eq!(
+            t.get("beta").unwrap().workspaces,
+            vec![PathBuf::from("/w/Clients/Beta")]
+        );
         assert!(add_tenant(&mut json, "beta", Path::new("/w/x"), "x").is_err());
         assert!(add_tenant(&mut json, "gamma", Path::new("/w/Clients/Beta/sous"), "g").is_err());
         // Tenant sur un projet existant : ses dossiers et alias restent.
-        add_tenant(&mut json, "sof", Path::new("/w/App/Sofapp"), "soflution-app").unwrap();
-        assert_eq!(json["projects"]["soflution-app"]["allowedServers"], json!(["*"]));
+        add_tenant(
+            &mut json,
+            "sof",
+            Path::new("/w/App/Sofapp"),
+            "soflution-app",
+        )
+        .unwrap();
+        assert_eq!(
+            json["projects"]["soflution-app"]["allowedServers"],
+            json!(["*"])
+        );
         assert_eq!(remove_tenant(&mut json, "sof").unwrap(), "soflution-app");
         assert!(json["projects"]["soflution-app"].get("tenant").is_none());
-        assert!(json["projects"]["soflution-app"].get("workspaces").is_some());
+        assert!(json["projects"]["soflution-app"]
+            .get("workspaces")
+            .is_some());
         assert!(parse_projects(&json).unwrap().get("sof").is_none());
     }
 
     #[test]
     fn serveurs_d_un_tenant_depuis_l_ecran() {
         let known: BTreeSet<String> =
-            ["cloudflare-api", "supabase", "stripe", "context7", "svelte"].iter().map(|s| s.to_string()).collect();
+            ["cloudflare-api", "supabase", "stripe", "context7", "svelte"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
         let mut json = projects();
         let servers: BTreeMap<String, Vec<String>> = [
             // Variable déjà déclarée : elle garde son secret (CF_TOKEN), la nouvelle prend son nom.
-            ("cloudflare-api".to_string(), vec!["CLOUDFLARE_MCP_TOKEN".to_string(), "ACCOUNT_ID".to_string()]),
+            (
+                "cloudflare-api".to_string(),
+                vec!["CLOUDFLARE_MCP_TOKEN".to_string(), "ACCOUNT_ID".to_string()],
+            ),
             ("stripe".to_string(), vec![]),
         ]
         .into_iter()
         .collect();
-        set_servers(&mut json, "acme", &servers, &["svelte".into(), "context7".into()], &known).unwrap();
+        set_servers(
+            &mut json,
+            "acme",
+            &servers,
+            &["svelte".into(), "context7".into()],
+            &known,
+        )
+        .unwrap();
         let entry = &json["projects"]["acme"];
         assert_eq!(
             entry["credentials"],
@@ -1591,16 +1841,25 @@ mod tests {
         assert_eq!(entry["sharedServers"], json!(["context7", "svelte"]));
         // keepEnv d'un serveur retiré disparaît avec lui.
         assert_eq!(entry["keepEnv"], json!({}));
-        assert_eq!(json["projects"]["soflution-app"], projects()["projects"]["soflution-app"]);
+        assert_eq!(
+            json["projects"]["soflution-app"],
+            projects()["projects"]["soflution-app"]
+        );
 
         // Refus sans rien modifier : serveur inconnu, nom OAuth réservé, double déclaration.
         let before = json.clone();
-        let unknown: BTreeMap<String, Vec<String>> = [("inconnu".to_string(), vec![])].into_iter().collect();
+        let unknown: BTreeMap<String, Vec<String>> =
+            [("inconnu".to_string(), vec![])].into_iter().collect();
         assert!(set_servers(&mut json, "acme", &unknown, &[], &known).is_err());
-        let oauth: BTreeMap<String, Vec<String>> =
-            [("stripe".to_string(), vec!["MCPHUB_OAUTH_STRIPE".to_string()])].into_iter().collect();
+        let oauth: BTreeMap<String, Vec<String>> = [(
+            "stripe".to_string(),
+            vec!["MCPHUB_OAUTH_STRIPE".to_string()],
+        )]
+        .into_iter()
+        .collect();
         assert!(set_servers(&mut json, "acme", &oauth, &[], &known).is_err());
-        let both: BTreeMap<String, Vec<String>> = [("stripe".to_string(), vec![])].into_iter().collect();
+        let both: BTreeMap<String, Vec<String>> =
+            [("stripe".to_string(), vec![])].into_iter().collect();
         assert!(set_servers(&mut json, "acme", &both, &["stripe".into()], &known).is_err());
         assert!(set_servers(&mut json, "inconnu", &both, &[], &known).is_err());
         assert_eq!(json, before);
@@ -1614,7 +1873,10 @@ mod tests {
             "env": { "API_TOKEN": "${HUB_TOKEN}", "P8_PATH": "/cle.p8", "PATH": "/bin" }
         });
         let (required, optional) = server_variables(&stdio);
-        assert_eq!(required.into_iter().collect::<Vec<_>>(), ["ACCOUNT_ID", "API_TOKEN"]);
+        assert_eq!(
+            required.into_iter().collect::<Vec<_>>(),
+            ["ACCOUNT_ID", "API_TOKEN"]
+        );
         assert_eq!(optional.into_iter().collect::<Vec<_>>(), ["P8_PATH"]);
         let remote = json!({ "url": "https://x.example/mcp", "headers": { "Authorization": "Bearer ${X_TOKEN}" } });
         let (required, optional) = server_variables(&remote);
@@ -1678,7 +1940,9 @@ mod tests {
 
     #[test]
     fn origine_lue_dans_les_arguments() {
-        let o = CallOrigin::from_args(&json!({"_mcphub_context": {"working_dir": "/w/a", "cwd": "relatif"}}));
+        let o = CallOrigin::from_args(
+            &json!({"_mcphub_context": {"working_dir": "/w/a", "cwd": "relatif"}}),
+        );
         assert_eq!(o.working_dir, Some(PathBuf::from("/w/a")));
         assert_eq!(o.cwd, None, "chemin relatif ignore");
         assert!(CallOrigin::from_args(&json!({})).is_empty());

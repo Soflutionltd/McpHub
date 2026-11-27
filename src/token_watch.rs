@@ -58,7 +58,10 @@ pub struct TokenMeta {
 pub type MetaFile = BTreeMap<String, TokenMeta>;
 
 pub fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn meta_path(scope: &Scope) -> PathBuf {
@@ -128,7 +131,9 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 }
 
 fn num(s: &str) -> Option<i64> {
-    (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse().ok()).flatten()
+    (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| s.parse().ok())
+        .flatten()
 }
 
 /// Date et heure d'un service : `2026-12-31T23:59:59Z` (Cloudflare), `2026-12-31 23:59:59 UTC`
@@ -136,8 +141,16 @@ fn num(s: &str) -> Option<i64> {
 pub fn parse_datetime(raw: &str) -> Option<u64> {
     let raw = raw.trim();
     let date = raw.get(..10)?;
-    let (y, m, d) = (num(date.get(..4)?)?, num(date.get(5..7)?)?, num(date.get(8..10)?)?);
-    if date.as_bytes()[4] != b'-' || date.as_bytes()[7] != b'-' || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+    let (y, m, d) = (
+        num(date.get(..4)?)?,
+        num(date.get(5..7)?)?,
+        num(date.get(8..10)?)?,
+    );
+    if date.as_bytes()[4] != b'-'
+        || date.as_bytes()[7] != b'-'
+        || !(1..=12).contains(&m)
+        || !(1..=31).contains(&d)
+    {
         return None;
     }
     let rest = raw[10..].trim_start_matches(['T', ' ']);
@@ -145,12 +158,18 @@ pub fn parse_datetime(raw: &str) -> Option<u64> {
         (86_399, "")
     } else {
         let time = rest.get(..8)?;
-        let (h, mi, s) = (num(time.get(..2)?)?, num(time.get(3..5)?)?, num(time.get(6..8)?)?);
+        let (h, mi, s) = (
+            num(time.get(..2)?)?,
+            num(time.get(3..5)?)?,
+            num(time.get(6..8)?)?,
+        );
         if h > 23 || mi > 59 || s > 60 {
             return None;
         }
         // Fractions de seconde ignorées (`.123Z`).
-        let zone = rest[8..].trim_start_matches(|c: char| c == '.' || c.is_ascii_digit()).trim();
+        let zone = rest[8..]
+            .trim_start_matches(|c: char| c == '.' || c.is_ascii_digit())
+            .trim();
         (h * 3600 + mi * 60 + s, zone)
     };
     let offset = match zone {
@@ -239,9 +258,16 @@ fn state_text(level: &Level, meta: &TokenMeta) -> String {
     match level {
         Level::Refused => format!("refusé par {} (expiré ou révoqué)", service_label(meta)),
         Level::Reconnect => "connexion expirée, à refaire".into(),
-        Level::Expired => format!("expiré le {}", meta.expires_at.map(format_date).unwrap_or_default()),
+        Level::Expired => format!(
+            "expiré le {}",
+            meta.expires_at.map(format_date).unwrap_or_default()
+        ),
         Level::Soon(1) => "expire demain".into(),
-        Level::Soon(days) => format!("expire dans {} jours ({})", days, meta.expires_at.map(format_date).unwrap_or_default()),
+        Level::Soon(days) => format!(
+            "expire dans {} jours ({})",
+            days,
+            meta.expires_at.map(format_date).unwrap_or_default()
+        ),
     }
 }
 
@@ -310,7 +336,9 @@ fn tenant_ids() -> Vec<String> {
 }
 
 fn scopes() -> Vec<Scope> {
-    std::iter::once(Scope::Hub).chain(tenant_ids().into_iter().map(Scope::Tenant)).collect()
+    std::iter::once(Scope::Hub)
+        .chain(tenant_ids().into_iter().map(Scope::Tenant))
+        .collect()
 }
 
 fn scope_tenant(scope: &Scope) -> Option<String> {
@@ -328,7 +356,12 @@ pub fn alerts() -> Vec<Alert> {
         .flat_map(|scope| {
             let tenant = scope_tenant(&scope);
             load(&scope).into_iter().filter_map(move |(name, meta)| {
-                level(&meta, now).map(|level| Alert { tenant: tenant.clone(), name, meta, level })
+                level(&meta, now).map(|level| Alert {
+                    tenant: tenant.clone(),
+                    name,
+                    meta,
+                    level,
+                })
             })
         })
         .collect()
@@ -339,11 +372,18 @@ pub fn alerts() -> Vec<Alert> {
 /// Dernier jour où un serveur a reçu l'avis « expire bientôt » (une fois par jour).
 fn notes_given() -> std::sync::MutexGuard<'static, HashMap<String, u64>> {
     static N: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
-    N.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner())
+    N.get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 /// Texte de l'avis pour un ensemble de fiches et un appel (réussi ou non).
-fn note_from(tenant: Option<&str>, entries: &[(String, TokenMeta)], failed: bool, now: u64) -> Option<String> {
+fn note_from(
+    tenant: Option<&str>,
+    entries: &[(String, TokenMeta)],
+    failed: bool,
+    now: u64,
+) -> Option<String> {
     let lines: Vec<String> = entries
         .iter()
         .filter_map(|(name, meta)| {
@@ -386,8 +426,10 @@ pub fn note_for(process_key: &str, failed: bool) -> Option<String> {
     if !failed && notes_given().get(process_key) == Some(&today) {
         return None;
     }
-    let entries: Vec<(String, TokenMeta)> =
-        load(&scope).into_iter().filter(|(_, m)| m.servers.iter().any(|s| s == server)).collect();
+    let entries: Vec<(String, TokenMeta)> = load(&scope)
+        .into_iter()
+        .filter(|(_, m)| m.servers.iter().any(|s| s == server))
+        .collect();
     if entries.is_empty() {
         return None;
     }
@@ -446,7 +488,11 @@ fn watched(scope: &Scope) -> Result<(Vec<Watched>, BTreeSet<String>), String> {
         }
         by_name
             .entry(name.to_string())
-            .or_insert_with(|| Watched { name: name.to_string(), var: var.to_string(), servers: BTreeSet::new() })
+            .or_insert_with(|| Watched {
+                name: name.to_string(),
+                var: var.to_string(),
+                servers: BTreeSet::new(),
+            })
             .servers
             .insert(server.to_string());
     };
@@ -489,11 +535,21 @@ async fn check_one(scope: &Scope, w: &Watched) -> (Option<String>, Check) {
             Scope::Hub => w.var.clone(),
             Scope::Tenant(id) => crate::tenant::instance_name(&w.var, id),
         };
-        let stored = tokio::task::spawn_blocking(move || crate::oauth::load(&instance)).await.ok().flatten();
+        let stored = tokio::task::spawn_blocking(move || crate::oauth::load(&instance))
+            .await
+            .ok()
+            .flatten();
         let dead = stored.and_then(|s| s.tokens).is_some_and(|t| {
             t.refresh_token.is_none() && t.expires_at.is_some_and(|e| e <= now_ms())
         });
-        return (Some("oauth".into()), if dead { Check::Reconnect } else { Check::Unknown });
+        return (
+            Some("oauth".into()),
+            if dead {
+                Check::Reconnect
+            } else {
+                Check::Unknown
+            },
+        );
     }
     let Some(connector) = crate::connectors::for_var(&w.var) else {
         return (None, Check::Unknown);
@@ -513,9 +569,13 @@ async fn check_one(scope: &Scope, w: &Watched) -> (Option<String>, Check) {
 
 /// Contrôle tous les coffres, met les fiches à jour et notifie les paliers franchis.
 pub async fn check_all() {
-    for scope in tokio::task::spawn_blocking(scopes).await.unwrap_or_default() {
+    for scope in tokio::task::spawn_blocking(scopes)
+        .await
+        .unwrap_or_default()
+    {
         let task_scope = scope.clone();
-        let (list, present) = match tokio::task::spawn_blocking(move || watched(&task_scope)).await {
+        let (list, present) = match tokio::task::spawn_blocking(move || watched(&task_scope)).await
+        {
             Ok(Ok(found)) => found,
             Ok(Err(e)) => {
                 eprintln!("[McpHub][TOKENS] controle saute (config illisible) : {}", e);
@@ -568,7 +628,12 @@ pub async fn check_all() {
                     Some(l) => {
                         if entry.notified.as_deref() != Some(l.bucket()) {
                             entry.notified = Some(l.bucket().into());
-                            let alert = Alert { tenant: tenant.clone(), name: w.name.clone(), meta: entry.clone(), level: l };
+                            let alert = Alert {
+                                tenant: tenant.clone(),
+                                name: w.name.clone(),
+                                meta: entry.clone(),
+                                level: l,
+                            };
                             notify.push(alert.message());
                         }
                     }
@@ -652,7 +717,8 @@ mod tests {
         TokenMeta {
             var: "CLOUDFLARE_API_TOKEN".into(),
             service: Some("cloudflare".into()),
-            expires_at: expires_in_days.map(|d| (1_000 * DAY_MS as i64 + d * DAY_MS as i64 - 1000) as u64),
+            expires_at: expires_in_days
+                .map(|d| (1_000 * DAY_MS as i64 + d * DAY_MS as i64 - 1000) as u64),
             status: status.map(String::from),
             servers: vec!["cf-orchestrator".into()],
             ..Default::default()
@@ -667,7 +733,10 @@ mod tests {
         assert_eq!(level(&meta(Some(14), None), now), Some(Level::Soon(14)));
         assert_eq!(level(&meta(Some(3), None), now), Some(Level::Soon(3)));
         assert_eq!(level(&meta(Some(0), None), now), Some(Level::Expired));
-        assert_eq!(level(&meta(Some(30), Some("refused")), now), Some(Level::Refused));
+        assert_eq!(
+            level(&meta(Some(30), Some("refused")), now),
+            Some(Level::Refused)
+        );
         assert_eq!(Level::Soon(10).bucket(), "14");
         assert_eq!(Level::Soon(2).bucket(), "3");
         assert_eq!(Level::Expired.bucket(), "0");
@@ -678,14 +747,26 @@ mod tests {
         let now = 1_000 * DAY_MS;
         let soon = vec![("CLOUDFLARE_API_TOKEN".to_string(), meta(Some(2), None))];
         let note = note_from(Some("acme"), &soon, false, now).unwrap();
-        assert!(note.contains("client acme") && note.contains("expire dans 2 jours"), "{}", note);
-        assert!(note.contains("Client accounts, acme, secret CLOUDFLARE_API_TOKEN"), "{}", note);
+        assert!(
+            note.contains("client acme") && note.contains("expire dans 2 jours"),
+            "{}",
+            note
+        );
+        assert!(
+            note.contains("Client accounts, acme, secret CLOUDFLARE_API_TOKEN"),
+            "{}",
+            note
+        );
         // Un appel en échec n'annonce pas une simple échéance proche comme cause.
         assert_eq!(note_from(Some("acme"), &soon, true, now), None);
 
         let expired = vec![("CLOUDFLARE_API_TOKEN".to_string(), meta(Some(-1), None))];
         let note = note_from(None, &expired, true, now).unwrap();
-        assert!(note.contains("jeton expiré") && note.contains("compte McpHub") && note.contains("carte cf-orchestrator"));
+        assert!(
+            note.contains("jeton expiré")
+                && note.contains("compte McpHub")
+                && note.contains("carte cf-orchestrator")
+        );
         // Appel réussi malgré une fiche « expiré » : jeton déjà renouvelé, rien à dire.
         assert_eq!(note_from(None, &expired, false, now), None);
     }
@@ -704,15 +785,29 @@ mod tests {
         let mut file = MetaFile::new();
         file.insert(
             "GITHUB_TOKEN".into(),
-            TokenMeta { var: "GITHUB_TOKEN".into(), expires_at: Some(5), notified: Some("3".into()), ..Default::default() },
+            TokenMeta {
+                var: "GITHUB_TOKEN".into(),
+                expires_at: Some(5),
+                notified: Some("3".into()),
+                ..Default::default()
+            },
         );
         // La date donnée par le service prime sur la saisie.
         apply_record(&mut file, recorded(Some(100), Some(50)));
         let entry = &file["GITHUB_TOKEN"];
-        assert_eq!((entry.expires_at, entry.expires_source.as_deref()), (Some(100), Some("service")));
-        assert_eq!((entry.notified.as_deref(), entry.status.as_deref()), (None, Some("ok")));
+        assert_eq!(
+            (entry.expires_at, entry.expires_source.as_deref()),
+            (Some(100), Some("service"))
+        );
+        assert_eq!(
+            (entry.notified.as_deref(), entry.status.as_deref()),
+            (None, Some("ok"))
+        );
         apply_record(&mut file, recorded(None, Some(50)));
-        assert_eq!(file["GITHUB_TOKEN"].expires_source.as_deref(), Some("manual"));
+        assert_eq!(
+            file["GITHUB_TOKEN"].expires_source.as_deref(),
+            Some("manual")
+        );
         // Nouveau jeton sans échéance connue : l'ancienne date ne survit pas.
         apply_record(&mut file, recorded(None, None));
         assert_eq!(file["GITHUB_TOKEN"].expires_at, None);

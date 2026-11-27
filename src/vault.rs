@@ -100,7 +100,10 @@ pub fn list_names() -> Vec<String> {
 
 pub fn list_names_in(scope: &Scope) -> Vec<String> {
     if !is_available() {
-        return file_backend::read(scope).into_iter().map(|(k, _)| k).collect();
+        return file_backend::read(scope)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
     }
     let path = scope.index_path();
     let content = match fs::read_to_string(&path) {
@@ -196,7 +199,10 @@ pub fn get(name: &str) -> Result<Option<String>, String> {
 
 pub fn get_in(scope: &Scope, name: &str) -> Result<Option<String>, String> {
     if !is_available() {
-        return Ok(file_backend::read(scope).into_iter().find(|(k, _)| k == name).map(|(_, v)| v));
+        return Ok(file_backend::read(scope)
+            .into_iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v));
     }
     if !is_valid_name(name) {
         return Err(format!("nom invalide: {}", name));
@@ -204,7 +210,14 @@ pub fn get_in(scope: &Scope, name: &str) -> Result<Option<String>, String> {
     // -g écrit la valeur sur stderr sous la forme `password: "texte"` ou, pour les
     // caractères non ASCII, `password: 0xC3A9...  "..."` : on décode l'hexadécimal.
     let out = Command::new("/usr/bin/security")
-        .args(["find-generic-password", "-s", &scope.service(), "-a", name, "-g"])
+        .args([
+            "find-generic-password",
+            "-s",
+            &scope.service(),
+            "-a",
+            name,
+            "-g",
+        ])
         .args(keychain_args())
         .stdin(Stdio::null())
         .output()
@@ -334,7 +347,13 @@ pub fn delete_in(scope: &Scope, name: &str) -> Result<bool, String> {
         return Err(format!("nom invalide: {}", name));
     }
     let out = Command::new("/usr/bin/security")
-        .args(["delete-generic-password", "-s", &scope.service(), "-a", name])
+        .args([
+            "delete-generic-password",
+            "-s",
+            &scope.service(),
+            "-a",
+            name,
+        ])
         .args(keychain_args())
         .stdin(Stdio::null())
         .output()
@@ -478,7 +497,13 @@ mod file_backend {
         let mut lines: Vec<String> = Vec::new();
         for line in content.lines() {
             let t = line.trim();
-            let key = t.strip_prefix("export ").unwrap_or(t).split('=').next().unwrap_or("").trim();
+            let key = t
+                .strip_prefix("export ")
+                .unwrap_or(t)
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .trim();
             if !t.starts_with('#') && key == name {
                 existed = true;
                 continue;
@@ -595,13 +620,19 @@ pub fn run_cli(args: &[String]) {
     };
     let sub = args.first().map(|s| s.as_str()).unwrap_or("status");
     if scope != Scope::Hub && matches!(sub, "status" | "migrate") {
-        eprintln!("'{}' ne concerne que le coffre McpHub (sans --tenant).", sub);
+        eprintln!(
+            "'{}' ne concerne que le coffre McpHub (sans --tenant).",
+            sub
+        );
         std::process::exit(2);
     }
     if !is_available() && matches!(sub, "status" | "migrate") {
         // Hors macOS : le coffre est secrets.env (mode 600, caché aux serveurs isolés).
         let p = crate::instance::hub_dir().join("secrets.env");
-        println!("Trousseau macOS indisponible : coffre = {} (mode 600)", p.display());
+        println!(
+            "Trousseau macOS indisponible : coffre = {} (mode 600)",
+            p.display()
+        );
         println!("Secrets dans le coffre : {}", list_names().len());
         return;
     }
@@ -669,7 +700,9 @@ fn cli_list(scope: &Scope) {
     let names = list_names_in(scope);
     if names.is_empty() {
         match scope {
-            Scope::Hub => println!("Coffre vide. 'McpHub vault migrate' pour importer secrets.env."),
+            Scope::Hub => {
+                println!("Coffre vide. 'McpHub vault migrate' pour importer secrets.env.")
+            }
             Scope::Tenant(_) => println!("Coffre du {} vide.", scope.label()),
         }
         return;
@@ -696,7 +729,12 @@ fn cli_set(scope: &Scope, name: &str) {
         }
     };
     match set_in(scope, name, &value) {
-        Ok(()) => println!("{} enregistre dans le coffre {} ({}).", name, scope.label(), mask(&value)),
+        Ok(()) => println!(
+            "{} enregistre dans le coffre {} ({}).",
+            name,
+            scope.label(),
+            mask(&value)
+        ),
         Err(e) => eprintln!("Erreur : {}", e),
     }
 }

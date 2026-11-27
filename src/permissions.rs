@@ -117,9 +117,7 @@ impl PermissionsConfig {
             "rules",
         ];
         const RULE_KEYS: &[&str] = &["server", "tool", "action", "reason"];
-        let obj = value
-            .as_object()
-            .ok_or("permissions doit etre un objet")?;
+        let obj = value.as_object().ok_or("permissions doit etre un objet")?;
         if let Some(unknown) = obj.keys().find(|k| !KEYS.contains(&k.as_str())) {
             return Err(format!(
                 "permissions : cle inconnue \"{}\" ({})",
@@ -145,8 +143,12 @@ impl PermissionsConfig {
         };
         let mut cfg = PermissionsConfig::default();
         if let Some(d) = text("default")? {
-            cfg.default = Action::parse(d)
-                .ok_or_else(|| format!("permissions.default invalide \"{}\" (allow, confirm, deny)", d))?;
+            cfg.default = Action::parse(d).ok_or_else(|| {
+                format!(
+                    "permissions.default invalide \"{}\" (allow, confirm, deny)",
+                    d
+                )
+            })?;
         }
         match obj.get("autoClassify") {
             None => {}
@@ -194,7 +196,10 @@ impl PermissionsConfig {
                 match rule.get(key) {
                     None => Ok(None),
                     Some(Value::String(s)) => Ok(Some(s.clone())),
-                    Some(_) => Err(format!("permissions : regle #{}, {} doit etre une chaine", n, key)),
+                    Some(_) => Err(format!(
+                        "permissions : regle #{}, {} doit etre une chaine",
+                        n, key
+                    )),
                 }
             };
             let action_text = field("action")?
@@ -230,7 +235,11 @@ impl PermissionsConfig {
     /// serveur sans être un refus laisse passer au moins un outil ; un refus sur tous les
     /// outils (`*`) atteint avant ferme tout ; sinon c'est `default` qui tranche.
     pub fn denies_server(&self, server: &str) -> bool {
-        for rule in self.rules.iter().filter(|rule| glob_match(&rule.server, server)) {
+        for rule in self
+            .rules
+            .iter()
+            .filter(|rule| glob_match(&rule.server, server))
+        {
             if rule.action != Action::Deny {
                 return false;
             }
@@ -486,7 +495,10 @@ mod tests {
         assert!(!cfg.denies_server("lecture"));
         assert!(!cfg.denies_server("autre"));
 
-        let tout_refuse = PermissionsConfig { default: Action::Deny, ..cfg.clone() };
+        let tout_refuse = PermissionsConfig {
+            default: Action::Deny,
+            ..cfg.clone()
+        };
         assert!(tout_refuse.denies_server("autre"));
         assert!(tout_refuse.denies_server("partiel"));
         assert!(!tout_refuse.denies_server("lecture"));
@@ -516,14 +528,28 @@ mod tests {
 
     #[test]
     fn annotation_durcit_mais_n_assouplit_pas() {
-        let mut cfg = PermissionsConfig { auto_classify: true, ..Default::default() };
+        let mut cfg = PermissionsConfig {
+            auto_classify: true,
+            ..Default::default()
+        };
         let d = cfg.decide_with("srv", "apply_changes", true);
         assert_eq!(d.action, Action::Confirm);
         assert_eq!(d.source, "auto:annotation");
-        assert_eq!(cfg.decide_with("srv", "apply_changes", false).action, Action::Allow);
+        assert_eq!(
+            cfg.decide_with("srv", "apply_changes", false).action,
+            Action::Allow
+        );
         // Une regle explicite reste prioritaire.
-        cfg.rules.push(Rule { server: "srv".into(), tool: "apply_*".into(), action: Action::Allow, reason: None });
-        assert_eq!(cfg.decide_with("srv", "apply_changes", true).action, Action::Allow);
+        cfg.rules.push(Rule {
+            server: "srv".into(),
+            tool: "apply_*".into(),
+            action: Action::Allow,
+            reason: None,
+        });
+        assert_eq!(
+            cfg.decide_with("srv", "apply_changes", true).action,
+            Action::Allow
+        );
         // Sans auto_classify, pas d'effet.
         let cfg2 = PermissionsConfig::default();
         assert_eq!(cfg2.decide_with("srv", "x", true).action, Action::Allow);
@@ -569,7 +595,11 @@ mod tests {
             json!({ "autoClassify": "yes" }),
             json!({ "rules": { "server": "x", "action": "deny" } }),
         ] {
-            assert!(PermissionsConfig::from_json(&invalid).is_err(), "accepte : {}", invalid);
+            assert!(
+                PermissionsConfig::from_json(&invalid).is_err(),
+                "accepte : {}",
+                invalid
+            );
         }
         let cfg = PermissionsConfig::from_json(&json!({})).expect("objet vide valide");
         assert_eq!(cfg.default, Action::Allow);

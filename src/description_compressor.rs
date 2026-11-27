@@ -110,10 +110,7 @@ pub fn compress(description: &str) -> String {
     }
 
     // Step 1: normalize whitespace (collapse multiple spaces/newlines to single space).
-    let normalized: String = description
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let normalized: String = description.split_whitespace().collect::<Vec<_>>().join(" ");
 
     // Step 2: strip leading boilerplate. Match case-insensitively.
     let mut working = normalized.trim().to_string();
@@ -141,10 +138,7 @@ pub fn compress(description: &str) -> String {
             if lower.ends_with(suffix) {
                 let cut = working.len() - suffix.len();
                 working = working[..cut].trim_end_matches([',', ';', ' ']).to_string();
-                if !working.ends_with('.')
-                    && !working.ends_with('!')
-                    && !working.ends_with('?')
-                {
+                if !working.ends_with('.') && !working.ends_with('!') && !working.ends_with('?') {
                     working.push('.');
                 }
                 changed = true;
@@ -183,7 +177,11 @@ fn truncate_at_sentence(s: &str, soft_limit: usize) -> String {
             }
         }
         if i >= soft_limit && last_sentence_end > 0 {
-            return chars[..last_sentence_end].iter().collect::<String>().trim().to_string();
+            return chars[..last_sentence_end]
+                .iter()
+                .collect::<String>()
+                .trim()
+                .to_string();
         }
     }
 
@@ -214,22 +212,13 @@ mod tests {
             compress("This function helps you find references."),
             "Find references."
         );
-        assert_eq!(
-            compress("Allows you to send an email."),
-            "Send an email."
-        );
+        assert_eq!(compress("Allows you to send an email."), "Send an email.");
     }
 
     #[test]
     fn strips_trailing_fluff() {
-        assert_eq!(
-            compress("Read a file as needed."),
-            "Read a file."
-        );
-        assert_eq!(
-            compress("List directories if needed."),
-            "List directories."
-        );
+        assert_eq!(compress("Read a file as needed."), "Read a file.");
+        assert_eq!(compress("List directories if needed."), "List directories.");
         assert_eq!(
             compress("Get user info for more information."),
             "Get user info."

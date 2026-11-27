@@ -36,6 +36,9 @@ pub struct SandboxSpec {
     /// Programmes sensibles autorisés malgré tout (ex. "osascript", "open" pour un serveur
     /// qui pilote le simulateur iOS).
     pub allow_exec: Vec<String>,
+    /// Isolation impossible sur cette machine (pas de bwrap, pas de sandbox-exec) : `false`
+    /// (défaut) refuse le démarrage ; `true` (`"ifUnavailable": "run"`) lance sans isolation.
+    pub run_if_unavailable: bool,
 }
 
 /// Secrets jamais lisibles par un serveur isolé (relatifs au dossier personnel).
@@ -124,8 +127,17 @@ const UNSANDBOXED_BY_DEFAULT: &[&str] = &["desktop-commander", "kilnshell"];
 fn str_list(server_name: &str, key: &str, v: Option<&Value>) -> Result<Vec<String>, String> {
     let Some(v) = v else { return Ok(Vec::new()) };
     v.as_array()
-        .and_then(|a| a.iter().map(|s| s.as_str().map(String::from)).collect::<Option<Vec<_>>>())
-        .ok_or_else(|| format!("{} : sandbox.{} doit etre une liste de chaines", server_name, key))
+        .and_then(|a| {
+            a.iter()
+                .map(|s| s.as_str().map(String::from))
+                .collect::<Option<Vec<_>>>()
+        })
+        .ok_or_else(|| {
+            format!(
+                "{} : sandbox.{} doit etre une liste de chaines",
+                server_name, key
+            )
+        })
 }
 
 enum ModeSetting {
@@ -147,7 +159,14 @@ fn mode_of(server_name: &str, s: &str) -> Result<ModeSetting, String> {
     }
 }
 
-const SPEC_KEYS: &[&str] = &["mode", "network", "allowRead", "allowWrite", "allowExec"];
+const SPEC_KEYS: &[&str] = &[
+    "mode",
+    "network",
+    "allowRead",
+    "allowWrite",
+    "allowExec",
+    "ifUnavailable",
+];
 
 /// Réglage effectif d'un serveur : `mcpServers.X.sandbox` (false / true / "shield" / "strict" /
 /// objet), sinon `settings.sandbox` global, sinon pas d'isolation.
@@ -174,6 +193,7 @@ pub fn resolve(
         allow_read: Vec::new(),
         allow_write: Vec::new(),
         allow_exec: Vec::new(),
+        run_if_unavailable: false,
     };
     match &spec_value {
         Value::Bool(true) => {}
@@ -201,11 +221,27 @@ pub fn resolve(
             match o.get("network") {
                 None => {}
                 Some(Value::Bool(n)) => spec.network = *n,
-                Some(_) => return Err(format!("{} : sandbox.network doit etre true ou false", label)),
+                Some(_) => {
+                    return Err(format!(
+                        "{} : sandbox.network doit etre true ou false",
+                        label
+                    ))
+                }
             }
             spec.allow_read = str_list(&label, "allowRead", o.get("allowRead"))?;
             spec.allow_write = str_list(&label, "allowWrite", o.get("allowWrite"))?;
             spec.allow_exec = str_list(&label, "allowExec", o.get("allowExec"))?;
+            spec.run_if_unavailable = match o.get("ifUnavailable") {
+                None => false,
+                Some(Value::String(v)) if v == "refuse" => false,
+                Some(Value::String(v)) if v == "run" => true,
+                Some(_) => {
+                    return Err(format!(
+                        "{} : sandbox.ifUnavailable doit etre \"refuse\" ou \"run\"",
+                        label
+                    ))
+                }
+            };
         }
         _ => {
             return Err(format!(
@@ -310,7 +346,10 @@ pub fn profile(spec: &SandboxSpec, home: &str, referenced: &[String]) -> String 
             .map(|f| format!("(literal {})", q(&format!("{}/{}", home, f)))),
     );
     denied.extend(crate::instance::sandbox_hub_rules(home));
-    p.push_str(&format!("(deny file-read* file-write* {})\n", denied.join(" ")));
+    p.push_str(&format!(
+        "(deny file-read* file-write* {})\n",
+        denied.join(" ")
+    ));
     let protected: Vec<String> = WRITE_PROTECTED
         .iter()
         .map(|f| format!("(subpath {})", q(&format!("{}/{}", home, f))))
@@ -324,7 +363,14 @@ pub fn profile(spec: &SandboxSpec, home: &str, referenced: &[String]) -> String 
             "(subpath \"/private/var/folders\")".into(),
             "(subpath \"/dev\")".into(),
         ];
-        for d in [".npm", ".cache", "Library/Caches", ".bun", ".pnpm-store", "Library/pnpm"] {
+        for d in [
+            ".npm",
+            ".cache",
+            "Library/Caches",
+            ".bun",
+            ".pnpm-store",
+            "Library/pnpm",
+        ] {
             writable.push(format!("(subpath {})", q(&format!("{}/{}", home, d))));
         }
         p.push_str(&format!("(allow file-write* {})\n", writable.join(" ")));
@@ -364,7 +410,10 @@ pub fn profile(spec: &SandboxSpec, home: &str, referenced: &[String]) -> String 
         .map(|w| format!("(subpath {})", q(&w)))
         .collect();
     if !writes.is_empty() {
-        p.push_str(&format!("(allow file-read* file-write* {})\n", writes.join(" ")));
+        p.push_str(&format!(
+            "(allow file-read* file-write* {})\n",
+            writes.join(" ")
+        ));
     }
     p
 }
@@ -399,7 +448,9 @@ fn bwrap_path() -> Option<String> {
 
 fn empty_file() -> String {
     let p = std::env::temp_dir().join(format!("mcphub-empty-{}", std::process::id()));
-    let ok = std::fs::metadata(&p).map(|m| m.is_file() && m.len() == 0).unwrap_or(false)
+    let ok = std::fs::metadata(&p)
+        .map(|m| m.is_file() && m.len() == 0)
+        .unwrap_or(false)
         || std::fs::write(&p, b"").is_ok();
     #[cfg(unix)]
     if ok {
@@ -435,7 +486,10 @@ pub fn bwrap_args(spec: &SandboxSpec, home: &str, referenced: &[String]) -> Vec<
     let mut a: Vec<String> = vec!["--die-with-parent".into(), "--new-session".into()];
     let push = |a: &mut Vec<String>, parts: &[&str]| a.extend(parts.iter().map(|p| p.to_string()));
     if spec.mode == SandboxMode::Strict {
-        push(&mut a, &["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"]);
+        push(
+            &mut a,
+            &["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"],
+        );
         let mut writable: Vec<String> = vec!["/tmp".into(), "/var/tmp".into(), "/dev/shm".into()];
         for d in [".npm", ".cache", ".bun", ".pnpm-store", ".local/share/pnpm"] {
             let p = format!("{}/{}", home, d);
@@ -456,7 +510,10 @@ pub fn bwrap_args(spec: &SandboxSpec, home: &str, referenced: &[String]) -> Vec<
         push(&mut a, &["--dev-bind", "/", "/"]);
     }
     // Secrets : dossiers vides, fichiers remplacés par /dev/null.
-    let mut hidden: Vec<String> = SECRET_DIRS.iter().map(|d| format!("{}/{}", home, d)).collect();
+    let mut hidden: Vec<String> = SECRET_DIRS
+        .iter()
+        .map(|d| format!("{}/{}", home, d))
+        .collect();
     hidden.extend(hub_dirs(home));
     // Fichier vide en lecture seule plutôt que /dev/null (inutilisable sur un montage nodev) :
     // un shell lit un ~/.bashrc vide au lieu d'afficher « Permission denied ».
@@ -503,18 +560,39 @@ pub fn bwrap_args(spec: &SandboxSpec, home: &str, referenced: &[String]) -> Vec<
     a
 }
 
+/// Isolation demandée mais impossible ici : refus, sauf `"ifUnavailable": "run"`.
+fn unavailable(
+    server: &str,
+    spec: &SandboxSpec,
+    why: &str,
+    command: &str,
+    args: &[String],
+) -> Result<(String, Vec<String>), String> {
+    if spec.run_if_unavailable {
+        eprintln!(
+            "[McpHub][SANDBOX] {} : {}, serveur lance SANS isolation (ifUnavailable: run)",
+            server, why
+        );
+        return Ok((command.to_string(), args.to_vec()));
+    }
+    Err(format!(
+        "{} : isolation demandee mais impossible ({}). Serveur non demarre. Installer l'outil, ou accepter le lancement sans isolation avec \"sandbox\": {{\"ifUnavailable\": \"run\"}}",
+        server, why
+    ))
+}
+
 /// Commande enveloppée : `/usr/bin/sandbox-exec -p PROFIL commande args...` (macOS) ou
-/// `bwrap ... -- commande args...` (Linux). Sans l'un ni l'autre, la commande est lancée telle
-/// quelle avec un avertissement.
+/// `bwrap ... -- commande args...` (Linux). Sans l'un ni l'autre, une isolation demandée
+/// empêche le démarrage (sauf `"ifUnavailable": "run"`).
 pub fn wrap(
     server: &str,
     spec: Option<&SandboxSpec>,
     command: &str,
     args: &[String],
     env: &HashMap<String, String>,
-) -> (String, Vec<String>) {
+) -> Result<(String, Vec<String>), String> {
     let Some(spec) = spec else {
-        return (command.to_string(), args.to_vec());
+        return Ok((command.to_string(), args.to_vec()));
     };
     let home = dirs::home_dir()
         .map(|h| h.to_string_lossy().to_string())
@@ -526,26 +604,84 @@ pub fn wrap(
             new_args.push("--".into());
             new_args.push(command.to_string());
             new_args.extend(args.iter().cloned());
-            return (bwrap, new_args);
+            return Ok((bwrap, new_args));
         }
-        eprintln!("[McpHub][SANDBOX] {} : bubblewrap (bwrap) indisponible ou refuse par le noyau, serveur lance sans isolation (apt install bubblewrap)", server);
-        return (command.to_string(), args.to_vec());
+        return unavailable(
+            server,
+            spec,
+            "bubblewrap (bwrap) absent ou refuse par le noyau, apt install bubblewrap",
+            command,
+            args,
+        );
     }
     let exe = "/usr/bin/sandbox-exec";
     if !cfg!(target_os = "macos") || !Path::new(exe).exists() {
-        eprintln!("[McpHub][SANDBOX] {} : sandbox-exec indisponible, serveur lance sans isolation", server);
-        return (command.to_string(), args.to_vec());
+        return unavailable(
+            server,
+            spec,
+            "sandbox-exec absent sur ce systeme",
+            command,
+            args,
+        );
     }
     let referenced = referenced_paths(env, args, &home);
-    let mut new_args = vec!["-p".to_string(), profile(spec, &home, &referenced), command.to_string()];
+    let mut new_args = vec![
+        "-p".to_string(),
+        profile(spec, &home, &referenced),
+        command.to_string(),
+    ];
     new_args.extend(args.iter().cloned());
-    (exe.to_string(), new_args)
+    Ok((exe.to_string(), new_args))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn isolation_impossible_refusee_sauf_choix_explicite() {
+        let strict = resolve("x", &json!({"sandbox": "shield"}), None, "npx", &[])
+            .unwrap()
+            .unwrap();
+        assert!(!strict.run_if_unavailable);
+        let err = unavailable("x", &strict, "outil absent", "npx", &["a".into()]).unwrap_err();
+        assert!(
+            err.contains("non demarre") && err.contains("ifUnavailable"),
+            "{}",
+            err
+        );
+        let lenient = resolve(
+            "x",
+            &json!({"sandbox": {"mode": "shield", "ifUnavailable": "run"}}),
+            None,
+            "npx",
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(lenient.run_if_unavailable);
+        assert_eq!(
+            unavailable("x", &lenient, "outil absent", "npx", &["a".into()]).unwrap(),
+            ("npx".to_string(), vec!["a".to_string()])
+        );
+        // Réglage global hérité, valeur inconnue refusée.
+        let global = json!({"mode": "strict", "ifUnavailable": "run"});
+        assert!(
+            resolve("x", &json!({}), Some(&global), "npx", &[])
+                .unwrap()
+                .unwrap()
+                .run_if_unavailable
+        );
+        assert!(resolve(
+            "x",
+            &json!({"sandbox": {"ifUnavailable": "maybe"}}),
+            None,
+            "npx",
+            &[]
+        )
+        .is_err());
+    }
 
     #[test]
     fn resolution_des_reglages() {
@@ -557,16 +693,40 @@ mod tests {
         assert!(ok("supabase", json!({"sandbox": false}), Some(&g), &[]).is_none());
         assert!(ok("supabase", json!({"sandbox": "off"}), Some(&g), &[]).is_none());
         assert!(ok("supabase", json!({}), None, &[]).is_none());
-        assert!(ok("dc", json!({}), Some(&g), &["@wonderwhy-er/desktop-commander".into()]).is_none());
-        assert!(ok("dc", json!({"sandbox": "shield"}), Some(&g), &["desktop-commander".into()]).is_some());
-        let s = resolve("x", &json!({"sandbox": {"mode": "strict", "network": false, "allowWrite": ["~/data"]}}), None, "xurl", &[])
-            .unwrap()
-            .unwrap();
+        assert!(ok(
+            "dc",
+            json!({}),
+            Some(&g),
+            &["@wonderwhy-er/desktop-commander".into()]
+        )
+        .is_none());
+        assert!(ok(
+            "dc",
+            json!({"sandbox": "shield"}),
+            Some(&g),
+            &["desktop-commander".into()]
+        )
+        .is_some());
+        let s = resolve(
+            "x",
+            &json!({"sandbox": {"mode": "strict", "network": false, "allowWrite": ["~/data"]}}),
+            None,
+            "xurl",
+            &[],
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(s.mode, SandboxMode::Strict);
         assert!(!s.network);
         assert!(s.allow_write.contains(&"~/data".to_string()));
         assert!(s.allow_write.contains(&"~/.xurl".to_string()));
-        let r = ok("cf", json!({}), Some(&g), &["-y".into(), "mcp-remote@0.15.1".into()]).unwrap();
+        let r = ok(
+            "cf",
+            json!({}),
+            Some(&g),
+            &["-y".into(), "mcp-remote@0.15.1".into()],
+        )
+        .unwrap();
         assert!(r.allow_write.contains(&"~/.mcp-auth".to_string()));
     }
 
@@ -574,28 +734,66 @@ mod tests {
     fn faute_de_frappe_refusee_au_lieu_de_retirer_l_isolation() {
         assert!(resolve("a", &json!({"sandbox": "sheild"}), None, "npx", &[]).is_err());
         assert!(resolve("a", &json!({}), Some(&json!("stirct")), "npx", &[]).is_err());
-        assert!(resolve("a", &json!({"sandbox": {"mode": "shield", "allowWrites": ["~/x"]}}), None, "npx", &[]).is_err());
-        assert!(resolve("a", &json!({"sandbox": {"network": "no"}}), None, "npx", &[]).is_err());
+        assert!(resolve(
+            "a",
+            &json!({"sandbox": {"mode": "shield", "allowWrites": ["~/x"]}}),
+            None,
+            "npx",
+            &[]
+        )
+        .is_err());
+        assert!(resolve(
+            "a",
+            &json!({"sandbox": {"network": "no"}}),
+            None,
+            "npx",
+            &[]
+        )
+        .is_err());
         assert!(resolve("a", &json!({"sandbox": 1}), None, "npx", &[]).is_err());
     }
 
     #[test]
     fn profil_bouclier_et_exceptions() {
-        let spec = SandboxSpec { mode: SandboxMode::Shield, network: true, allow_read: vec![], allow_write: vec![], allow_exec: vec![] };
+        let spec = SandboxSpec {
+            mode: SandboxMode::Shield,
+            network: true,
+            allow_read: vec![],
+            allow_write: vec![],
+            allow_exec: vec![],
+            run_if_unavailable: false,
+        };
         let env = HashMap::from([("KEY".to_string(), "/Users/a/.private_keys/k.p8".to_string())]);
         let refs = referenced_paths(&env, &["--file=/Users/a/doc.txt".into()], "/Users/a");
         assert!(refs.contains(&"/Users/a/.private_keys/k.p8".to_string()));
-        assert!(!refs.contains(&"/Users/a/doc.txt".to_string()), "pas besoin, deja lisible");
+        assert!(
+            !refs.contains(&"/Users/a/doc.txt".to_string()),
+            "pas besoin, deja lisible"
+        );
         // Un dossier parent d'un secret ne rouvre jamais le bouclier.
-        for evil in ["~", "/Users/a", "/Users", "/", "~/.config", "/Users/a/.ssh", "/Users/a/.ssh/../.ssh/id_rsa"] {
+        for evil in [
+            "~",
+            "/Users/a",
+            "/Users",
+            "/",
+            "~/.config",
+            "/Users/a/.ssh",
+            "/Users/a/.ssh/../.ssh/id_rsa",
+        ] {
             let env = HashMap::from([("W".to_string(), evil.to_string())]);
-            assert!(referenced_paths(&env, &[], "/Users/a").is_empty(), "{}", evil);
+            assert!(
+                referenced_paths(&env, &[], "/Users/a").is_empty(),
+                "{}",
+                evil
+            );
         }
         let p = profile(&spec, "/Users/a", &refs);
         assert!(p.contains("(deny file-read* file-write* (subpath \"/Users/a/.ssh\")"));
         assert!(p.contains("(deny process-exec (literal \"/usr/bin/security\")"));
         let deny_at = p.find("(deny file-read*").unwrap();
-        let allow_at = p.find("(allow file-read* (subpath \"/Users/a/.private_keys/k.p8\")").unwrap();
+        let allow_at = p
+            .find("(allow file-read* (subpath \"/Users/a/.private_keys/k.p8\")")
+            .unwrap();
         assert!(allow_at > deny_at, "l'exception doit suivre l'interdiction");
         assert!(!p.contains("(deny file-write*)\n"));
         assert!(!p.contains("network-outbound"));
@@ -603,11 +801,21 @@ mod tests {
 
     #[test]
     fn profil_strict() {
-        let spec = SandboxSpec { mode: SandboxMode::Strict, network: false, allow_read: vec![], allow_write: vec!["~/out".into(), "~".into()], allow_exec: vec!["open".into()] };
+        let spec = SandboxSpec {
+            mode: SandboxMode::Strict,
+            network: false,
+            allow_read: vec![],
+            allow_write: vec!["~/out".into(), "~".into()],
+            allow_exec: vec!["open".into()],
+            run_if_unavailable: false,
+        };
         let p = profile(&spec, "/Users/a", &[]);
         assert!(p.contains("(deny file-write*)\n"));
         assert!(p.contains("(deny network*)"));
-        assert!(!p.contains("(subpath \"/Users/a\"))"), "~ ne doit pas etre rouvert");
+        assert!(
+            !p.contains("(subpath \"/Users/a\"))"),
+            "~ ne doit pas etre rouvert"
+        );
         assert!(!p.contains("/usr/bin/open"));
         assert!(p.contains("(allow file-read* file-write* (subpath \"/Users/a/out\"))"));
     }
@@ -620,10 +828,21 @@ mod tests {
         std::fs::create_dir_all(home.join(".mcp-auth")).unwrap();
         std::fs::write(home.join(".netrc"), "x").unwrap();
         std::fs::write(home.join(".ssh/deploy.p8"), "k").unwrap();
-        let shield = SandboxSpec { mode: SandboxMode::Shield, network: false, allow_read: vec![], allow_write: vec!["~/.mcp-auth".into()], allow_exec: vec![] };
+        let shield = SandboxSpec {
+            mode: SandboxMode::Shield,
+            network: false,
+            allow_read: vec![],
+            allow_write: vec!["~/.mcp-auth".into()],
+            allow_exec: vec![],
+            run_if_unavailable: false,
+        };
         let key = format!("{}/.ssh/deploy.p8", h);
         let a = bwrap_args(&shield, &h, std::slice::from_ref(&key)).join(" ");
-        assert!(a.starts_with("--die-with-parent --new-session --dev-bind / /"), "{}", a);
+        assert!(
+            a.starts_with("--die-with-parent --new-session --dev-bind / /"),
+            "{}",
+            a
+        );
         assert!(a.contains(&format!("--tmpfs {}/.ssh", h)));
         assert!(a.contains(&format!("{}/.netrc", h)) && a.contains("mcphub-empty-"));
         let tmpfs_at = a.find(&format!("--tmpfs {}/.ssh", h)).unwrap();
@@ -631,11 +850,21 @@ mod tests {
         assert!(key_at > tmpfs_at, "l'exception suit le masquage");
         assert!(a.contains(&format!("--bind {0}/.mcp-auth {0}/.mcp-auth", h)));
         assert!(a.ends_with("--unshare-net"));
-        let strict = SandboxSpec { mode: SandboxMode::Strict, network: true, allow_read: vec![], allow_write: vec!["~".into()], allow_exec: vec![] };
+        let strict = SandboxSpec {
+            mode: SandboxMode::Strict,
+            network: true,
+            allow_read: vec![],
+            allow_write: vec!["~".into()],
+            allow_exec: vec![],
+            run_if_unavailable: false,
+        };
         let b = bwrap_args(&strict, &h, &[]).join(" ");
         assert!(b.contains("--ro-bind / / --dev /dev --proc /proc"));
         assert!(b.contains("--bind /tmp /tmp"));
-        assert!(!b.contains(&format!("--bind {0} {0} ", h)), "~ ne doit jamais etre rouvert");
+        assert!(
+            !b.contains(&format!("--bind {0} {0} ", h)),
+            "~ ne doit jamais etre rouvert"
+        );
         assert!(!b.contains("--unshare-net"));
         let _ = std::fs::remove_dir_all(&home);
     }

@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/Soflutionltd/McpHub/releases/latest"><img src="https://img.shields.io/github/v/release/Soflutionltd/McpHub?color=F5B301&label=release" alt="Latest release"/></a>
-  <img src="https://img.shields.io/badge/MCP-2026--07--28-2563EB" alt="MCP 2026-07-28"/>
+  <img src="https://img.shields.io/badge/MCP-2025--11--25-2563EB" alt="MCP 2025-11-25"/>
   <img src="https://img.shields.io/badge/written%20in-Rust-B7410E?logo=rust&logoColor=white" alt="Rust"/>
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-0F172A?logo=apple" alt="macOS and Linux"/>
   <img src="https://img.shields.io/badge/license-MIT-16A34A" alt="MIT"/>
@@ -191,9 +191,9 @@ Use `http://127.0.0.1:24680/sse` with the same `Authorization` header.
 - `mcphub_bootstrap`: call once per conversation. Resolves the project from the workspace, returns its aliases and allowed servers, and recalls compact [MemoryPilot](https://github.com/Soflutionltd/MemoryPilot) context, also for folders without a project entry.
 - `mcphub_search`, `mcphub_call`: same as the daemon, plus suggestions on a misspelled tool or server, and the input schema on argument errors.
 - `mcphub_batch`: up to 20 independent calls in one round-trip. A JSON result is embedded as JSON (not as an escaped string), with a `notes` array when it was shaped.
-- Lighter results, on `mcphub_call` and on each call of `mcphub_batch`: a successful JSON result comes back compact, without its `null` and empty-string fields (empty arrays stay). `fields` keeps only the listed keys of each row, `max_rows` keeps the first rows (rows are the root array, or an array of objects held by a root key), `max_chars` cuts the text (default 60000, or `MCPHUB_RESULT_MAX_CHARS`), and `format: "toon"` writes the JSON as [TOON](https://github.com/toon-format/toon) (each list of rows as one header line plus one line per row), and `raw: true` returns the child result untouched. A cut result says how to read the rest: `mcphub_call` with server `mcphub`, tool `read_result`, arguments `{ handle, offset, length }`; the client keeps the last 16 cut results in memory. A result holding a number of 16 digits or more, or an exponent, is never rewritten. Errors and confirmation requests are never touched. Agents are told about `fields` and `max_rows` three ways: the server instructions sent at startup, the `mcphub_call` description, and a one-line reminder appended to a list result of 8000 characters or more that used neither.
+- Lighter results, on `mcphub_call` and on each call of `mcphub_batch`: a successful JSON result comes back compact, without its `null` and empty-string fields (empty arrays stay). `fields` keeps only the listed keys of each row, `max_rows` keeps the first rows (rows are the root array, or an array of objects held by a root key), `max_chars` cuts the text (default 60000, or `MCPHUB_RESULT_MAX_CHARS`), and `format: "toon"` writes the JSON as [TOON](https://github.com/toon-format/toon) (each list of rows as one header line plus one line per row), `format: "csv"` writes a plain list of rows as one header line and one line per row (the most compact when rows are flat), and `raw: true` returns the child result untouched. A text result loses its terminal noise: colour codes, progress bars redrawn in place, and a line of twenty characters or more repeated five times or more in a row is kept once with its count; anything else comes back as it was, short repeated lines and JSON that McpHub does not rewrite included. A cut result says how to go on without reading it all: `mcphub_call` with server `mcphub`, tool `search_result`, arguments `{ handle, query, context, max_matches }` returns only the passages that hold the words, each with its position, and tool `read_result`, arguments `{ handle, offset, length }` reads on from a position; the client keeps the last 16 cut results in memory. A result holding a number of 16 digits or more, or an exponent, is never rewritten. Errors and confirmation requests are never touched. Agents are told about `fields` and `max_rows` three ways: the server instructions sent at startup, the `mcphub_call` description, and a one-line reminder appended to a list result of 8000 characters or more that used neither.
 - `mcphub_run`: the daemon's code mode. A script chains several tool calls in the sandbox and only its final value comes back. The project rules (`allowedServers`, owned servers, the pinned Supabase, App Store and Cloudflare identifiers) are handed to the daemon, which applies them to every `mcp.call`; a daemon too old to do so is never given a script from a folder that has rules.
-- `mcphub_status`, `mcphub_savings`: server health and an honest context-size comparison.
+- `mcphub_status`, `mcphub_savings`: server health and an honest context-size comparison. `mcphub_savings` also counts code mode: scripts run, tool calls made inside them, round trips saved. It lists each server with its calls and the result bytes it sent to the agent, heaviest first.
 
 Per-project policy lives in `~/.McpHub/projects.json` (or the path in `MCPHUB_PROJECTS`), see [`client/projects.example.json`](client/projects.example.json). For a workspace listed there, only its `allowedServers` are reachable (`["*"]` opens every server and keeps the identifier checks), and a call aimed at another Supabase project, App Store app or Cloudflare project is refused. Without the file there is no policy; an unreadable file is an error, never silently ignored.
 
@@ -326,7 +326,7 @@ return unhealthy.map(p => p.name);
 ```
 
 - `mcp.call(server, tool, args)` returns the tool result, `mcp.search(query)` finds tools, `console.log` is captured.
-- The program runs in a separate Node.js process (22.13 or newer) started with `--permission`: no files, no network, no subprocesses, inside a macOS sandbox.
+- The program runs in a separate Node.js process (22.13 or newer) started with `--permission`: no files, no network, no subprocesses, inside a macOS sandbox. Code mode needs Node and is macOS only for now: without `sandbox-exec` (Linux, Windows) `mcphub_run` is refused.
 - Its only way out is `mcp.call`, which goes through every McpHub guard (permissions, quarantine, profiles, audit).
 - Limits: `settings.codeMode` → `{ "timeoutSecs": 60, "maxCalls": 100 }`, output capped at 1 MB.
 
@@ -604,6 +604,8 @@ Everything lives in `~/.McpHub/config.json` and is hot-reloaded while the daemon
 }
 ```
 
+Servers named in `settings.preload` (`"auto"`, `"all"` or a list) are started with the daemon and are not stopped when idle, so their next call never waits for a cold start; set `"keepPreloadedWarm": false` to let `idleTimeout` stop them too. A start that fails for a reason time does not fix (refused or expired sign-in, program not found) is reported at once instead of being tried three times.
+
 ### Per-server options
 
 | Option | Effect |
@@ -678,7 +680,7 @@ Files: `~/.McpHub/` (config, cache, pins, audit log, token; `~/.McpHub-<name>/` 
 <details>
 <summary><b>Does it work with any MCP server?</b></summary>
 
-Yes: any stdio server (`command` + `args`) and any Streamable HTTP server (`url`). Tool annotations, output schemas, paginated tool lists and protocol versions up to 2026-07-28 are relayed.
+Tools, yes: any stdio server (`command` + `args`) and any Streamable HTTP server (`url`). Tool annotations, output schemas, paginated tool lists and protocol versions up to 2025-11-25 are relayed; the 2026-07-28 revision (no `initialize`, `server/discover`) is not implemented yet. Requests a server sends back to the client, sampling and elicitation, are refused.
 
 </details>
 

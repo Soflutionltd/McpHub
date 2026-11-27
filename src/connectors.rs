@@ -102,7 +102,9 @@ pub fn for_var(var: &str) -> Option<&'static KeyConnector> {
 fn pct(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => (b as char).to_string(),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
             _ => format!("%{:02X}", b),
         })
         .collect()
@@ -131,7 +133,10 @@ pub fn create_url(connector: &KeyConnector, name: &str) -> String {
             )
         }
         "github" => {
-            let perms: String = GITHUB_PERMISSIONS.iter().map(|(p, level)| format!("&{}={}", p, level)).collect();
+            let perms: String = GITHUB_PERMISSIONS
+                .iter()
+                .map(|(p, level)| format!("&{}={}", p, level))
+                .collect();
             format!(
                 "https://github.com/settings/personal-access-tokens/new?name={}&description={}&expires_in=366{}",
                 pct(name),
@@ -146,10 +151,16 @@ pub fn create_url(connector: &KeyConnector, name: &str) -> String {
 /// Contrôle de forme avant tout appel réseau (jeton tronqué, mauvais champ copié).
 pub fn check_format(connector: &KeyConnector, value: &str) -> Result<(), String> {
     if value.len() < 20 || value.len() > 512 {
-        return Err(format!("this does not look like a {} token (length)", connector.label));
+        return Err(format!(
+            "this does not look like a {} token (length)",
+            connector.label
+        ));
     }
     if !value.chars().all(|c| c.is_ascii_graphic()) {
-        return Err(format!("this does not look like a {} token (spaces or special characters)", connector.label));
+        return Err(format!(
+            "this does not look like a {} token (spaces or special characters)",
+            connector.label
+        ));
     }
     let prefixes: &[&str] = match connector.id {
         "github" => &["github_pat_", "ghp_", "gho_", "ghu_"],
@@ -157,7 +168,10 @@ pub fn check_format(connector: &KeyConnector, value: &str) -> Result<(), String>
         _ => &[],
     };
     if !prefixes.is_empty() && !prefixes.iter().any(|p| value.starts_with(p)) {
-        return Err(format!("this is not a {} token (expected {}...)", connector.label, prefixes[0]));
+        return Err(format!(
+            "this is not a {} token (expected {}...)",
+            connector.label, prefixes[0]
+        ));
     }
     Ok(())
 }
@@ -197,14 +211,24 @@ struct ApiReply {
 
 /// Lecture d'une réponse JSON de l'API officielle du service (adresse fixe, jamais fournie
 /// par l'appelant).
-async fn api_get(connector: &KeyConnector, url: &str, token: &str) -> Result<ApiReply, VerifyError> {
+async fn api_get(
+    connector: &KeyConnector,
+    url: &str,
+    token: &str,
+) -> Result<ApiReply, VerifyError> {
     let r = http()
         .get(url)
         .bearer_auth(token)
         .header("Accept", "application/json")
         .send()
         .await
-        .map_err(|e| VerifyError::Unreachable(format!("{} unreachable: {}", connector.label, e.without_url())))?;
+        .map_err(|e| {
+            VerifyError::Unreachable(format!(
+                "{} unreachable: {}",
+                connector.label,
+                e.without_url()
+            ))
+        })?;
     let status = r.status().as_u16();
     let github_expiration = r
         .headers()
@@ -212,7 +236,11 @@ async fn api_get(connector: &KeyConnector, url: &str, token: &str) -> Result<Api
         .and_then(|v| v.to_str().ok())
         .map(String::from);
     let body = r.json::<Value>().await.unwrap_or(Value::Null);
-    Ok(ApiReply { status, body, github_expiration })
+    Ok(ApiReply {
+        status,
+        body,
+        github_expiration,
+    })
 }
 
 /// Interprète la liste des comptes Cloudflare vus par le jeton.
@@ -228,7 +256,11 @@ fn cloudflare_accounts(status: u16, body: &Value) -> Result<Verified, VerifyErro
             a.iter()
                 .filter_map(|acc| {
                     let id = acc.get("id")?.as_str()?.to_string();
-                    let name = acc.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                    let name = acc
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     Some((id, name))
                 })
                 .collect()
@@ -236,7 +268,8 @@ fn cloudflare_accounts(status: u16, body: &Value) -> Result<Verified, VerifyErro
         .unwrap_or_default();
     match accounts.as_slice() {
         [] => Err(VerifyError::Refused(
-            "the token is valid but sees no account: add the Account Settings Read permission".into(),
+            "the token is valid but sees no account: add the Account Settings Read permission"
+                .into(),
         )),
         [(id, name)] => Ok(Verified {
             account_id: Some(id.clone()),
@@ -245,7 +278,11 @@ fn cloudflare_accounts(status: u16, body: &Value) -> Result<Verified, VerifyErro
         }),
         many => Ok(Verified {
             account_id: None,
-            detail: format!("{} Cloudflare accounts: set {} by hand", many.len(), CLOUDFLARE_ACCOUNT_VAR),
+            detail: format!(
+                "{} Cloudflare accounts: set {} by hand",
+                many.len(),
+                CLOUDFLARE_ACCOUNT_VAR
+            ),
             expires_at: None,
         }),
     }
@@ -254,9 +291,17 @@ fn cloudflare_accounts(status: u16, body: &Value) -> Result<Verified, VerifyErro
 /// Échéance d'un jeton Cloudflare (`/tokens/verify`) ; un jeton inactif est refusé.
 fn cloudflare_expiry(body: &Value) -> Result<Option<u64>, VerifyError> {
     let result = body.get("result");
-    match result.and_then(|r| r.get("status")).and_then(|s| s.as_str()) {
+    match result
+        .and_then(|r| r.get("status"))
+        .and_then(|s| s.as_str())
+    {
         Some("active") | None => {}
-        Some(other) => return Err(VerifyError::Refused(format!("Cloudflare reports this token as {}", other))),
+        Some(other) => {
+            return Err(VerifyError::Refused(format!(
+                "Cloudflare reports this token as {}",
+                other
+            )))
+        }
     }
     Ok(result
         .and_then(|r| r.get("expires_on"))
@@ -272,12 +317,20 @@ pub async fn verify(connector: &KeyConnector, token: &str) -> Result<Verified, V
     };
     let out = match connector.id {
         "cloudflare" => {
-            let r = api_get(connector, "https://api.cloudflare.com/client/v4/accounts?per_page=50", token).await?;
+            let r = api_get(
+                connector,
+                "https://api.cloudflare.com/client/v4/accounts?per_page=50",
+                token,
+            )
+            .await?;
             let mut verified = cloudflare_accounts(r.status, &r.body)?;
             // Échéance : route de vérification du jeton de compte, sinon celle du jeton d'utilisateur.
             let mut urls = Vec::new();
             if let Some(id) = &verified.account_id {
-                urls.push(format!("https://api.cloudflare.com/client/v4/accounts/{}/tokens/verify", id));
+                urls.push(format!(
+                    "https://api.cloudflare.com/client/v4/accounts/{}/tokens/verify",
+                    id
+                ));
             }
             urls.push("https://api.cloudflare.com/client/v4/user/tokens/verify".to_string());
             for url in urls {
@@ -298,7 +351,10 @@ pub async fn verify(connector: &KeyConnector, token: &str) -> Result<Verified, V
                 Some(login) if r.status == 200 => Ok(Verified {
                     account_id: None,
                     detail: format!("GitHub account {}", login),
-                    expires_at: r.github_expiration.as_deref().and_then(crate::token_watch::parse_datetime),
+                    expires_at: r
+                        .github_expiration
+                        .as_deref()
+                        .and_then(crate::token_watch::parse_datetime),
                 }),
                 _ => Err(VerifyError::Refused("GitHub refused this token".into())),
             }
@@ -374,18 +430,23 @@ pub fn describe(var: &str, tenant: Option<&str>) -> Value {
 /// Code Mode Cloudflare : écriture sur ce qu'un agent déploie (Workers, Pages, D1, KV, R2,
 /// DNS), plus `offline_access` pour le renouvellement. Sans liste, le serveur n'annonce que
 /// `user:read account:read` et la connexion reste en lecture seule.
-const CLOUDFLARE_OAUTH_SCOPES: &str = "offline_access user:read account:read account-settings.read \
+const CLOUDFLARE_OAUTH_SCOPES: &str =
+    "offline_access user:read account:read account-settings.read \
 workers-scripts.write workers-kv-storage.write workers-r2.write workers-routes.write d1.write \
 page.write queues.write vectorize.write ai.write containers.write workers-observability.read \
 workers-tail.read dns.write zone.read zone-settings.write ssl-and-certificates.write cache.purge";
 
-const SUPABASE_OAUTH_SCOPES: &str = "organizations:read projects:read projects:write database:read \
+const SUPABASE_OAUTH_SCOPES: &str =
+    "organizations:read projects:read projects:write database:read \
 database:write analytics:read secrets:read edge_functions:read edge_functions:write \
 environment:read environment:write storage:read storage:write";
 
 /// Scopes à demander pour un serveur MCP distant connu, sinon ceux qu'il annonce.
 pub fn oauth_scope(url: &str) -> Option<&'static str> {
-    let host = reqwest::Url::parse(url).ok()?.host_str()?.to_ascii_lowercase();
+    let host = reqwest::Url::parse(url)
+        .ok()?
+        .host_str()?
+        .to_ascii_lowercase();
     match host.as_str() {
         "mcp.cloudflare.com" => Some(CLOUDFLARE_OAUTH_SCOPES),
         "mcp.supabase.com" => Some(SUPABASE_OAUTH_SCOPES),
@@ -396,7 +457,10 @@ pub fn oauth_scope(url: &str) -> Option<&'static str> {
 // ─── GitHub : code d'appareil ────────────────────────────────
 
 fn valid_client_id(id: &str) -> bool {
-    (8..=64).contains(&id.len()) && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    (8..=64).contains(&id.len())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
 }
 
 /// Identifiant public de l'app GitHub de l'éditeur : fixé à la compilation
@@ -435,20 +499,37 @@ pub async fn github_device_start(client_id: &str) -> Result<DeviceStart, String>
         .send()
         .await
         .map_err(|e| format!("GitHub unreachable: {}", e.without_url()))?;
-    let v: Value = r.json().await.map_err(|e| format!("GitHub: unexpected answer ({})", e))?;
+    let v: Value = r
+        .json()
+        .await
+        .map_err(|e| format!("GitHub: unexpected answer ({})", e))?;
     let get = |k: &str| v.get(k).and_then(|x| x.as_str()).map(String::from);
-    match (get("device_code"), get("user_code"), get("verification_uri")) {
-        (Some(device_code), Some(user_code), Some(uri)) if uri.starts_with("https://github.com/") => Ok(DeviceStart {
-            user_code,
-            verification_uri: uri,
-            expires_in: v.get("expires_in").and_then(|x| x.as_u64()).unwrap_or(900),
-            device_code,
-            interval: v.get("interval").and_then(|x| x.as_u64()).unwrap_or(5).max(1),
-            client_id: client_id.to_string(),
-        }),
+    match (
+        get("device_code"),
+        get("user_code"),
+        get("verification_uri"),
+    ) {
+        (Some(device_code), Some(user_code), Some(uri))
+            if uri.starts_with("https://github.com/") =>
+        {
+            Ok(DeviceStart {
+                user_code,
+                verification_uri: uri,
+                expires_in: v.get("expires_in").and_then(|x| x.as_u64()).unwrap_or(900),
+                device_code,
+                interval: v
+                    .get("interval")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(5)
+                    .max(1),
+                client_id: client_id.to_string(),
+            })
+        }
         _ => Err(format!(
             "GitHub refused the device sign-in: {}",
-            get("error_description").or_else(|| get("error")).unwrap_or_else(|| "no code returned".into())
+            get("error_description")
+                .or_else(|| get("error"))
+                .unwrap_or_else(|| "no code returned".into())
         )),
     }
 }
@@ -477,7 +558,8 @@ fn parse_device_poll(v: &Value) -> DevicePoll {
 
 /// Attend l'autorisation sur GitHub et renvoie le jeton.
 pub async fn github_device_wait(start: DeviceStart) -> Result<String, String> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(start.expires_in.min(1800));
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(start.expires_in.min(1800));
     let mut interval = start.interval;
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
@@ -520,7 +602,9 @@ pub enum DeviceState {
 
 fn device_states() -> std::sync::MutexGuard<'static, HashMap<String, DeviceState>> {
     static S: OnceLock<Mutex<HashMap<String, DeviceState>>> = OnceLock::new();
-    S.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner())
+    S.get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 pub fn device_set(id: &str, state: DeviceState) {
@@ -558,14 +642,21 @@ fn parse_local_state(app: &str, raw: &str) -> Vec<BrowserProfile> {
     let Ok(v) = serde_json::from_str::<Value>(raw) else {
         return Vec::new();
     };
-    let Some(cache) = v.get("profile").and_then(|p| p.get("info_cache")).and_then(|c| c.as_object()) else {
+    let Some(cache) = v
+        .get("profile")
+        .and_then(|p| p.get("info_cache"))
+        .and_then(|c| c.as_object())
+    else {
         return Vec::new();
     };
     let mut out: Vec<BrowserProfile> = cache
         .iter()
         .map(|(dir, info)| {
             let label = info.get("name").and_then(|n| n.as_str()).unwrap_or(dir);
-            let account = info.get("user_name").and_then(|n| n.as_str()).filter(|u| !u.is_empty());
+            let account = info
+                .get("user_name")
+                .and_then(|n| n.as_str())
+                .filter(|u| !u.is_empty());
             BrowserProfile {
                 app: app.to_string(),
                 dir: dir.clone(),
@@ -587,8 +678,13 @@ pub fn browser_profiles() -> Vec<BrowserProfile> {
     BROWSERS
         .iter()
         .flat_map(|(app, dir)| {
-            let path = home.join("Library/Application Support").join(dir).join("Local State");
-            std::fs::read_to_string(path).map(|raw| parse_local_state(app, &raw)).unwrap_or_default()
+            let path = home
+                .join("Library/Application Support")
+                .join(dir)
+                .join("Local State");
+            std::fs::read_to_string(path)
+                .map(|raw| parse_local_state(app, &raw))
+                .unwrap_or_default()
         })
         .collect()
 }
@@ -608,13 +704,17 @@ pub fn open_url(url: &str, profile: Option<&BrowserProfile>) -> Result<(), Strin
         let mut cmd = std::process::Command::new("/usr/bin/open");
         match profile {
             Some(p) => {
-                cmd.args(["-na", &p.app, "--args"]).arg(format!("--profile-directory={}", p.dir)).arg(url);
+                cmd.args(["-na", &p.app, "--args"])
+                    .arg(format!("--profile-directory={}", p.dir))
+                    .arg(url);
             }
             None => {
                 cmd.arg(url);
             }
         }
-        cmd.spawn().map(|_| ()).map_err(|e| format!("cannot open the browser: {}", e))
+        cmd.spawn()
+            .map(|_| ())
+            .map_err(|e| format!("cannot open the browser: {}", e))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -634,15 +734,24 @@ pub fn tenant_browser(projects: &Value, tenant: &str) -> Option<BrowserProfile> 
         .get("browser")?;
     let app = pref.get("app")?.as_str()?;
     let dir = pref.get("profile")?.as_str()?;
-    browser_profiles().into_iter().find(|p| p.app == app && p.dir == dir)
+    browser_profiles()
+        .into_iter()
+        .find(|p| p.app == app && p.dir == dir)
 }
 
 /// Enregistre (ou retire avec `None`) le profil de navigateur d'un tenant dans projects.json.
-pub fn set_tenant_browser(json: &mut Value, tenant: &str, profile: Option<&BrowserProfile>) -> Result<(), String> {
+pub fn set_tenant_browser(
+    json: &mut Value,
+    tenant: &str,
+    profile: Option<&BrowserProfile>,
+) -> Result<(), String> {
     let entry = json
         .get_mut("projects")
         .and_then(|p| p.as_object_mut())
-        .and_then(|p| p.values_mut().find(|p| p.get("tenant").and_then(|t| t.as_str()) == Some(tenant)))
+        .and_then(|p| {
+            p.values_mut()
+                .find(|p| p.get("tenant").and_then(|t| t.as_str()) == Some(tenant))
+        })
         .and_then(|p| p.as_object_mut())
         .ok_or_else(|| format!("tenant {} inconnu", tenant))?;
     match profile {
@@ -662,16 +771,30 @@ mod tests {
 
     #[test]
     fn connecteur_par_variable() {
-        assert_eq!(for_var("CLOUDFLARE_MCP_TOKEN").map(|c| c.id), Some("cloudflare"));
-        assert_eq!(for_var("GITHUB_PERSONAL_ACCESS_TOKEN").map(|c| c.id), Some("github"));
-        assert_eq!(for_var("SUPABASE_ACCESS_TOKEN").map(|c| c.id), Some("supabase"));
+        assert_eq!(
+            for_var("CLOUDFLARE_MCP_TOKEN").map(|c| c.id),
+            Some("cloudflare")
+        );
+        assert_eq!(
+            for_var("GITHUB_PERSONAL_ACCESS_TOKEN").map(|c| c.id),
+            Some("github")
+        );
+        assert_eq!(
+            for_var("SUPABASE_ACCESS_TOKEN").map(|c| c.id),
+            Some("supabase")
+        );
         assert!(for_var("CLOUDFLARE_ACCOUNT_ID").is_none());
     }
 
     #[test]
     fn lien_cloudflare_pre_rempli() {
-        let url = create_url(for_var("CLOUDFLARE_API_TOKEN").unwrap(), &token_name(Some("acme")));
-        assert!(url.starts_with("https://dash.cloudflare.com/?to=/:account/api-tokens&permissionGroupKeys=%5B%7B"));
+        let url = create_url(
+            for_var("CLOUDFLARE_API_TOKEN").unwrap(),
+            &token_name(Some("acme")),
+        );
+        assert!(url.starts_with(
+            "https://dash.cloudflare.com/?to=/:account/api-tokens&permissionGroupKeys=%5B%7B"
+        ));
         assert!(url.contains("%22workers_scripts%22%2C%22type%22%3A%22edit%22"));
         assert!(url.ends_with("&name=McpHub%20%28acme%29"));
     }
@@ -679,7 +802,9 @@ mod tests {
     #[test]
     fn lien_github_pre_rempli() {
         let url = create_url(for_var("GITHUB_TOKEN").unwrap(), "McpHub");
-        assert!(url.starts_with("https://github.com/settings/personal-access-tokens/new?name=McpHub&"));
+        assert!(
+            url.starts_with("https://github.com/settings/personal-access-tokens/new?name=McpHub&")
+        );
         assert!(url.contains("&expires_in=366&administration=write&contents=write"));
     }
 
@@ -697,61 +822,114 @@ mod tests {
     #[test]
     fn comptes_cloudflare() {
         let one = json!({"success": true, "result": [{"id": "abc123", "name": "Acme"}]});
-        assert_eq!(cloudflare_accounts(200, &one).unwrap().account_id.as_deref(), Some("abc123"));
+        assert_eq!(
+            cloudflare_accounts(200, &one)
+                .unwrap()
+                .account_id
+                .as_deref(),
+            Some("abc123")
+        );
         let two = json!({"success": true, "result": [{"id": "a", "name": "A"}, {"id": "b", "name": "B"}]});
         assert_eq!(cloudflare_accounts(200, &two).unwrap().account_id, None);
         let none = json!({"success": true, "result": []});
-        assert!(matches!(cloudflare_accounts(200, &none), Err(VerifyError::Refused(_))));
+        assert!(matches!(
+            cloudflare_accounts(200, &none),
+            Err(VerifyError::Refused(_))
+        ));
         let refused = json!({"success": false, "errors": [{"code": 1000}]});
-        assert!(matches!(cloudflare_accounts(403, &refused), Err(VerifyError::Refused(_))));
+        assert!(matches!(
+            cloudflare_accounts(403, &refused),
+            Err(VerifyError::Refused(_))
+        ));
     }
 
     #[test]
     fn echeance_cloudflare() {
         let active = json!({"success": true, "result": {"status": "active", "expires_on": "2027-01-01T00:00:00Z"}});
-        assert_eq!(cloudflare_expiry(&active), Ok(crate::token_watch::parse_datetime("2027-01-01T00:00:00Z")));
+        assert_eq!(
+            cloudflare_expiry(&active),
+            Ok(crate::token_watch::parse_datetime("2027-01-01T00:00:00Z"))
+        );
         let forever = json!({"success": true, "result": {"status": "active"}});
         assert_eq!(cloudflare_expiry(&forever), Ok(None));
         let expired = json!({"success": true, "result": {"status": "expired"}});
-        assert!(matches!(cloudflare_expiry(&expired), Err(VerifyError::Refused(_))));
+        assert!(matches!(
+            cloudflare_expiry(&expired),
+            Err(VerifyError::Refused(_))
+        ));
     }
 
     #[test]
     fn ecritures_prevues() {
         let cf = for_var("CLOUDFLARE_API_TOKEN");
         let mut slots: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        slots.insert("CLOUDFLARE_API_TOKEN".into(), ["CLOUDFLARE_API_TOKEN".to_string()].into());
-        slots.insert("CLOUDFLARE_MCP_TOKEN".into(), ["CLOUDFLARE_MCP_TOKEN".to_string()].into());
-        slots.insert(CLOUDFLARE_ACCOUNT_VAR.into(), ["CLOUDFLARE_ACCOUNT_ID".to_string()].into());
+        slots.insert(
+            "CLOUDFLARE_API_TOKEN".into(),
+            ["CLOUDFLARE_API_TOKEN".to_string()].into(),
+        );
+        slots.insert(
+            "CLOUDFLARE_MCP_TOKEN".into(),
+            ["CLOUDFLARE_MCP_TOKEN".to_string()].into(),
+        );
+        slots.insert(
+            CLOUDFLARE_ACCOUNT_VAR.into(),
+            ["CLOUDFLARE_ACCOUNT_ID".to_string()].into(),
+        );
         let present: BTreeSet<String> = ["CLOUDFLARE_MCP_TOKEN".to_string()].into();
         let writes = plan_writes("CLOUDFLARE_API_TOKEN", cf, Some("abc"), &slots, &present);
         assert_eq!(
             writes,
             vec![
                 ("CLOUDFLARE_API_TOKEN".to_string(), Fill::Token),
-                ("CLOUDFLARE_ACCOUNT_ID".to_string(), Fill::AccountId("abc".into())),
+                (
+                    "CLOUDFLARE_ACCOUNT_ID".to_string(),
+                    Fill::AccountId("abc".into())
+                ),
             ]
         );
         // Un secret inconnu des connecteurs ne remplit que lui-même.
-        assert_eq!(plan_writes("AUTRE", None, None, &slots, &present), vec![("AUTRE".to_string(), Fill::Token)]);
+        assert_eq!(
+            plan_writes("AUTRE", None, None, &slots, &present),
+            vec![("AUTRE".to_string(), Fill::Token)]
+        );
     }
 
     #[test]
     fn scopes_oauth_par_service() {
-        assert!(oauth_scope("https://mcp.cloudflare.com/mcp").unwrap().contains("workers-scripts.write"));
-        assert!(oauth_scope("https://mcp.cloudflare.com/mcp").unwrap().starts_with("offline_access"));
+        assert!(oauth_scope("https://mcp.cloudflare.com/mcp")
+            .unwrap()
+            .contains("workers-scripts.write"));
+        assert!(oauth_scope("https://mcp.cloudflare.com/mcp")
+            .unwrap()
+            .starts_with("offline_access"));
         // Nom refusé par Cloudflare (« Unknown OAuth scope ») : le bon est page.write.
-        assert!(!oauth_scope("https://mcp.cloudflare.com/mcp").unwrap().contains("pages.write"));
-        assert!(oauth_scope("https://mcp.supabase.com/mcp?project_ref=x").unwrap().contains("database:write"));
+        assert!(!oauth_scope("https://mcp.cloudflare.com/mcp")
+            .unwrap()
+            .contains("pages.write"));
+        assert!(oauth_scope("https://mcp.supabase.com/mcp?project_ref=x")
+            .unwrap()
+            .contains("database:write"));
         assert!(oauth_scope("https://mcp.stripe.com").is_none());
     }
 
     #[test]
     fn reponses_du_code_d_appareil() {
-        assert_eq!(parse_device_poll(&json!({"access_token": "ghu_x"})), DevicePoll::Token("ghu_x".into()));
-        assert_eq!(parse_device_poll(&json!({"error": "authorization_pending"})), DevicePoll::Wait { slow_down: false });
-        assert_eq!(parse_device_poll(&json!({"error": "slow_down"})), DevicePoll::Wait { slow_down: true });
-        assert!(matches!(parse_device_poll(&json!({"error": "access_denied"})), DevicePoll::Failed(_)));
+        assert_eq!(
+            parse_device_poll(&json!({"access_token": "ghu_x"})),
+            DevicePoll::Token("ghu_x".into())
+        );
+        assert_eq!(
+            parse_device_poll(&json!({"error": "authorization_pending"})),
+            DevicePoll::Wait { slow_down: false }
+        );
+        assert_eq!(
+            parse_device_poll(&json!({"error": "slow_down"})),
+            DevicePoll::Wait { slow_down: true }
+        );
+        assert!(matches!(
+            parse_device_poll(&json!({"error": "access_denied"})),
+            DevicePoll::Failed(_)
+        ));
         assert!(valid_client_id("Iv23liAbCdEf0123"));
         assert!(!valid_client_id("id avec espace"));
     }
@@ -768,10 +946,18 @@ mod tests {
 
     #[test]
     fn profil_enregistre_dans_projects() {
-        let mut json = json!({"projects": {"acme-site": {"tenant": "acme", "workspaces": ["/tmp/a"]}}});
-        let p = BrowserProfile { app: "Google Chrome".into(), dir: "Profile 2".into(), name: "Client".into() };
+        let mut json =
+            json!({"projects": {"acme-site": {"tenant": "acme", "workspaces": ["/tmp/a"]}}});
+        let p = BrowserProfile {
+            app: "Google Chrome".into(),
+            dir: "Profile 2".into(),
+            name: "Client".into(),
+        };
         set_tenant_browser(&mut json, "acme", Some(&p)).unwrap();
-        assert_eq!(json["projects"]["acme-site"]["browser"]["profile"], "Profile 2");
+        assert_eq!(
+            json["projects"]["acme-site"]["browser"]["profile"],
+            "Profile 2"
+        );
         set_tenant_browser(&mut json, "acme", None).unwrap();
         assert!(json["projects"]["acme-site"].get("browser").is_none());
         assert!(set_tenant_browser(&mut json, "inconnu", None).is_err());

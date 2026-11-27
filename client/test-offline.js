@@ -37,6 +37,10 @@ function fakeHub() {
     async (args) => {
       received.push(args);
       if (args.tool === 'send_email') return new Promise(() => {});
+      if (args.tool === 'slow_report') {
+        await new Promise((resolve) => setTimeout(resolve, 600));
+        return { content: [{ type: 'text', text: 'report ready' }] };
+      }
       if (args.tool === 'recall' && args.arguments?.episodes_only) {
         return { content: [{ type: 'text', text: JSON.stringify({ episodes: [{ id: 'ep-1' }] }) }] };
       }
@@ -270,6 +274,99 @@ try {
   assert.equal(inside.isError, true);
   assert.match(text(inside), /inside a character/);
 
+  // Terminal noise goes: colour codes, a progress bar redrawn in place, the same line many times.
+  const noisy = [
+    '\u001b[32mPASS\u001b[0m suite one',
+    'downloading 10%\rdownloading 55%\rdownloading 100%',
+    ...Array.from({ length: 7 }, () => 'warning: deprecated call'),
+    'done',
+  ].join('\n');
+  const quiet = await fixed(noisy);
+  assert.equal(text(quiet), 'PASS suite one\ndownloading 100%\nwarning: deprecated call\n[McpHub: the line above came 7 times in a row]\ndone');
+  assert.match(quiet.content[1].text, /Terminal noise removed/);
+  assert.equal(text(await fixed(noisy, { raw: true })), noisy);
+  // An ordinary text, a source file with a few equal lines, Windows line endings: untouched.
+  for (const plain of ['one\ntwo\n\n\nthree', 'if (a) {\n}\n}\n}\n}\nend', 'line one\r\nline two\r\n', 'a,b\n1,2']) {
+    const same = await fixed(plain);
+    assert.equal(text(same), plain);
+    assert.equal(same.content.length, 1, plain);
+  }
+
+  // Short lines repeated in a row are data, not noise; an odd line ending loses nothing.
+  for (const data of ['0\n0\n0\n0\n0\n0', 'a\n}\n}\n}\n}\n}\n}', '---\n---\n---\n---\n---', 'x\r\r\ny']) {
+    const same = await fixed(data);
+    assert.equal(text(same), data);
+    assert.equal(same.content.length, 1, JSON.stringify(data));
+  }
+  // JSON that McpHub does not rewrite (a 16-digit number) is not cleaned either, and says why a format was skipped.
+  const bigNumber = `[\n{"id":12345678901234567},\n${Array.from({ length: 6 }, () => '{"status":"pending","count":0},').join('\n')}\n{"id":2}\n]`;
+  assert.equal(text(await fixed(bigNumber)), bigNumber);
+  const skipped = await fixed(bigNumber, { format: 'csv' });
+  assert.equal(text(skipped), bigNumber);
+  assert.match(skipped.content[1].text, /format csv not applied/);
+
+  // csv: one header line and one line per row, cells quoted only when needed.
+  const people = [{ id: 1, name: 'Ann, Lee', tags: ['a', 'b'] }, { id: 2, name: 'Bob "B"', city: 'Paris' }];
+  assert.equal(text(await fixed(JSON.stringify(people), { format: 'csv' })), 'id,name,tags,city\n1,"Ann, Lee","[""a"",""b""]",\n2,"Bob ""B""",,Paris');
+  assert.equal(
+    text(await fixed(JSON.stringify({ total: 2, rows: [{ id: 1 }, { id: 2 }] }), { format: 'csv', fields: ['id'] })),
+    '# total: 2\n# rows:\nid\n1\n2'
+  );
+  assert.equal(
+    text(await fixed(JSON.stringify({ note: 'two\nlines', rows: [{ id: 1 }] }), { format: 'csv' })),
+    '# note: "two\\nlines"\n# rows:\nid\n1'
+  );
+  assert.match((await fixed('[{},{}]', { format: 'csv' })).content[1].text, /csv needs a list of rows/);
+  const notRows = await fixed('{"a":{"b":1}}', { format: 'csv' });
+  assert.equal(text(notRows), '{"a":{"b":1}}');
+  assert.match(notRows.content[1].text, /csv needs a list of rows/);
+
+  // A cut result can be searched instead of read through: the passages that hold the words, with their place.
+  const haystack = `${'filler '.repeat(300)}first needle here ${'filler '.repeat(300)}the needle and the thread together ${'filler '.repeat(300)}`;
+  const cutHay = await fixed(haystack, { max_chars: 1000 });
+  const hayHandle = /"handle":"(r\d+)","query"/.exec(cutHay.content[1].text)?.[1];
+  assert.ok(hayHandle, cutHay.content[1].text);
+  const searchLocal = (args) =>
+    client.callTool({ name: 'mcphub_call', arguments: { server: 'mcphub', tool: 'search_result', arguments: args } });
+  const found = await searchLocal({ handle: hayHandle, query: 'Needle thread', context: 40 });
+  assert.equal(found.content.length, 3);
+  assert.match(found.content[0].text, /^\[chars \d+ to \d+\]\n.*first needle here/s);
+  assert.match(found.content[1].text, /the needle and the thread together/);
+  assert.match(found.content[2].text, /2 of 2 passages shown, 3 matches in \d+ chars\./);
+  assert.ok(found.content.map((item) => item.text).join('').length < 600, 'a search answers in a few hundred chars');
+  // The offset it gives is the one read_result takes.
+  const at = Number(/^\[chars (\d+) to/.exec(found.content[1].text)[1]);
+  assert.equal(text(await readLocal({ handle: hayHandle, offset: at, length: 30 })), haystack.slice(at, at + 30));
+  // The passage holding both words comes first when only one is asked for.
+  const best = await searchLocal({ handle: hayHandle, query: 'needle thread', context: 40, max_matches: 1 });
+  assert.match(best.content[0].text, /thread together/);
+  const none = await searchLocal({ handle: hayHandle, query: 'absent', context: 40 });
+  assert.match(text(none), /No match for "absent"/);
+  const partly = await searchLocal({ handle: hayHandle, query: 'needle absent', context: 40 });
+  assert.match(partly.content.at(-1).text, /Never found: "absent"\./);
+  // Letters whose lower case is longer, and characters made of two units: the places given stay right.
+  const tricky = `${'İ'.repeat(40)} ${'😀'.repeat(60)}needle ${'z'.repeat(1200)}`;
+  const trickyCut = await fixed(tricky, { max_chars: 1000 });
+  const trickyHandle = /"handle":"(r\d+)","query"/.exec(trickyCut.content[1].text)?.[1];
+  const inTricky = await searchLocal({ handle: trickyHandle, query: 'NEEDLE', context: 21 });
+  const trickyFrom = Number(/^\[chars (\d+) to/.exec(inTricky.content[0].text)[1]);
+  assert.match(inTricky.content[0].text, /needle/);
+  const reread = await readLocal({ handle: trickyHandle, offset: trickyFrom, length: 60 });
+  assert.notEqual(reread.isError, true, text(reread));
+  assert.ok(text(reread).includes('needle'));
+  // A very common word does not hide a rare one, and the answer stays small whatever is asked.
+  const log = `${'the quick line\n'.repeat(9000)}one error at the end\n`;
+  const logCut = await fixed(log, { max_chars: 1000 });
+  const logHandle = /"handle":"(r\d+)","query"/.exec(logCut.content[1].text)?.[1];
+  const rare = await searchLocal({ handle: logHandle, query: 'the error', context: 2000, max_matches: 50 });
+  assert.doesNotMatch(rare.content.at(-1).text, /Never found/);
+  assert.match(rare.content.at(-1).text, /5001\+ matches|\d+\+ matches/);
+  assert.ok(rare.content.some((item) => item.text.includes('one error at the end')), 'the passage with both words is shown');
+  assert.ok(rare.content.map((item) => item.text).join('').length < 40_000, 'bounded answer');
+  assert.equal((await searchLocal({ handle: 'r999', query: 'x' })).isError, true);
+  assert.equal((await searchLocal({ handle: hayHandle, query: '  ' })).isError, true);
+  assert.equal((await searchLocal({ handle: hayHandle, query: 'x', context: 5 })).isError, true);
+
   // A large list answered without fields or max_rows reminds the agent of them; a shaped one does not.
   const manyRows = JSON.stringify({ rows: Array.from({ length: 200 }, (_, id) => ({ id, label: 'x'.repeat(40) })) });
   const hinted = await fixed(manyRows);
@@ -288,6 +385,33 @@ try {
   const run = (extra = {}) => client.callTool({ name: 'mcphub_run', arguments: { code: 'return 42;', ...extra } });
   assert.equal(JSON.parse(text(await run())).result, 42);
   assert.deepEqual(runs.at(-1).policy, { denied_servers: ['acme-crm'] });
+
+  // Each run counts once, with the tool calls its script made: the round trips it saved.
+  const savingsReport = JSON.parse(text(await client.callTool({ name: 'mcphub_savings', arguments: {} })));
+  const codeMode = savingsReport.codeMode;
+
+  // Each server is listed with its calls and the bytes it sent to the agent, heaviest first.
+  const perServer = savingsReport.perServer.servers;
+  assert.ok(perServer.length > 0);
+  for (const entry of perServer) {
+    assert.ok(entry.calls > 0 && entry.resultBytes > 0, JSON.stringify(entry));
+    assert.equal(entry.approximateTokens, Math.round(entry.resultBytes / 4));
+    // Size returned by the child server before shaping, and what shaping removed from it.
+    assert.ok(entry.rawBytes > 0 && entry.savedBytes >= 0 && entry.savedBytes < entry.rawBytes, JSON.stringify(entry));
+    assert.equal(entry.approximateTokensSaved, Math.round(entry.savedBytes / 4));
+  }
+  const shaping = savingsReport.perServer.shaping;
+  assert.equal(shaping.rawBytes, perServer.reduce((sum, entry) => sum + entry.rawBytes, 0));
+  assert.equal(shaping.savedBytes, perServer.reduce((sum, entry) => sum + entry.savedBytes, 0));
+  assert.ok(shaping.savedPercent >= 0 && shaping.savedPercent <= 100, JSON.stringify(shaping));
+  assert.deepEqual(perServer.map((entry) => entry.resultBytes), perServer.map((entry) => entry.resultBytes).sort((a, b) => b - a));
+  // A call refused before any result came back (bad shaping arguments) is counted in the total only.
+  const deliveredCalls = perServer.reduce((sum, entry) => sum + entry.calls, 0);
+  assert.ok(deliveredCalls > 0 && deliveredCalls <= savingsReport.actualUsage.calls);
+  assert.equal(savingsReport.actualUsage.byServer, undefined);
+  assert.equal(codeMode.runs, 1);
+  assert.equal(codeMode.callsInsideScripts, 2);
+  assert.equal(codeMode.roundTripsSaved, 1);
 
   // Inside a project the daemon receives the same rules mcphub_call enforces.
   assert.equal(JSON.parse(text(await run({ working_dir: acme }))).policy, 'enforced');
@@ -493,6 +617,108 @@ try {
     assert.equal(text(plain), 'done read_row');
   } finally {
     await claudeCode.close();
+  }
+
+  // Several windows share one statistics file: each adds what it counted, none erases the others.
+  const windows = await Promise.all(
+    [1, 2, 3].map(async () => {
+      const window = new Client({ name: 'mcphub-offline-window', version: '1.0.0' });
+      await window.connect(
+        new StdioClientTransport({
+          command: process.execPath,
+          args: [process.env.MCPHUB_CLIENT_ENTRY ?? 'index.js'],
+          cwd: new URL('.', import.meta.url).pathname,
+          env: { ...process.env, ...clientEnv },
+          stderr: 'pipe'
+        })
+      );
+      return window;
+    })
+  );
+  try {
+    const windowCall = { name: 'mcphub_call', arguments: { server: 'windows', tool: 'read_row', arguments: { id: 1 } } };
+    await Promise.all(windows.flatMap((window) => [1, 2, 3, 4].map(() => window.callTool(windowCall))));
+    // Every window writes at the same moment, then any of them reports the total of all.
+    const reports = await Promise.all(
+      windows.map(async (window) => JSON.parse(text(await window.callTool({ name: 'mcphub_savings', arguments: {} }))))
+    );
+    const lastReport = JSON.parse(text(await windows[0].callTool({ name: 'mcphub_savings', arguments: {} })));
+    const shared = lastReport.perServer.servers.find((entry) => entry.server === 'windows');
+    assert.equal(shared.calls, 12);
+    // The same answer twelve times: the bytes add up exactly.
+    assert.ok(shared.resultBytes > 0 && shared.resultBytes % 12 === 0, String(shared.resultBytes));
+    assert.ok(reports.every((report) => report.perServer.servers.some((entry) => entry.server === 'windows')));
+  } finally {
+    await Promise.all(windows.map((window) => window.close()));
+  }
+
+  // A call longer than the answer delay gets a waiting answer instead of being cut by the
+  // MCP client; it keeps running once, and its result is read by handle.
+  const patient = new Client({ name: 'mcphub-offline-pending', version: '1.0.0' });
+  await patient.connect(
+    new StdioClientTransport({
+      command: process.execPath,
+      args: [process.env.MCPHUB_CLIENT_ENTRY ?? 'index.js'],
+      cwd: new URL('.', import.meta.url).pathname,
+      env: {
+        ...process.env,
+        ...clientEnv,
+        MCPHUB_ANSWER_BEFORE_MS: '200',
+        MCPHUB_CALL_TIMEOUT_MS: '900'
+      },
+      stderr: 'pipe'
+    })
+  );
+  try {
+    const callResult = (handle) =>
+      patient.callTool({
+        name: 'mcphub_call',
+        arguments: { server: 'mcphub', tool: 'call_result', arguments: { handle } }
+      });
+    const slow = await patient.callTool({
+      name: 'mcphub_call',
+      arguments: { server: 'reports', tool: 'slow_report', arguments: {} }
+    });
+    assert.notEqual(slow.isError, true);
+    assert.equal(slow._meta?.mcphub?.status, 'pending');
+    assert.equal(slow._meta.mcphub.handle, 'c1');
+    assert.match(text(slow), /Do not call it again.*"handle":"c1"/);
+
+    // Still running: the same handle is given again, nothing is replayed.
+    const waiting = await callResult('c1');
+    assert.equal(waiting._meta?.mcphub?.status, 'pending');
+    assert.equal(waiting._meta.mcphub.handle, 'c1');
+
+    let ready = await callResult('c1');
+    while (ready._meta?.mcphub?.status === 'pending') ready = await callResult('c1');
+    assert.equal(text(ready), 'report ready');
+    assert.equal(received.filter((call) => call.tool === 'slow_report').length, 1);
+
+    // A result is read once.
+    const gone = await callResult('c1');
+    assert.equal(gone.isError, true);
+    assert.match(text(gone), /No pending call for handle "c1"/);
+
+    // A quick call is answered directly.
+    const quick = await patient.callTool({
+      name: 'mcphub_call',
+      arguments: { server: 'db', tool: 'read_row', arguments: { id: 3 } }
+    });
+    assert.equal(text(quick), 'done read_row');
+    assert.equal(quick._meta?.mcphub?.status, undefined);
+
+    // A call that fails in the background reports its failure through the handle.
+    const stuck = await patient.callTool({
+      name: 'mcphub_call',
+      arguments: { server: 'mail', tool: 'send_email', arguments: { to: 'b@example.com' } }
+    });
+    assert.equal(stuck._meta?.mcphub?.status, 'pending');
+    let failed = await callResult(stuck._meta.mcphub.handle);
+    while (failed._meta?.mcphub?.status === 'pending') failed = await callResult(stuck._meta.mcphub.handle);
+    assert.equal(failed.isError, true);
+    assert.equal(failed._meta?.mcphub?.status, 'unknown_outcome');
+  } finally {
+    await patient.close();
   }
 
   console.log('offline client tests: ok');

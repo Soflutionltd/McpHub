@@ -176,6 +176,7 @@ jobs:
         run: |
           npm ci
           npm audit --omit=dev --audit-level=high
+          npm run -s test:tokens
           npm run -s test:offline
           npm run -s bundle
           MCPHUB_CLIENT_ENTRY=dist/mcphub-client.mjs npm run -s test:offline
