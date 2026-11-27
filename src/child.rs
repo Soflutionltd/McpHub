@@ -50,6 +50,26 @@ fn file_uri(path: &std::path::Path) -> String {
     uri
 }
 
+/// Distance d'édition (insertions, suppressions, substitutions) entre deux noms courts.
+pub fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut current = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            current.push(
+                (previous[j] + cost)
+                    .min(previous[j + 1] + 1)
+                    .min(current[j] + 1),
+            );
+        }
+        previous = current;
+    }
+    previous[b.len()]
+}
+
 /// Instance d'un serveur propre à un dossier de projet : `serveur#<empreinte du dossier>`.
 /// Un serveur qui demande `roots/list` en reçoit une par projet : le dossier qu'il connaît ne
 /// change jamais, quel que soit le nombre de conversations en parallèle.
@@ -944,6 +964,29 @@ impl ChildManager {
                 .then(|| name.to_string());
         }
         self.resolve_name(name).await
+    }
+
+    /// Serveur visé par un nom mal tapé : le seul serveur de la config à au plus deux lettres
+    /// d'écart (`supabaze` → `supabase`). Aucune correction si plusieurs se ressemblent, si le
+    /// nom est trop court, ou s'il désigne une instance.
+    pub async fn closest_name(&self, name: &str) -> Option<String> {
+        if name.chars().count() < 4
+            || crate::tenant::is_instance_name(name)
+            || is_root_instance(name)
+        {
+            return None;
+        }
+        let lower = name.to_lowercase();
+        let configs = self.configs.lock().await;
+        let close: Vec<&String> = configs
+            .keys()
+            .filter(|k| !crate::tenant::is_instance_name(k) && !is_root_instance(k))
+            .filter(|k| edit_distance(&k.to_lowercase(), &lower) <= 2)
+            .collect();
+        match close.as_slice() {
+            [only] => Some((*only).clone()),
+            _ => None,
+        }
     }
 
     /// Nom canonique (clé de config) d'un serveur. Utilisé aussi par le proxy pour que
@@ -2287,6 +2330,31 @@ done
             calls
         );
         manager.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn nom_de_serveur_mal_tape() {
+        assert_eq!(edit_distance("supabaze", "supabase"), 1);
+        assert_eq!(edit_distance("depsnoar", "depsonar"), 2);
+        let dir = fake_dir("noms");
+        let mut configs = HashMap::new();
+        for name in ["supabase", "depsonar", "github", "gitlab"] {
+            configs.insert(name.to_string(), fake_config(&dir, &[], 5));
+        }
+        let manager = ChildManager::new(configs, 300_000, 5);
+        assert_eq!(
+            manager.closest_name("supabaze").await.as_deref(),
+            Some("supabase")
+        );
+        assert_eq!(
+            manager.closest_name("Depsnoar").await.as_deref(),
+            Some("depsonar")
+        );
+        // github et gitlab sont tous deux proches de "gitlub" : ambigu, aucune correction.
+        assert!(edit_distance("gitlub", "github") <= 2 && edit_distance("gitlub", "gitlab") <= 2);
+        assert_eq!(manager.closest_name("gitlub").await, None);
+        assert_eq!(manager.closest_name("abc").await, None);
+        assert_eq!(manager.closest_name("supabase@acme").await, None);
     }
 
     #[test]

@@ -2867,6 +2867,21 @@ impl ProxyServer {
             let token = args.get("confirmation_token").and_then(|v| v.as_str());
             return self.handle_hub_tool(id, &tool, arguments, token).await;
         }
+        // Nom mal tapé (`supabaze`) : corrigé vers le seul serveur proche, et signalé.
+        let mut server_note = None;
+        let server = match self.child_manager.resolve_name(&server).await {
+            Some(_) => server,
+            None => match self.child_manager.closest_name(&server).await {
+                Some(close) => {
+                    server_note = Some(format!(
+                        "server name corrected by McpHub: \"{}\" -> \"{}\"",
+                        server, close
+                    ));
+                    close
+                }
+                None => server,
+            },
+        };
         // Cloisonnement des tenants : décidé avant tout le reste, sur le nom canonique.
         let canonical = self
             .child_manager
@@ -3243,6 +3258,9 @@ impl ProxyServer {
                             }),
                         );
                     }
+                }
+                if let (Some(note), Some(obj)) = (&server_note, normalized.as_object_mut()) {
+                    obj.insert("_server_corrected".into(), serde_json::json!(note));
                 }
                 // Jeton expiré (échec) ou bientôt expiré : dit en clair à l'agent, hors cache.
                 let failed = normalized.get("isError").and_then(|v| v.as_bool()) == Some(true);
