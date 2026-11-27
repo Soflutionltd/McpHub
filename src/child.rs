@@ -232,6 +232,9 @@ impl StdioShared {
                         server_method.to_string(),
                     ));
                 }
+                None if server_method == "notifications/tools/list_changed" => {
+                    notify_tools_changed(&self.server_name);
+                }
                 None if server_method == "notifications/message" => {
                     if let Some(params) = parsed.get("params") {
                         if let (Some(level), Some(data)) = (
@@ -546,13 +549,18 @@ fn now_ms() -> u64 {
 struct ServerPool {
     procs: Vec<Arc<Instance>>,
     handles: Vec<KillHandle>,
-    tools: Vec<ToolDef>,
+    /// Outils annoncés, relus quand le serveur signale un changement (`tools/list_changed`).
+    tools: std::sync::Mutex<Vec<ToolDef>>,
     request_timeout_secs: u64,
     next_idx: AtomicUsize,
     last_used_ms: AtomicU64,
 }
 
 impl ServerPool {
+    fn tools(&self) -> Vec<ToolDef> {
+        self.tools.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
     fn touch(&self) {
         self.last_used_ms.store(now_ms(), Ordering::Relaxed);
     }
@@ -587,6 +595,27 @@ impl ServerPool {
                 KillHandle::Remote(remote) => remote.close().await,
             }
         }
+    }
+}
+
+/// Serveurs qui ont annoncé un changement de leurs outils, lus par le proxy (catalogue).
+fn tools_changed_channel() -> &'static std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>> =
+        std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Le proxy s'abonne aux changements d'outils annoncés par les serveurs.
+pub fn subscribe_tools_changed() -> tokio::sync::mpsc::UnboundedReceiver<String> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    *tools_changed_channel().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
+    rx
+}
+
+fn notify_tools_changed(server: &str) {
+    let guard = tools_changed_channel().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(tx) = guard.as_ref() {
+        let _ = tx.send(server.to_string());
     }
 }
 
@@ -929,6 +958,18 @@ impl ChildManager {
         }
     }
 
+    /// Relit les outils d'un serveur en marche (après `notifications/tools/list_changed`) :
+    /// définitions contrôlées et épinglées comme au démarrage. `None` si le serveur est arrêté.
+    pub async fn refresh_tools(&self, name: &str) -> Option<Result<Vec<ToolDef>, String>> {
+        let pool = self.pool(name).await?;
+        let proc = pool.pick();
+        let result = list_tools(&proc, name, pool.request_timeout_secs).await;
+        if let Ok(tools) = &result {
+            *pool.tools.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = tools.clone();
+        }
+        Some(result)
+    }
+
     pub async fn start_server(&self, name: &str) -> Result<Vec<ToolDef>, String> {
         let name_resolved = self
             .resolve_internal(name)
@@ -938,7 +979,7 @@ impl ChildManager {
 
         if let Some(pool) = self.pool(name).await {
             pool.touch();
-            return Ok(pool.tools.clone());
+            return Ok(pool.tools());
         }
 
         let gate = {
@@ -948,7 +989,7 @@ impl ChildManager {
         let mut last_failure = gate.lock().await;
         if let Some(pool) = self.pool(name).await {
             pool.touch();
-            return Ok(pool.tools.clone());
+            return Ok(pool.tools());
         }
         if let Some((at, error)) = last_failure.as_ref() {
             if at.elapsed() < START_FAILURE_MEMORY {
@@ -1048,7 +1089,7 @@ impl ChildManager {
         let pool = Arc::new(ServerPool {
             procs,
             handles,
-            tools: first_tools.clone(),
+            tools: std::sync::Mutex::new(first_tools.clone()),
             request_timeout_secs,
             next_idx: AtomicUsize::new(0),
             last_used_ms: AtomicU64::new(now_ms()),
@@ -1481,7 +1522,11 @@ async fn initialize(
 
     proc.notify("notifications/initialized", serde_json::json!({}))
         .await?;
-    // tools/list est paginé (nextCursor) : on lit toutes les pages.
+    list_tools(proc, name, request_timeout_secs).await
+}
+
+/// Lit `tools/list` (paginé, nextCursor) puis épingle et contrôle les définitions annoncées.
+async fn list_tools(proc: &Instance, name: &str, request_timeout_secs: u64) -> Result<Vec<ToolDef>, String> {
     let mut tools: Vec<ToolDef> = Vec::new();
     let mut cursor: Option<String> = None;
     for _page in 0..50 {
@@ -1586,7 +1631,13 @@ while IFS= read -r line; do
       if [ -n "$FAKE_HANG_INIT" ]; then sleep 60; fi
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fake","version":"1"}}}\n' "$id" ;;
     *'"method":"tools/list"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"mutate","description":"m","inputSchema":{"type":"object"}},{"name":"slow","description":"s","inputSchema":{"type":"object"}},{"name":"read_x","description":"r","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+      extra=''
+      if [ -f "$FAKE_DIR/grown" ]; then extra=',{"name":"extra","description":"e","inputSchema":{"type":"object"}}'; fi
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"mutate","description":"m","inputSchema":{"type":"object"}},{"name":"slow","description":"s","inputSchema":{"type":"object"}},{"name":"read_x","description":"r","inputSchema":{"type":"object"}}%s]}}\n' "$id" "$extra" ;;
+    *'"name":"grow"'*)
+      touch "$FAKE_DIR/grown"
+      printf '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}\n'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"grown"}]}}\n' "$id" ;;
     *'"name":"mutate"'*)
       echo done >> "$FAKE_DIR/mutations"
       exit 0 ;;
@@ -2061,6 +2112,23 @@ done
         let answers = wait_lines(&dir.join("answers"), 1).await;
         assert!(answers[0].contains("\"id\":99999"), "{}", answers[0]);
         manager.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn un_changement_d_outils_annonce_est_relu() {
+        let dir = fake_dir("outils-changes");
+        let manager = started(&dir, "fake-outils", 10);
+        let mut changes = subscribe_tools_changed();
+        assert_eq!(manager.start_server("fake-outils").await.unwrap().len(), 3);
+        manager.call_tool("fake-outils", "grow", serde_json::json!({})).await.unwrap();
+        let announced = tokio::time::timeout(Duration::from_secs(5), changes.recv()).await.unwrap();
+        assert_eq!(announced.as_deref(), Some("fake-outils"));
+        let tools = manager.refresh_tools("fake-outils").await.unwrap().unwrap();
+        assert!(tools.iter().any(|t| t.name == "extra"), "outil ajoute non relu");
+        // Le serveur en marche rend désormais la liste relue.
+        assert_eq!(manager.start_server("fake-outils").await.unwrap().len(), 4);
+        assert!(manager.refresh_tools("inconnu").await.is_none());
+        kill_fake(&dir);
     }
 
     #[tokio::test]

@@ -915,6 +915,14 @@ impl ProxyServer {
         let keep_preloaded_warm = config.keep_preloaded_warm;
         drop(config);
 
+        // Outils changés en cours de route (`notifications/tools/list_changed`) : relus,
+        // contrôlés et réindexés.
+        tokio::spawn(watch_tools_changed(
+            crate::child::subscribe_tools_changed(),
+            self.child_manager.clone(),
+            self.search_engine.clone(),
+        ));
+
         // 5. Préchauffage en tâche de fond : ni le démarrage ni l'écoute HTTP ne l'attendent.
         let preload_names = self.preload_targets().await;
         // Préchauffer pour arrêter trente minutes plus tard ne sert qu'au premier appel : ces
@@ -3402,6 +3410,45 @@ fn spawn_catalog_refresh(
         .await;
         in_progress.store(false, Ordering::SeqCst);
     });
+}
+
+/// Relit les outils d'un serveur qui annonce un changement, puis met à jour le cache et l'index.
+/// Les annonces rapprochées d'un même serveur sont regroupées.
+async fn watch_tools_changed(
+    mut changes: tokio::sync::mpsc::UnboundedReceiver<String>,
+    manager: Arc<ChildManager>,
+    engine: Arc<Mutex<SearchEngine>>,
+) {
+    while let Some(first) = changes.recv().await {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let mut names = std::collections::BTreeSet::from([first]);
+        while let Ok(more) = changes.try_recv() {
+            names.insert(more);
+        }
+        let mut cache = match crate::cache::load_cache() {
+            Some(c) => c,
+            None => continue,
+        };
+        let mut changed = false;
+        for name in names {
+            match manager.refresh_tools(&name).await {
+                Some(Ok(tools)) => {
+                    eprintln!("[McpHub][INFO] {} : liste d'outils changee, {} outils relus", name, tools.len());
+                    // Les instances de tenant ne sont pas au catalogue partagé.
+                    if let Some(entry) = cache.servers.get_mut(&name) {
+                        *entry = tools;
+                        changed = true;
+                    }
+                }
+                Some(Err(e)) => eprintln!("[McpHub][WARN] {} : relecture des outils impossible : {}", name, e),
+                None => {}
+            }
+        }
+        if changed {
+            engine.lock().await.build_index(indexed_tools_from_servers(&cache.servers));
+            crate::cache::save_cache_state(&cache);
+        }
+    }
 }
 
 /// Rebuild the in-memory search index and persist the refreshed cache.
