@@ -2801,8 +2801,9 @@ impl ProxyServer {
             // dossier d'un tenant, sauf "mcphub" dans ses sharedServers.
             if let Context::Tenant(t) = &ctx {
                 // Lister aussi : la liste nomme les serveurs et les comptes clients qui les utilisent.
+                // Catalogue et diagnostic aussi : ils décrivent les serveurs et jetons de McpHub.
                 if crate::server_admin::is_admin_tool(&tool)
-                    || crate::catalog::is_catalog_write_tool(&tool)
+                    || crate::catalog::is_catalog_tool(&tool)
                 {
                     let reason = format!(
                         "gerer les serveurs McpHub est toujours refuse depuis le dossier du tenant {}",
