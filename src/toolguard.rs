@@ -1389,6 +1389,30 @@ pub fn block_reason(
     None
 }
 
+/// Profil appliqué à un outil interne de McpHub (`server: "mcphub"`) : mêmes règles que pour un
+/// serveur (serveurs du profil, outils exclus). En lecture seule, tout outil qui change la
+/// config ou installe un programme est refusé, quel que soit son nom.
+fn hub_profile_reason(p: &Profile, name: &str, tool: &str, mutating: bool) -> Option<String> {
+    if let Some(r) = profile_reason(p, name, "mcphub", None) {
+        return Some(r);
+    }
+    let key = format!("mcphub/{}", tool);
+    if p.exclude_tools.iter().any(|g| glob_match(g, &key)) {
+        return Some(format!("outil exclu du profil '{}'", name));
+    }
+    if p.read_only && mutating {
+        return Some(format!("profil '{}' en lecture seule : cet outil modifie la config de McpHub", name));
+    }
+    None
+}
+
+/// Pourquoi un outil interne de McpHub est refusé pour ce profil, ou None.
+pub fn hub_block_reason(tool: &str, mutating: bool, profile: Option<&str>) -> Option<String> {
+    let st = state();
+    let (name, p) = profile.and_then(|n| st.config.profiles.get(n).map(|p| (n, p)))?;
+    hub_profile_reason(p, name, tool, mutating)
+}
+
 /// Outils d'un serveur tels qu'exposés au catalogue : sans quarantaine ni outils filtrés,
 /// avec les descriptions réécrites. (Le profil, propre à chaque client, s'applique à la requête.)
 pub fn present_tools(server: &str, tools: &[ToolDef]) -> Vec<ToolDef> {
@@ -1611,6 +1635,19 @@ pub fn cmd_pins(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profil_en_lecture_seule_sur_les_outils_internes() {
+        let ro = Profile { read_only: true, ..Default::default() };
+        assert!(hub_profile_reason(&ro, "lecture", "server_disable", true).is_some());
+        assert!(hub_profile_reason(&ro, "lecture", "registry_install", true).is_some());
+        assert_eq!(hub_profile_reason(&ro, "lecture", "servers_list", false), None);
+        let no_hub = Profile { exclude_servers: vec!["mcphub".into()], ..Default::default() };
+        assert!(hub_profile_reason(&no_hub, "client", "servers_list", false).is_some());
+        let no_disable = Profile { exclude_tools: vec!["mcphub/server_*".into()], ..Default::default() };
+        assert!(hub_profile_reason(&no_disable, "client", "server_disable", true).is_some());
+        assert_eq!(hub_profile_reason(&Profile::default(), "tous", "server_disable", true), None);
+    }
     use serde_json::json;
 
     fn tool(name: &str, desc: &str) -> ToolDef {

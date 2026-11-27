@@ -2074,6 +2074,23 @@ impl ProxyServer {
         arguments: serde_json::Value,
         confirmation_token: Option<&str>,
     ) -> JsonRpcResponse {
+        // Le profil du client s'applique aussi aux outils internes : un profil en lecture seule
+        // ne désactive, n'ajoute ni n'installe aucun serveur.
+        let mutating = crate::server_admin::is_write_tool(tool) || crate::registry::is_install_tool(tool);
+        if let Some(reason) = crate::toolguard::hub_block_reason(tool, mutating, current_profile().as_deref()) {
+            self.record_audit(AuditEntry {
+                server: "mcphub".into(),
+                tool: tool.to_string(),
+                mode: "admin",
+                decision: "deny",
+                status: "blocked",
+                policy: "toolguard".into(),
+                arguments: Some(crate::audit::safe_arguments(&arguments)),
+                ..Default::default()
+            })
+            .await;
+            return JsonRpcResponse::error(id, -32001, format!("Bloque par McpHub : mcphub/{} : {}", tool, reason));
+        }
         if crate::server_admin::is_admin_tool(tool) {
             return self
                 .handle_admin_tool(id, tool, arguments, confirmation_token)
