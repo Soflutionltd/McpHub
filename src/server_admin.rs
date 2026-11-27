@@ -353,19 +353,26 @@ fn build_entry(args: &Value, settings: Option<&Value>) -> Result<(Value, Vec<Str
                 entry.insert("env".into(), Value::Object(env));
             }
             // Bac à sable bouclier par défaut, comme une installation depuis le registre (sauf
-            // réglage global, qui s'applique alors). L'agent ne peut pas le retirer.
-            match args.get("sandbox") {
-                Some(Value::Bool(false)) => return Err("sandbox: an agent cannot turn the sandbox off (the user can, in the dashboard)".into()),
-                Some(Value::String(s)) if s.eq_ignore_ascii_case("off") => {
+            // réglage global, qui s'applique alors). L'agent ne peut pas le retirer : le réglage
+            // est jugé une fois interprété, quelle que soit sa forme (false, "none",
+            // {"mode": "off"}...), et un serveur exempté par défaut reçoit un bouclier explicite.
+            if let Some(v) = args.get("sandbox") {
+                entry.insert("sandbox".into(), v.clone());
+            }
+            let global = settings.and_then(|s| s.get("sandbox"));
+            let label = args.get("name").and_then(|n| n.as_str()).unwrap_or("server");
+            let effective = |entry: &Map<String, Value>| {
+                crate::sandbox::resolve(label, &Value::Object(entry.clone()), global, cmd, &list)
+            };
+            match effective(&entry)? {
+                Some(_) => {}
+                None if args.get("sandbox").is_some() => {
                     return Err("sandbox: an agent cannot turn the sandbox off (the user can, in the dashboard)".into())
                 }
-                Some(v) => {
-                    entry.insert("sandbox".into(), v.clone());
-                }
                 None => {
-                    let global = settings.and_then(|s| s.get("sandbox")).filter(|v| !matches!(v, Value::Bool(false)));
-                    if global.is_none() {
-                        entry.insert("sandbox".into(), json!("shield"));
+                    entry.insert("sandbox".into(), json!("shield"));
+                    if effective(&entry)?.is_none() {
+                        return Err("sandbox: isolation could not be applied to this server".into());
                     }
                 }
             }
@@ -682,6 +689,13 @@ mod tests {
             .call("server_add", json!({"name": "WEATHER", "command": "x"}))
             .unwrap_err();
         assert!(dup.contains("already exists"));
+
+        // Un nom exempté d'isolation par défaut reçoit quand même un bouclier explicite.
+        f.call("server_add", json!({"name": "kilnshell-copy", "command": "npx", "args": ["kilnshell"]})).unwrap();
+        assert_eq!(f.config()["mcpServers"]["kilnshell-copy"]["sandbox"], "shield");
+        // Un mode strict demandé par l'agent est gardé.
+        f.call("server_add", json!({"name": "tight", "command": "npx", "sandbox": {"mode": "strict"}})).unwrap();
+        assert_eq!(f.config()["mcpServers"]["tight"]["sandbox"]["mode"], "strict");
     }
 
     #[test]
@@ -740,6 +754,11 @@ mod tests {
             json!({"name": "x", "url": "https://${HOST}/mcp"}),
             json!({"name": "x", "command": "npx", "sandbox": false}),
             json!({"name": "x", "command": "npx", "sandbox": "off"}),
+            json!({"name": "x", "command": "npx", "sandbox": "OFF"}),
+            json!({"name": "x", "command": "npx", "sandbox": "none"}),
+            json!({"name": "x", "command": "npx", "sandbox": "false"}),
+            json!({"name": "x", "command": "npx", "sandbox": {"mode": "off"}}),
+            json!({"name": "x", "command": "npx", "sandbox": {"mode": "none", "network": false}}),
             json!({"name": "x", "command": "npx", "args": "-y pkg"}),
             json!({"name": "x", "url": "https://a.example.com", "auth": "basic"}),
         ];
