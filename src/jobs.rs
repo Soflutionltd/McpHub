@@ -26,6 +26,10 @@ struct Job {
     tenant: Option<String>,
     server: String,
     tool: String,
+    /// Processus appelé (`serveur` ou `serveur@tenant`) : avis de jeton à la relecture.
+    process_key: String,
+    /// Sortie d'un outil qui renvoie des données externes : marquée comme telle à la relecture.
+    untrusted: bool,
     started: Instant,
     finished: Option<Instant>,
     state: JobState,
@@ -48,8 +52,27 @@ fn new_handle() -> String {
     format!("job-{}-{}", salt, n)
 }
 
+/// Appel encore en cours à enregistrer.
+pub struct NewJob {
+    pub tenant: Option<String>,
+    pub server: String,
+    pub tool: String,
+    pub process_key: String,
+    pub untrusted: bool,
+}
+
+/// État d'un appel, vu par le compte qui l'a lancé.
+pub struct JobView {
+    pub server: String,
+    pub tool: String,
+    pub process_key: String,
+    pub untrusted: bool,
+    pub elapsed_secs: u64,
+    pub state: JobState,
+}
+
 /// Enregistre un appel encore en cours ; renvoie son numéro.
-pub fn register(tenant: Option<String>, server: &str, tool: &str) -> String {
+pub fn register(new: NewJob) -> String {
     let handle = new_handle();
     let mut table = jobs();
     let now = Instant::now();
@@ -68,9 +91,11 @@ pub fn register(tenant: Option<String>, server: &str, tool: &str) -> String {
     table.insert(
         handle.clone(),
         Job {
-            tenant,
-            server: server.to_string(),
-            tool: tool.to_string(),
+            tenant: new.tenant,
+            server: new.server,
+            tool: new.tool,
+            process_key: new.process_key,
+            untrusted: new.untrusted,
             started: now,
             finished: None,
             state: JobState::Running,
@@ -87,22 +112,24 @@ pub fn finish(handle: &str, result: Result<serde_json::Value, String>) {
 }
 
 /// État d'un appel pour le compte qui le demande (`None` : inconnu, expiré ou d'un autre compte).
-pub fn get(handle: &str, tenant: Option<&str>) -> Option<(String, String, u64, JobState)> {
+pub fn get(handle: &str, tenant: Option<&str>) -> Option<JobView> {
     let table = jobs();
     let job = table.get(handle)?;
     if job.tenant.as_deref() != tenant {
         return None;
     }
-    Some((
-        job.server.clone(),
-        job.tool.clone(),
-        job.started.elapsed().as_secs(),
-        job.state.clone(),
-    ))
+    Some(JobView {
+        server: job.server.clone(),
+        tool: job.tool.clone(),
+        process_key: job.process_key.clone(),
+        untrusted: job.untrusted,
+        elapsed_secs: job.started.elapsed().as_secs(),
+        state: job.state.clone(),
+    })
 }
 
 /// Réponse « toujours en cours » donnée à l'agent.
-pub fn running_text(handle: &str, server: &str, tool: &str, seconds: u64) -> String {
+pub fn running_value(handle: &str, server: &str, tool: &str, seconds: u64) -> serde_json::Value {
     serde_json::json!({
         "status": "running",
         "handle": handle,
@@ -112,40 +139,54 @@ pub fn running_text(handle: &str, server: &str, tool: &str, seconds: u64) -> Str
         "note": "Still running in McpHub: the call was NOT lost and must NOT be sent again.",
         "next": format!("mcphub_call server=mcphub tool=job_result arguments={{\"handle\": \"{}\"}} in about 20 seconds.", handle),
     })
-    .to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn new_job(tenant: Option<&str>, server: &str, tool: &str) -> NewJob {
+        NewJob {
+            tenant: tenant.map(String::from),
+            server: server.into(),
+            tool: tool.into(),
+            process_key: server.into(),
+            untrusted: true,
+        }
+    }
+
     #[test]
     fn cycle_d_un_appel_long() {
-        let h = register(None, "depsonar", "depsonar_audit");
+        let h = register(new_job(None, "depsonar", "depsonar_audit"));
         assert!(h.starts_with("job-"));
-        assert_eq!(get(&h, None).map(|j| j.3), Some(JobState::Running));
+        let view = get(&h, None).unwrap();
+        assert_eq!(view.state, JobState::Running);
+        assert!(
+            view.untrusted,
+            "la marque des donnees externes suit l'appel"
+        );
         // Un autre compte ne voit rien.
         assert!(get(&h, Some("acme")).is_none());
         finish(&h, Ok(serde_json::json!({"content": []})));
         assert!(matches!(
-            get(&h, None).map(|j| j.3),
+            get(&h, None).map(|j| j.state),
             Some(JobState::Done(Ok(_)))
         ));
         assert!(get("job-inconnu-1", None).is_none());
-        let text = running_text(&h, "depsonar", "depsonar_audit", 45);
+        let text = running_value(&h, "depsonar", "depsonar_audit", 45).to_string();
         assert!(text.contains("must NOT be sent again") && text.contains(&h));
     }
 
     #[test]
     fn table_bornee_sans_oublier_un_appel_en_cours() {
-        let running = register(Some("borne".into()), "s", "t");
+        let running = register(new_job(Some("borne"), "s", "t"));
         for _ in 0..(MAX_JOBS + 10) {
-            let h = register(Some("borne".into()), "s", "t");
+            let h = register(new_job(Some("borne"), "s", "t"));
             finish(&h, Ok(serde_json::json!({})));
         }
         assert!(jobs().len() <= MAX_JOBS);
         assert_eq!(
-            get(&running, Some("borne")).map(|j| j.3),
+            get(&running, Some("borne")).map(|j| j.state),
             Some(JobState::Running)
         );
     }

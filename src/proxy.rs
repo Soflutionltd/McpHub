@@ -2092,7 +2092,8 @@ impl ProxyServer {
         )
     }
 
-    /// `job_result {handle}` : résultat d'un appel long, ou « toujours en cours ».
+    /// `job_result {handle}` : résultat d'un appel long, ou « toujours en cours ». Présenté
+    /// comme une réponse directe (marque des données externes, avis de jeton).
     async fn handle_job_result(
         &self,
         id: Option<serde_json::Value>,
@@ -2103,27 +2104,38 @@ impl ProxyServer {
             .get("handle")
             .and_then(|h| h.as_str())
             .unwrap_or("");
-        let Some((server, tool, elapsed, state)) = crate::jobs::get(handle, tenant) else {
+        let Some(job) = crate::jobs::get(handle, tenant) else {
             return JsonRpcResponse::error(
                 id,
                 -32602,
                 format!(
-                    "unknown or expired job {} (results are kept 30 minutes)",
+                    "unknown or expired job {} (results are kept 30 minutes; if McpHub restarted meanwhile, check whether the call took effect before sending it again)",
                     handle
                 ),
             );
         };
-        match state {
-            crate::jobs::JobState::Running => JsonRpcResponse::success(
-                id,
-                serde_json::json!({ "content": [{ "type": "text", "text": crate::jobs::running_text(handle, &server, &tool, elapsed) }] }),
-            ),
+        match job.state {
+            crate::jobs::JobState::Running => {
+                let reply =
+                    crate::jobs::running_value(handle, &job.server, &job.tool, job.elapsed_secs);
+                JsonRpcResponse::success(
+                    id,
+                    serde_json::json!({ "content": [{ "type": "text", "text": reply.to_string() }] }),
+                )
+            }
             crate::jobs::JobState::Done(Ok(result)) => {
-                JsonRpcResponse::success(id, self.normalize_result_for_profile(result).await)
+                let normalized = self.normalize_result_for_profile(result).await;
+                JsonRpcResponse::success(
+                    id,
+                    present_result(normalized, job.untrusted, &job.process_key),
+                )
             }
-            crate::jobs::JobState::Done(Err(e)) => {
-                tool_failure_response(id, e, serde_json::json!({ "server": server, "tool": tool }))
-            }
+            crate::jobs::JobState::Done(Err(e)) => present_error(
+                id,
+                e,
+                serde_json::json!({ "server": job.server, "tool": job.tool }),
+                &job.process_key,
+            ),
         }
     }
 
@@ -2871,7 +2883,16 @@ impl ProxyServer {
         let mut server_note = None;
         let server = match self.child_manager.resolve_name(&server).await {
             Some(_) => server,
-            None => match self.child_manager.closest_name(&server).await {
+            // Seulement vers un serveur que ce contexte peut utiliser : un compte client ne doit
+            // pas découvrir par approximation un serveur qui ne lui est pas ouvert.
+            None => match self
+                .child_manager
+                .closest_name(&server)
+                .await
+                .filter(|close| {
+                    crate::tenant::route(&ctx, close).is_ok()
+                        && crate::toolguard::server_visible(close, current_profile().as_deref())
+                }) {
                 Some(close) => {
                     server_note = Some(format!(
                         "server name corrected by McpHub: \"{}\" -> \"{}\"",
@@ -3133,111 +3154,101 @@ impl ProxyServer {
             self.response_cache.invalidate_server(&process_key);
         }
         let start_time = Instant::now();
-        // L'appel tourne dans sa propre tâche : au-delà de `deferAfterSecs`, l'agent reçoit un
-        // numéro et l'appel continue, au lieu d'être perdu au délai du client.
+        // L'appel tourne dans sa propre tâche, suivie jusqu'au bout quoi qu'il arrive au client
+        // (annulation, délai) : cache invalidé après une écriture, métriques et audit final.
+        // Au-delà de `deferAfterSecs`, l'agent reçoit un numéro et relit le résultat ensuite.
         let defer_after = self.config.lock().await.defer_after_secs;
-        let mut call = {
+        let tenant = CALL_TENANT.try_with(|t| t.clone()).ok().flatten();
+        let follow: Arc<std::sync::Mutex<Follow>> =
+            Arc::new(std::sync::Mutex::new(Follow::default()));
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        {
             let manager = self.child_manager.clone();
             let (key, name, args) = (process_key.clone(), tool.clone(), arguments.clone());
             let root = crate::child::call_root();
-            tokio::spawn(crate::child::CALL_ROOT.scope(root, async move {
+            let call = tokio::spawn(crate::child::CALL_ROOT.scope(root, async move {
                 manager.call_tool(&key, &name, args).await
-            }))
-        };
-        let joined = if defer_after == 0 {
-            Some((&mut call).await)
+            }));
+            let tracker = CallTracker {
+                audit: self.audit.clone(),
+                config: self.config.clone(),
+                cache: self.response_cache.clone(),
+                metrics: self.metrics.clone(),
+                usage_writer: self.usage_writer.clone(),
+                process_key: process_key.clone(),
+                mutating,
+                tenant: tenant.clone(),
+                base: audit_base.clone(),
+                started: start_time,
+                follow: follow.clone(),
+            };
+            tokio::spawn(async move {
+                let res = joined_result(call.await, &tracker.base.server, &tracker.base.tool);
+                tracker.finish(&res).await;
+                let _ = done_tx.send(res);
+            });
+        }
+        let waited = if defer_after == 0 {
+            Some(done_rx.await)
         } else {
-            tokio::time::timeout(std::time::Duration::from_secs(defer_after), &mut call)
+            tokio::time::timeout(std::time::Duration::from_secs(defer_after), done_rx)
                 .await
                 .ok()
         };
-        let Some(joined) = joined else {
-            let tenant = CALL_TENANT.try_with(|t| t.clone()).ok().flatten();
-            let handle = crate::jobs::register(tenant.clone(), &server, &tool);
-            self.record_audit(AuditEntry {
-                status: "deferred",
-                duration_ms: Some(start_time.elapsed().as_millis() as u64),
-                ..audit_base.clone()
-            })
-            .await;
-            let (audit, config, cache, key, job, base) = (
-                self.audit.clone(),
-                self.config.clone(),
-                self.response_cache.clone(),
-                process_key.clone(),
-                handle.clone(),
-                audit_base,
-            );
-            tokio::spawn(async move {
-                let res = joined_result(call.await, &base.server, &base.tool);
-                if mutating {
-                    cache.invalidate_server(&key);
-                }
-                let cfg = config.lock().await.audit.clone();
-                audit.record(
-                    &cfg,
-                    AuditEntry {
-                        status: audit_status(&res),
-                        duration_ms: Some(start_time.elapsed().as_millis() as u64),
-                        error: audit_error(&res),
-                        tenant,
-                        ..base
-                    },
-                );
-                crate::jobs::finish(&job, res);
-            });
-            let text = crate::jobs::running_text(&handle, &server, &tool, defer_after);
-            return JsonRpcResponse::success(
-                id,
-                serde_json::json!({ "content": [{ "type": "text", "text": text }] }),
-            );
-        };
-        let res = joined_result(joined, &server, &tool);
-        if mutating {
-            self.response_cache.invalidate_server(&process_key);
-        }
-        let elapsed = start_time.elapsed().as_millis() as u64;
-
-        let usage_key = format!("{}__{}", process_key, tool);
-        let usage_snapshot = {
-            let mut m = self.metrics.lock().await;
-            m.total_requests += 1;
-            let sm = m.servers.entry(process_key.clone()).or_default();
-            sm.call_count += 1;
-            sm.total_latency_ms += elapsed;
-            sm.last_call_time = Some(SystemTime::now());
-            if let Err(ref e) = res {
-                sm.error_count += 1;
-                sm.last_error = Some(e.clone());
-            }
-            m.tools
-                .entry(usage_key.clone())
-                .or_default()
-                .record_call(elapsed, res.is_err());
-            if res.is_ok() {
-                *m.tool_calls.entry(usage_key).or_insert(0) += 1;
-                Some(m.tool_calls.clone())
-            } else {
-                None
-            }
-        };
-
-        if let Some(snapshot) = usage_snapshot {
-            self.usage_writer.schedule(snapshot);
-        }
-
         self.record_execute_route(execute_strategy).await;
-        self.record_audit(AuditEntry {
-            status: audit_status(&res),
-            duration_ms: Some(elapsed),
-            error: audit_error(&res),
-            ..audit_base
-        })
-        .await;
+        let res = match waited {
+            Some(Ok(res)) => res,
+            Some(Err(_)) => Err(format!(
+                "{} {}/{} : suivi de l'appel interrompu dans McpHub ; verifier s'il a eu lieu avant de relancer",
+                crate::child::UNKNOWN_OUTCOME,
+                server,
+                tool
+            )),
+            None => {
+                let finished = {
+                    let mut state = follow.lock().unwrap_or_else(|e| e.into_inner());
+                    match state.done.take() {
+                        Some(res) => Ok(res),
+                        None => {
+                            let handle = crate::jobs::register(crate::jobs::NewJob {
+                                tenant: tenant.clone(),
+                                server: server.clone(),
+                                tool: tool.clone(),
+                                process_key: process_key.clone(),
+                                untrusted: tool_untrusted,
+                            });
+                            state.handle = Some(handle.clone());
+                            Err(handle)
+                        }
+                    }
+                };
+                match finished {
+                    // Terminé à l'instant : réponse normale.
+                    Ok(res) => res,
+                    Err(handle) => {
+                        self.record_audit(AuditEntry {
+                            status: "deferred",
+                            duration_ms: Some(start_time.elapsed().as_millis() as u64),
+                            ..audit_base
+                        })
+                        .await;
+                        let mut reply =
+                            crate::jobs::running_value(&handle, &server, &tool, defer_after);
+                        if let Some(note) = &server_note {
+                            reply["server_corrected"] = serde_json::json!(note);
+                        }
+                        return JsonRpcResponse::success(
+                            id,
+                            serde_json::json!({ "content": [{ "type": "text", "text": reply.to_string() }] }),
+                        );
+                    }
+                }
+            }
+        };
 
         match res {
             Ok(result) => {
-                let mut normalized = self.normalize_result_for_profile(result).await;
+                let normalized = self.normalize_result_for_profile(result).await;
                 if cacheable {
                     self.response_cache.put_if_current(
                         &process_key,
@@ -3248,46 +3259,18 @@ impl ProxyServer {
                         cache_generation,
                     );
                 }
-                if tool_untrusted {
-                    if let Some(obj) = normalized.as_object_mut() {
-                        obj.insert(
-                            "_untrusted".into(),
-                            serde_json::json!({
-                                "is_external_data": true,
-                                "hint": untrusted::UNTRUSTED_HINT,
-                            }),
-                        );
-                    }
-                }
+                let mut normalized = present_result(normalized, tool_untrusted, &process_key);
                 if let (Some(note), Some(obj)) = (&server_note, normalized.as_object_mut()) {
                     obj.insert("_server_corrected".into(), serde_json::json!(note));
                 }
-                // Jeton expiré (échec) ou bientôt expiré : dit en clair à l'agent, hors cache.
-                let failed = normalized.get("isError").and_then(|v| v.as_bool()) == Some(true);
-                if let Some(note) = crate::token_watch::note_for(&process_key, failed) {
-                    if let Some(obj) = normalized.as_object_mut() {
-                        if let Some(content) = obj.get_mut("content").and_then(|c| c.as_array_mut())
-                        {
-                            content.push(serde_json::json!({ "type": "text", "text": note }));
-                        }
-                        obj.insert("_token_alert".into(), serde_json::json!(note));
-                    }
-                }
                 JsonRpcResponse::success(id, normalized)
             }
-            Err(mut e) => {
+            Err(e) => {
                 let mut data = serde_json::json!({
                     "server": server,
                     "tool": tool,
                     "args_received": arguments,
                 });
-                // Le statut se lit en tête du message : l'avis va à la fin.
-                if let Some(note) = crate::token_watch::note_for(&process_key, true) {
-                    if !e.contains(&note) {
-                        e = format!("{}\n\n{}", e, note);
-                    }
-                    data["token_alert"] = serde_json::json!(note);
-                }
                 if failure_status(&e) == "error" {
                     if let Some(schema) = tool_schema {
                         data["inputSchema"] = schema;
@@ -3296,7 +3279,7 @@ impl ProxyServer {
                         );
                     }
                 }
-                tool_failure_response(id, e, data)
+                present_error(id, e, data, &process_key)
             }
         }
     }
@@ -3515,6 +3498,127 @@ fn audit_status(res: &Result<serde_json::Value, String>) -> &'static str {
         Ok(v) if v.get("isError").and_then(|b| b.as_bool()).unwrap_or(false) => "tool_error",
         Ok(_) => "ok",
     }
+}
+
+/// Suivi d'un appel : son numéro s'il a été différé, sinon son résultat s'il vient de finir.
+#[derive(Default)]
+struct Follow {
+    handle: Option<String>,
+    done: Option<Result<serde_json::Value, String>>,
+}
+
+/// Ce que la tâche de suivi fait à la fin de l'appel, que le client attende encore ou non.
+struct CallTracker {
+    audit: Arc<AuditLogger>,
+    config: Arc<Mutex<ProxyConfig>>,
+    cache: Arc<ResponseCache>,
+    metrics: Arc<Mutex<GlobalMetrics>>,
+    usage_writer: Arc<crate::metrics::UsageWriter>,
+    process_key: String,
+    mutating: bool,
+    tenant: Option<String>,
+    base: AuditEntry,
+    started: Instant,
+    follow: Arc<std::sync::Mutex<Follow>>,
+}
+
+impl CallTracker {
+    async fn finish(self, res: &Result<serde_json::Value, String>) {
+        // Avant et après : une lecture lancée pendant l'écriture ne doit pas survivre à celle-ci.
+        if self.mutating {
+            self.cache.invalidate_server(&self.process_key);
+        }
+        let elapsed = self.started.elapsed().as_millis() as u64;
+        let usage_key = format!("{}__{}", self.process_key, self.base.tool);
+        let usage_snapshot = {
+            let mut m = self.metrics.lock().await;
+            m.total_requests += 1;
+            let sm = m.servers.entry(self.process_key.clone()).or_default();
+            sm.call_count += 1;
+            sm.total_latency_ms += elapsed;
+            sm.last_call_time = Some(SystemTime::now());
+            if let Err(e) = res {
+                sm.error_count += 1;
+                sm.last_error = Some(e.clone());
+            }
+            m.tools
+                .entry(usage_key.clone())
+                .or_default()
+                .record_call(elapsed, res.is_err());
+            if res.is_ok() {
+                *m.tool_calls.entry(usage_key).or_insert(0) += 1;
+                Some(m.tool_calls.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(snapshot) = usage_snapshot {
+            self.usage_writer.schedule(snapshot);
+        }
+        let cfg = self.config.lock().await.audit.clone();
+        self.audit.record(
+            &cfg,
+            AuditEntry {
+                status: audit_status(res),
+                duration_ms: Some(elapsed),
+                error: audit_error(res),
+                tenant: self.tenant.clone(),
+                ..self.base.clone()
+            },
+        );
+        let mut state = self.follow.lock().unwrap_or_else(|e| e.into_inner());
+        match &state.handle {
+            Some(handle) => crate::jobs::finish(handle, res.clone()),
+            None => state.done = Some(res.clone()),
+        }
+    }
+}
+
+/// Résultat présenté à l'agent : marque des données externes (contre l'injection de consignes)
+/// et avis de jeton expiré ou bientôt expiré. Hors cache : appliqué à chaque réponse.
+fn present_result(
+    mut normalized: serde_json::Value,
+    untrusted: bool,
+    process_key: &str,
+) -> serde_json::Value {
+    if untrusted {
+        if let Some(obj) = normalized.as_object_mut() {
+            obj.insert(
+                "_untrusted".into(),
+                serde_json::json!({
+                    "is_external_data": true,
+                    "hint": untrusted::UNTRUSTED_HINT,
+                }),
+            );
+        }
+    }
+    let failed = normalized.get("isError").and_then(|v| v.as_bool()) == Some(true);
+    if let Some(note) = crate::token_watch::note_for(process_key, failed) {
+        if let Some(obj) = normalized.as_object_mut() {
+            if let Some(content) = obj.get_mut("content").and_then(|c| c.as_array_mut()) {
+                content.push(serde_json::json!({ "type": "text", "text": note }));
+            }
+            obj.insert("_token_alert".into(), serde_json::json!(note));
+        }
+    }
+    normalized
+}
+
+/// Erreur présentée à l'agent, avec l'avis de jeton expiré en fin de message (le statut se lit
+/// en tête).
+fn present_error(
+    id: Option<serde_json::Value>,
+    mut e: String,
+    mut data: serde_json::Value,
+    process_key: &str,
+) -> JsonRpcResponse {
+    if let Some(note) = crate::token_watch::note_for(process_key, true) {
+        if !e.contains(&note) {
+            e = format!("{}\n\n{}", e, note);
+        }
+        data["token_alert"] = serde_json::json!(note);
+    }
+    tool_failure_response(id, e, data)
 }
 
 /// Résultat d'un appel lancé dans sa propre tâche : une tâche interrompue (panique, arrêt du
@@ -4355,6 +4459,14 @@ async fn config_and_cache_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resultat_relu_garde_la_marque_des_donnees_externes() {
+        let result = serde_json::json!({"content": [{"type": "text", "text": "page web"}]});
+        let marked = present_result(result.clone(), true, "serveur-sans-jeton");
+        assert_eq!(marked["_untrusted"]["is_external_data"], true);
+        assert!(present_result(result, false, "serveur-sans-jeton").get("_untrusted").is_none());
+    }
 
     #[test]
     fn message_d_erreur_note_au_journal() {
