@@ -920,7 +920,18 @@ async fn handle_repair_server(name: &str) -> Vec<u8> {
 
     // Step 2: start it exactly as the daemon does (sandbox, minimal environment without the
     // daemon's secrets, own process group).
-    let mut cmd = crate::child::local_command(name, &server_config);
+    let mut cmd = match crate::child::local_command(name, &server_config) {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            return json_ok(json!({
+                "ok": false,
+                "step": "sandbox_unavailable",
+                "error": e,
+                "suggestion": "Install the sandbox tool (bubblewrap on Linux), or set \"sandbox\": {\"ifUnavailable\": \"run\"} to start without isolation",
+                "auto_fixable": false
+            }))
+        }
+    };
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());

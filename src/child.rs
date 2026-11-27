@@ -672,14 +672,14 @@ pub fn base_child_env(unsandboxed: bool, inherit: &[String]) -> Vec<(String, Str
 /// Commande d'un serveur local, prête à lancer : sandbox, environnement minimal (jamais les
 /// secrets chargés dans le démon), ses propres variables, groupe de processus dédié.
 /// Utilisée par le démarrage normal et par le diagnostic du tableau de bord.
-pub fn local_command(name: &str, config: &ServerConfig) -> Command {
+pub fn local_command(name: &str, config: &ServerConfig) -> Result<Command, String> {
     let (program, program_args) = crate::sandbox::wrap(
         name,
         config.sandbox.as_ref(),
         &config.command,
         &config.args,
         &config.env,
-    );
+    )?;
     let mut cmd = Command::new(&program);
     cmd.args(&program_args).kill_on_drop(true);
     cmd.env_clear();
@@ -697,7 +697,7 @@ pub fn local_command(name: &str, config: &ServerConfig) -> Command {
     }
     #[cfg(unix)]
     cmd.process_group(0);
-    cmd
+    Ok(cmd)
 }
 
 /// Sortie d'erreur d'un serveur enfant : ~/Library/Logs/McpHub/<serveur>.stderr.log (remise à zéro
@@ -1446,7 +1446,7 @@ async fn start_instance(
                 config.sandbox.as_ref().map(|s| s.mode)
             );
         }
-        let mut cmd = local_command(name, config);
+        let mut cmd = local_command(name, config)?;
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(child_stderr(name));

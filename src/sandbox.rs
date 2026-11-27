@@ -36,6 +36,9 @@ pub struct SandboxSpec {
     /// Programmes sensibles autorisés malgré tout (ex. "osascript", "open" pour un serveur
     /// qui pilote le simulateur iOS).
     pub allow_exec: Vec<String>,
+    /// Isolation impossible sur cette machine (pas de bwrap, pas de sandbox-exec) : `false`
+    /// (défaut) refuse le démarrage ; `true` (`"ifUnavailable": "run"`) lance sans isolation.
+    pub run_if_unavailable: bool,
 }
 
 /// Secrets jamais lisibles par un serveur isolé (relatifs au dossier personnel).
@@ -156,7 +159,7 @@ fn mode_of(server_name: &str, s: &str) -> Result<ModeSetting, String> {
     }
 }
 
-const SPEC_KEYS: &[&str] = &["mode", "network", "allowRead", "allowWrite", "allowExec"];
+const SPEC_KEYS: &[&str] = &["mode", "network", "allowRead", "allowWrite", "allowExec", "ifUnavailable"];
 
 /// Réglage effectif d'un serveur : `mcpServers.X.sandbox` (false / true / "shield" / "strict" /
 /// objet), sinon `settings.sandbox` global, sinon pas d'isolation.
@@ -183,6 +186,7 @@ pub fn resolve(
         allow_read: Vec::new(),
         allow_write: Vec::new(),
         allow_exec: Vec::new(),
+        run_if_unavailable: false,
     };
     match &spec_value {
         Value::Bool(true) => {}
@@ -220,6 +224,17 @@ pub fn resolve(
             spec.allow_read = str_list(&label, "allowRead", o.get("allowRead"))?;
             spec.allow_write = str_list(&label, "allowWrite", o.get("allowWrite"))?;
             spec.allow_exec = str_list(&label, "allowExec", o.get("allowExec"))?;
+            spec.run_if_unavailable = match o.get("ifUnavailable") {
+                None => false,
+                Some(Value::String(v)) if v == "refuse" => false,
+                Some(Value::String(v)) if v == "run" => true,
+                Some(_) => {
+                    return Err(format!(
+                        "{} : sandbox.ifUnavailable doit etre \"refuse\" ou \"run\"",
+                        label
+                    ))
+                }
+            };
         }
         _ => {
             return Err(format!(
@@ -538,18 +553,30 @@ pub fn bwrap_args(spec: &SandboxSpec, home: &str, referenced: &[String]) -> Vec<
     a
 }
 
+/// Isolation demandée mais impossible ici : refus, sauf `"ifUnavailable": "run"`.
+fn unavailable(server: &str, spec: &SandboxSpec, why: &str, command: &str, args: &[String]) -> Result<(String, Vec<String>), String> {
+    if spec.run_if_unavailable {
+        eprintln!("[McpHub][SANDBOX] {} : {}, serveur lance SANS isolation (ifUnavailable: run)", server, why);
+        return Ok((command.to_string(), args.to_vec()));
+    }
+    Err(format!(
+        "{} : isolation demandee mais impossible ({}). Serveur non demarre. Installer l'outil, ou accepter le lancement sans isolation avec \"sandbox\": {{\"ifUnavailable\": \"run\"}}",
+        server, why
+    ))
+}
+
 /// Commande enveloppée : `/usr/bin/sandbox-exec -p PROFIL commande args...` (macOS) ou
-/// `bwrap ... -- commande args...` (Linux). Sans l'un ni l'autre, la commande est lancée telle
-/// quelle avec un avertissement.
+/// `bwrap ... -- commande args...` (Linux). Sans l'un ni l'autre, une isolation demandée
+/// empêche le démarrage (sauf `"ifUnavailable": "run"`).
 pub fn wrap(
     server: &str,
     spec: Option<&SandboxSpec>,
     command: &str,
     args: &[String],
     env: &HashMap<String, String>,
-) -> (String, Vec<String>) {
+) -> Result<(String, Vec<String>), String> {
     let Some(spec) = spec else {
-        return (command.to_string(), args.to_vec());
+        return Ok((command.to_string(), args.to_vec()));
     };
     let home = dirs::home_dir()
         .map(|h| h.to_string_lossy().to_string())
@@ -561,18 +588,19 @@ pub fn wrap(
             new_args.push("--".into());
             new_args.push(command.to_string());
             new_args.extend(args.iter().cloned());
-            return (bwrap, new_args);
+            return Ok((bwrap, new_args));
         }
-        eprintln!("[McpHub][SANDBOX] {} : bubblewrap (bwrap) indisponible ou refuse par le noyau, serveur lance sans isolation (apt install bubblewrap)", server);
-        return (command.to_string(), args.to_vec());
+        return unavailable(
+            server,
+            spec,
+            "bubblewrap (bwrap) absent ou refuse par le noyau, apt install bubblewrap",
+            command,
+            args,
+        );
     }
     let exe = "/usr/bin/sandbox-exec";
     if !cfg!(target_os = "macos") || !Path::new(exe).exists() {
-        eprintln!(
-            "[McpHub][SANDBOX] {} : sandbox-exec indisponible, serveur lance sans isolation",
-            server
-        );
-        return (command.to_string(), args.to_vec());
+        return unavailable(server, spec, "sandbox-exec absent sur ce systeme", command, args);
     }
     let referenced = referenced_paths(env, args, &home);
     let mut new_args = vec![
@@ -581,13 +609,30 @@ pub fn wrap(
         command.to_string(),
     ];
     new_args.extend(args.iter().cloned());
-    (exe.to_string(), new_args)
+    Ok((exe.to_string(), new_args))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn isolation_impossible_refusee_sauf_choix_explicite() {
+        let strict = resolve("x", &json!({"sandbox": "shield"}), None, "npx", &[]).unwrap().unwrap();
+        assert!(!strict.run_if_unavailable);
+        let err = unavailable("x", &strict, "outil absent", "npx", &["a".into()]).unwrap_err();
+        assert!(err.contains("non demarre") && err.contains("ifUnavailable"), "{}", err);
+        let lenient = resolve("x", &json!({"sandbox": {"mode": "shield", "ifUnavailable": "run"}}), None, "npx", &[])
+            .unwrap()
+            .unwrap();
+        assert!(lenient.run_if_unavailable);
+        assert_eq!(unavailable("x", &lenient, "outil absent", "npx", &["a".into()]).unwrap(), ("npx".to_string(), vec!["a".to_string()]));
+        // Réglage global hérité, valeur inconnue refusée.
+        let global = json!({"mode": "strict", "ifUnavailable": "run"});
+        assert!(resolve("x", &json!({}), Some(&global), "npx", &[]).unwrap().unwrap().run_if_unavailable);
+        assert!(resolve("x", &json!({"sandbox": {"ifUnavailable": "maybe"}}), None, "npx", &[]).is_err());
+    }
 
     #[test]
     fn resolution_des_reglages() {
@@ -667,6 +712,7 @@ mod tests {
             allow_read: vec![],
             allow_write: vec![],
             allow_exec: vec![],
+            run_if_unavailable: false,
         };
         let env = HashMap::from([("KEY".to_string(), "/Users/a/.private_keys/k.p8".to_string())]);
         let refs = referenced_paths(&env, &["--file=/Users/a/doc.txt".into()], "/Users/a");
@@ -712,6 +758,7 @@ mod tests {
             allow_read: vec![],
             allow_write: vec!["~/out".into(), "~".into()],
             allow_exec: vec!["open".into()],
+            run_if_unavailable: false,
         };
         let p = profile(&spec, "/Users/a", &[]);
         assert!(p.contains("(deny file-write*)\n"));
@@ -738,6 +785,7 @@ mod tests {
             allow_read: vec![],
             allow_write: vec!["~/.mcp-auth".into()],
             allow_exec: vec![],
+            run_if_unavailable: false,
         };
         let key = format!("{}/.ssh/deploy.p8", h);
         let a = bwrap_args(&shield, &h, std::slice::from_ref(&key)).join(" ");
@@ -759,6 +807,7 @@ mod tests {
             allow_read: vec![],
             allow_write: vec!["~".into()],
             allow_exec: vec![],
+            run_if_unavailable: false,
         };
         let b = bwrap_args(&strict, &h, &[]).join(" ");
         assert!(b.contains("--ro-bind / / --dev /dev --proc /proc"));

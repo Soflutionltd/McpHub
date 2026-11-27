@@ -365,6 +365,9 @@ fn build_entry(args: &Value, settings: Option<&Value>) -> Result<(Value, Vec<Str
                 crate::sandbox::resolve(label, &Value::Object(entry.clone()), global, cmd, &list)
             };
             match effective(&entry)? {
+                Some(spec) if spec.run_if_unavailable && args.get("sandbox").is_some() => {
+                    return Err("sandbox: an agent cannot allow running without isolation (ifUnavailable: run is for the user)".into())
+                }
                 Some(_) => {}
                 None if args.get("sandbox").is_some() => {
                     return Err("sandbox: an agent cannot turn the sandbox off (the user can, in the dashboard)".into())
@@ -759,6 +762,7 @@ mod tests {
             json!({"name": "x", "command": "npx", "sandbox": "false"}),
             json!({"name": "x", "command": "npx", "sandbox": {"mode": "off"}}),
             json!({"name": "x", "command": "npx", "sandbox": {"mode": "none", "network": false}}),
+            json!({"name": "x", "command": "npx", "sandbox": {"mode": "shield", "ifUnavailable": "run"}}),
             json!({"name": "x", "command": "npx", "args": "-y pkg"}),
             json!({"name": "x", "url": "https://a.example.com", "auth": "basic"}),
         ];
