@@ -1205,6 +1205,14 @@ fn bibliotheque_de_services_et_diagnostic() {
     assert!(!std::fs::read_to_string(fx.hub.join("config.json"))
         .unwrap()
         .contains("mcp.notion.com"));
+    // Le diagnostic décrit les serveurs et jetons de McpHub : refusé aussi depuis un client.
+    let (err, out) = hub_tool(
+        &mut hub,
+        "ready",
+        json!({ "server": "svc" }),
+        Some(&fx.acme),
+    );
+    assert!(err, "{}", out);
 
     // Diagnostic : un serveur prêt, un service pas encore connecté (avec la marche à suivre).
     let (err, ready) = hub_tool(&mut hub, "ready", json!({ "server": "svc" }), None);
