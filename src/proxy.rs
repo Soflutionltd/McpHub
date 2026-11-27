@@ -2092,6 +2092,41 @@ impl ProxyServer {
         )
     }
 
+    /// `job_result {handle}` : résultat d'un appel long, ou « toujours en cours ».
+    async fn handle_job_result(
+        &self,
+        id: Option<serde_json::Value>,
+        arguments: &serde_json::Value,
+        tenant: Option<&str>,
+    ) -> JsonRpcResponse {
+        let handle = arguments
+            .get("handle")
+            .and_then(|h| h.as_str())
+            .unwrap_or("");
+        let Some((server, tool, elapsed, state)) = crate::jobs::get(handle, tenant) else {
+            return JsonRpcResponse::error(
+                id,
+                -32602,
+                format!(
+                    "unknown or expired job {} (results are kept 30 minutes)",
+                    handle
+                ),
+            );
+        };
+        match state {
+            crate::jobs::JobState::Running => JsonRpcResponse::success(
+                id,
+                serde_json::json!({ "content": [{ "type": "text", "text": crate::jobs::running_text(handle, &server, &tool, elapsed) }] }),
+            ),
+            crate::jobs::JobState::Done(Ok(result)) => {
+                JsonRpcResponse::success(id, self.normalize_result_for_profile(result).await)
+            }
+            crate::jobs::JobState::Done(Err(e)) => {
+                tool_failure_response(id, e, serde_json::json!({ "server": server, "tool": tool }))
+            }
+        }
+    }
+
     /// Serveurs de la config (nom, adresse) : ce qui est déjà connecté pour le catalogue.
     async fn configured_list(&self) -> Vec<(String, Option<String>)> {
         self.config
@@ -2796,6 +2831,12 @@ impl ProxyServer {
             .get("arguments")
             .cloned()
             .unwrap_or(serde_json::json!({}));
+        // Résultat d'un appel long : relu par le compte qui l'a lancé, tenant compris.
+        if server.eq_ignore_ascii_case("mcphub") && tool == "job_result" {
+            return self
+                .handle_job_result(id, &arguments, ctx.tenant_id())
+                .await;
+        }
         if server.eq_ignore_ascii_case("mcphub") {
             // Outils internes (bibliothèque, installation dans la config McpHub) : pas depuis le
             // dossier d'un tenant, sauf "mcphub" dans ses sharedServers.
@@ -3077,10 +3118,66 @@ impl ProxyServer {
             self.response_cache.invalidate_server(&process_key);
         }
         let start_time = Instant::now();
-        let res = self
-            .child_manager
-            .call_tool(&process_key, &tool, arguments.clone())
+        // L'appel tourne dans sa propre tâche : au-delà de `deferAfterSecs`, l'agent reçoit un
+        // numéro et l'appel continue, au lieu d'être perdu au délai du client.
+        let defer_after = self.config.lock().await.defer_after_secs;
+        let mut call = {
+            let manager = self.child_manager.clone();
+            let (key, name, args) = (process_key.clone(), tool.clone(), arguments.clone());
+            let root = crate::child::call_root();
+            tokio::spawn(crate::child::CALL_ROOT.scope(root, async move {
+                manager.call_tool(&key, &name, args).await
+            }))
+        };
+        let joined = if defer_after == 0 {
+            Some((&mut call).await)
+        } else {
+            tokio::time::timeout(std::time::Duration::from_secs(defer_after), &mut call)
+                .await
+                .ok()
+        };
+        let Some(joined) = joined else {
+            let tenant = CALL_TENANT.try_with(|t| t.clone()).ok().flatten();
+            let handle = crate::jobs::register(tenant.clone(), &server, &tool);
+            self.record_audit(AuditEntry {
+                status: "deferred",
+                duration_ms: Some(start_time.elapsed().as_millis() as u64),
+                ..audit_base.clone()
+            })
             .await;
+            let (audit, config, cache, key, job, base) = (
+                self.audit.clone(),
+                self.config.clone(),
+                self.response_cache.clone(),
+                process_key.clone(),
+                handle.clone(),
+                audit_base,
+            );
+            tokio::spawn(async move {
+                let res = joined_result(call.await, &base.server, &base.tool);
+                if mutating {
+                    cache.invalidate_server(&key);
+                }
+                let cfg = config.lock().await.audit.clone();
+                audit.record(
+                    &cfg,
+                    AuditEntry {
+                        status: audit_status(&res),
+                        duration_ms: Some(start_time.elapsed().as_millis() as u64),
+                        error: audit_error(&res),
+                        tenant,
+                        ..base
+                    },
+                );
+                crate::jobs::finish(&job, res);
+            });
+            let text = crate::jobs::running_text(&handle, &server, &tool, defer_after);
+            return JsonRpcResponse::success(
+                id,
+                serde_json::json!({ "content": [{ "type": "text", "text": text }] }),
+            );
+        };
+        let res = joined_result(joined, &server, &tool);
         if mutating {
             self.response_cache.invalidate_server(&process_key);
         }
@@ -3400,6 +3497,24 @@ fn audit_status(res: &Result<serde_json::Value, String>) -> &'static str {
         Ok(v) if v.get("isError").and_then(|b| b.as_bool()).unwrap_or(false) => "tool_error",
         Ok(_) => "ok",
     }
+}
+
+/// Résultat d'un appel lancé dans sa propre tâche : une tâche interrompue (panique, arrêt du
+/// démon) laisse une issue inconnue, jamais rejouée.
+fn joined_result(
+    joined: Result<Result<serde_json::Value, String>, tokio::task::JoinError>,
+    server: &str,
+    tool: &str,
+) -> Result<serde_json::Value, String> {
+    joined.unwrap_or_else(|e| {
+        Err(format!(
+            "{} {}/{} : appel interrompu dans McpHub ({}) ; verifier s'il a eu lieu avant de relancer",
+            crate::child::UNKNOWN_OUTCOME,
+            server,
+            tool,
+            e
+        ))
+    })
 }
 
 /// Message d'erreur noté au journal : l'erreur McpHub, ou le texte d'une erreur rendue par
@@ -4225,15 +4340,28 @@ mod tests {
 
     #[test]
     fn message_d_erreur_note_au_journal() {
-        assert_eq!(audit_error(&Ok(serde_json::json!({"content": [{"type": "text", "text": "ok"}]}))), None);
+        assert_eq!(
+            audit_error(&Ok(
+                serde_json::json!({"content": [{"type": "text", "text": "ok"}]})
+            )),
+            None
+        );
         let rendue = serde_json::json!({"isError": true, "content": [{"type": "text", "text": "project not found"}]});
-        assert_eq!(audit_error(&Ok(rendue)).as_deref(), Some("project not found"));
+        assert_eq!(
+            audit_error(&Ok(rendue)).as_deref(),
+            Some("project not found")
+        );
         let vide = serde_json::json!({"isError": true, "content": []});
-        assert_eq!(audit_error(&Ok(vide)).as_deref(), Some("erreur rendue sans texte"));
+        assert_eq!(
+            audit_error(&Ok(vide)).as_deref(),
+            Some("erreur rendue sans texte")
+        );
         let long = "x".repeat(800);
         assert!(audit_error(&Err(long)).unwrap().ends_with("[tronque]"));
         let secret = serde_json::json!({"isError": true, "content": [{"type": "text", "text": "bad token ghp_abcdefghijklmnopqrstuvwxyz0123456789"}]});
-        assert!(!audit_error(&Ok(secret)).unwrap().contains("ghp_abcdefghijklmnopqrstuvwxyz0123456789"));
+        assert!(!audit_error(&Ok(secret))
+            .unwrap()
+            .contains("ghp_abcdefghijklmnopqrstuvwxyz0123456789"));
     }
 
     #[tokio::test]

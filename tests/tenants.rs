@@ -20,6 +20,7 @@ while IFS= read -r line; do
     *'"method":"tools/list"'*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"get_identity","description":"Identity","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
     *'"method":"tools/call"'*)
+      if [ -n "$FAKE_SLOW" ]; then sleep "$FAKE_SLOW"; fi
       printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"token=%s home=%s p8=%s leak=%s ssh=%s"}]}}\n' "$id" "$TOKEN" "$HOME" "$P8" "$LEAK" "$SSH_AUTH_SOCK" ;;
     *'"method":"ping"'*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
@@ -1228,5 +1229,62 @@ fn bibliotheque_de_services_et_diagnostic() {
         "{}",
         missing
     );
+    hub.finish();
+}
+
+#[test]
+fn un_appel_long_continue_et_se_relit() {
+    let fx = Fixture::new("long");
+    // svc met 3 s à répondre ; McpHub rend la main après 1 s.
+    let path = fx.hub.join("config.json");
+    let mut config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    config["servers"]["svc"]["env"]["FAKE_SLOW"] = json!("3");
+    config["settings"]["deferAfterSecs"] = json!(1);
+    std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+    let mut hub = fx.start();
+    let job_result = |hub: &mut Hub, handle: &str, wd: Option<&Path>| -> Value {
+        let mut call =
+            json!({ "server": "mcphub", "tool": "job_result", "arguments": { "handle": handle } });
+        if let Some(w) = wd {
+            call["_mcphub_context"] = json!({ "working_dir": w });
+        }
+        hub.request(
+            "tools/call",
+            json!({ "name": "mcphub_call", "arguments": call }),
+        )
+    };
+
+    let first = hub.call("svc", None, None).unwrap();
+    let running: Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(running["status"], "running", "{}", first);
+    assert!(running["note"]
+        .as_str()
+        .unwrap()
+        .contains("must NOT be sent again"));
+    let handle = running["handle"].as_str().unwrap().to_string();
+
+    // Tout de suite : encore en cours. Depuis le dossier d'un client : inconnu.
+    let now = job_result(&mut hub, &handle, None);
+    assert!(
+        now.to_string().contains("\\\"status\\\":\\\"running\\\""),
+        "{}",
+        now
+    );
+    let other = job_result(&mut hub, &handle, Some(&fx.acme));
+    assert!(other.get("error").is_some(), "{}", other);
+
+    // Après la fin réelle de l'appel : son résultat, une seule exécution.
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    let done = job_result(&mut hub, &handle, None);
+    assert!(
+        done["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("token=hub-secret"),
+        "{}",
+        done
+    );
+    let unknown = job_result(&mut hub, "job-inconnu-1", None);
+    assert!(unknown.get("error").is_some());
     hub.finish();
 }

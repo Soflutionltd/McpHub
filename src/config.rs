@@ -56,6 +56,9 @@ pub struct ProxyConfig {
     pub idle_timeout_ms: u64,
     pub preload_delay_ms: u64,
     pub request_timeout_secs: u64,
+    /// Au-delà, `mcphub_call` répond « toujours en cours » avec un numéro et l'appel continue
+    /// (`settings.deferAfterSecs`, 0 = jamais).
+    pub defer_after_secs: u64,
     pub health_check_interval_secs: u64,
     pub health_auto_restart: bool,
     pub health_notifications: bool,
@@ -85,6 +88,7 @@ impl Default for ProxyConfig {
             idle_timeout_ms: 5 * 60 * 1000,
             preload_delay_ms: 200,
             request_timeout_secs: 120,
+            defer_after_secs: 45,
             health_check_interval_secs: 30,
             health_auto_restart: true,
             health_notifications: true,
@@ -704,6 +708,9 @@ fn config_from_json(json: &Value, source_path: Option<&Path>) -> Result<ProxyCon
             .and_then(|v| v.as_u64())
         {
             config.request_timeout_secs = timeout.max(1);
+        }
+        if let Some(defer) = settings.get("deferAfterSecs").and_then(|v| v.as_u64()) {
+            config.defer_after_secs = defer;
         }
         // Health monitor settings
         if let Some(health) = settings.get("health") {

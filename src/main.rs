@@ -17,6 +17,7 @@ mod health;
 mod http_guard;
 mod install;
 mod instance;
+mod jobs;
 mod logs;
 mod metrics;
 mod oauth;
