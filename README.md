@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/Soflutionltd/McpHub/releases/latest"><img src="https://img.shields.io/github/v/release/Soflutionltd/McpHub?color=F5B301&label=release" alt="Latest release"/></a>
-  <img src="https://img.shields.io/badge/MCP-2026--07--28-2563EB" alt="MCP 2026-07-28"/>
+  <img src="https://img.shields.io/badge/MCP-2025--11--25-2563EB" alt="MCP 2025-11-25"/>
   <img src="https://img.shields.io/badge/written%20in-Rust-B7410E?logo=rust&logoColor=white" alt="Rust"/>
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-0F172A?logo=apple" alt="macOS and Linux"/>
   <img src="https://img.shields.io/badge/license-MIT-16A34A" alt="MIT"/>
@@ -326,7 +326,7 @@ return unhealthy.map(p => p.name);
 ```
 
 - `mcp.call(server, tool, args)` returns the tool result, `mcp.search(query)` finds tools, `console.log` is captured.
-- The program runs in a separate Node.js process (22.13 or newer) started with `--permission`: no files, no network, no subprocesses, inside a macOS sandbox.
+- The program runs in a separate Node.js process (22.13 or newer) started with `--permission`: no files, no network, no subprocesses, inside a macOS sandbox. Code mode needs Node and is macOS only for now: without `sandbox-exec` (Linux, Windows) `mcphub_run` is refused.
 - Its only way out is `mcp.call`, which goes through every McpHub guard (permissions, quarantine, profiles, audit).
 - Limits: `settings.codeMode` → `{ "timeoutSecs": 60, "maxCalls": 100 }`, output capped at 1 MB.
 
@@ -664,7 +664,7 @@ Files: `~/.McpHub/` (config, cache, pins, audit log, token; `~/.McpHub-<name>/` 
 <details>
 <summary><b>Does it work with any MCP server?</b></summary>
 
-Yes: any stdio server (`command` + `args`) and any Streamable HTTP server (`url`). Tool annotations, output schemas, paginated tool lists and protocol versions up to 2026-07-28 are relayed.
+Tools, yes: any stdio server (`command` + `args`) and any Streamable HTTP server (`url`). Tool annotations, output schemas, paginated tool lists and protocol versions up to 2025-11-25 are relayed; the 2026-07-28 revision (no `initialize`, `server/discover`) is not implemented yet. Requests a server sends back to the client, sampling and elicitation, are refused.
 
 </details>
 
