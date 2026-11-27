@@ -3118,7 +3118,7 @@ impl ProxyServer {
         self.record_audit(AuditEntry {
             status: audit_status(&res),
             duration_ms: Some(elapsed),
-            error: res.as_ref().err().cloned(),
+            error: audit_error(&res),
             ..audit_base
         })
         .await;
@@ -3255,7 +3255,7 @@ impl ProxyServer {
             status: audit_status(&res),
             duration_ms: Some(elapsed),
             arguments: Some(audit_arguments),
-            error: res.as_ref().err().cloned(),
+            error: audit_error(&res),
             tenant: None,
         })
         .await;
@@ -3400,6 +3400,33 @@ fn audit_status(res: &Result<serde_json::Value, String>) -> &'static str {
         Ok(v) if v.get("isError").and_then(|b| b.as_bool()).unwrap_or(false) => "tool_error",
         Ok(_) => "ok",
     }
+}
+
+/// Message d'erreur noté au journal : l'erreur McpHub, ou le texte d'une erreur rendue par
+/// l'outil (`isError`), sans secret et borné. Sans lui, impossible de savoir pourquoi un outil
+/// échoue.
+fn audit_error(res: &Result<serde_json::Value, String>) -> Option<String> {
+    let text = match res {
+        Err(e) => e.clone(),
+        Ok(v) if v.get("isError").and_then(|b| b.as_bool()).unwrap_or(false) => v
+            .get("content")
+            .and_then(|c| c.as_array())
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| "erreur rendue sans texte".into()),
+        Ok(_) => return None,
+    };
+    let text = crate::redaction::redact_text(&text);
+    Some(match text.char_indices().nth(500) {
+        Some((cut, _)) => format!("{} [tronque]", &text[..cut]),
+        None => text,
+    })
 }
 
 /// État réel d'un appel en échec : rien n'a été exécuté, effet inconnu, ou erreur rendue.
@@ -4195,6 +4222,19 @@ async fn config_and_cache_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_d_erreur_note_au_journal() {
+        assert_eq!(audit_error(&Ok(serde_json::json!({"content": [{"type": "text", "text": "ok"}]}))), None);
+        let rendue = serde_json::json!({"isError": true, "content": [{"type": "text", "text": "project not found"}]});
+        assert_eq!(audit_error(&Ok(rendue)).as_deref(), Some("project not found"));
+        let vide = serde_json::json!({"isError": true, "content": []});
+        assert_eq!(audit_error(&Ok(vide)).as_deref(), Some("erreur rendue sans texte"));
+        let long = "x".repeat(800);
+        assert!(audit_error(&Err(long)).unwrap().ends_with("[tronque]"));
+        let secret = serde_json::json!({"isError": true, "content": [{"type": "text", "text": "bad token ghp_abcdefghijklmnopqrstuvwxyz0123456789"}]});
+        assert!(!audit_error(&Ok(secret)).unwrap().contains("ghp_abcdefghijklmnopqrstuvwxyz0123456789"));
+    }
 
     #[tokio::test]
     async fn le_dossier_de_la_session_distingue_le_cache_et_vient_du_working_dir() {
