@@ -50,6 +50,40 @@ fn file_uri(path: &std::path::Path) -> String {
     uri
 }
 
+/// Instance d'un serveur propre à un dossier de projet : `serveur#<empreinte du dossier>`.
+/// Un serveur qui demande `roots/list` en reçoit une par projet : le dossier qu'il connaît ne
+/// change jamais, quel que soit le nombre de conversations en parallèle.
+pub fn is_root_instance(name: &str) -> bool {
+    name.contains('#')
+}
+
+/// Nom du serveur sans l'empreinte du dossier (`filesystem#3f2a` → `filesystem`).
+pub fn base_server(name: &str) -> &str {
+    name.split_once('#').map(|(base, _)| base).unwrap_or(name)
+}
+
+fn root_tag(root: &std::path::Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    root.hash(&mut hasher);
+    format!("{:08x}", hasher.finish() as u32)
+}
+
+/// Serveurs (clé de processus sans empreinte) qui ont demandé `roots/list` depuis le démarrage.
+fn roots_servers() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<String>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> = std::sync::OnceLock::new();
+    S.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Serveur qui dépend du dossier du projet : il a demandé `roots/list`, ou c'est le serveur de
+/// fichiers officiel (ses dossiers autorisés sont les racines reçues).
+fn uses_roots(name: &str, config: &ServerConfig) -> bool {
+    roots_servers().contains(name)
+        || std::iter::once(&config.command)
+            .chain(config.args.iter())
+            .any(|a| a.contains("server-filesystem"))
+}
+
 /// Les racines d'une session, au format MCP de `roots/list` : le dossier, nommé par son dernier élément.
 pub fn roots_value(root: Option<&std::path::Path>) -> serde_json::Value {
     let roots: Vec<serde_json::Value> = root
@@ -889,7 +923,7 @@ impl ChildManager {
 
     /// Nom exact d'une instance de tenant, sinon résolution normale.
     async fn resolve_internal(&self, name: &str) -> Option<String> {
-        if crate::tenant::is_instance_name(name) {
+        if crate::tenant::is_instance_name(name) || is_root_instance(name) {
             return self
                 .configs
                 .lock()
@@ -906,7 +940,7 @@ impl ChildManager {
     /// Un nom venu de l'extérieur ne désigne jamais une instance de tenant (`serveur@tenant`) :
     /// celles-ci ne s'atteignent que par le routage des tenants (`resolve_instance`).
     pub async fn resolve_name(&self, name: &str) -> Option<String> {
-        if crate::tenant::is_instance_name(name) {
+        if crate::tenant::is_instance_name(name) || is_root_instance(name) {
             return None;
         }
         let configs = self.configs.lock().await;
@@ -916,7 +950,7 @@ impl ChildManager {
         let lower = name.to_lowercase();
         for key in configs
             .keys()
-            .filter(|k| !crate::tenant::is_instance_name(k))
+            .filter(|k| !crate::tenant::is_instance_name(k) && !is_root_instance(k))
         {
             if key.to_lowercase() == lower {
                 return Some(key.clone());
@@ -925,7 +959,7 @@ impl ChildManager {
         let normalized = lower.replace(['-', '_'], "");
         for key in configs
             .keys()
-            .filter(|k| !crate::tenant::is_instance_name(k))
+            .filter(|k| !crate::tenant::is_instance_name(k) && !is_root_instance(k))
         {
             let key_normalized = key.to_lowercase().replace(['-', '_'], "");
             if key_normalized == normalized {
@@ -956,6 +990,24 @@ impl ChildManager {
             self.bump_epoch();
             pool.kill_now().await;
         }
+    }
+
+    /// Processus à utiliser pour l'appel en cours : le serveur lui-même, ou, s'il dépend du
+    /// dossier du projet, l'instance propre à ce dossier (créée au besoin, même config).
+    async fn root_instance(&self, name: &str) -> String {
+        let Some(root) = call_root() else {
+            return name.to_string();
+        };
+        let mut configs = self.configs.lock().await;
+        let Some(config) = configs.get(name).cloned() else {
+            return name.to_string();
+        };
+        if is_root_instance(name) || !uses_roots(name, &config) {
+            return name.to_string();
+        }
+        let key = format!("{}#{}", name, root_tag(&root));
+        configs.entry(key.clone()).or_insert(config);
+        key
     }
 
     /// Relit les outils d'un serveur en marche (après `notifications/tools/list_changed`) :
@@ -1191,6 +1243,7 @@ impl ChildManager {
             .resolve_internal(server_name)
             .await
             .ok_or_else(|| format!("Unknown server: {}", server_name))?;
+        let resolved = self.root_instance(&resolved).await;
         let server_name = resolved.as_str();
 
         self.start_server(server_name).await?;
@@ -1213,7 +1266,7 @@ impl ChildManager {
                 self.discard(server_name, &pool).await;
                 self.start_server(server_name).await?;
                 // Le serveur relancé a pu changer ses définitions : re-contrôle avant l'envoi.
-                if let Some(reason) = crate::toolguard::quarantined(server_name, tool_name) {
+                if let Some(reason) = crate::toolguard::quarantined(base_server(server_name), tool_name) {
                     return Err(format!(
                         "Bloque par McpHub apres redemarrage de {} : outil {} en quarantaine ({})",
                         server_name, tool_name, reason
@@ -1559,7 +1612,8 @@ async fn list_tools(proc: &Instance, name: &str, request_timeout_secs: u64) -> R
 
     // Épinglage / détection d'empoisonnement sur la définition réellement annoncée,
     // pour chaque instance du pool.
-    crate::toolguard::review(name, &tools);
+    // Une instance par dossier partage les épingles de son serveur.
+    crate::toolguard::review(base_server(name), &tools);
     Ok(tools)
 }
 
@@ -1591,6 +1645,10 @@ async fn answer_server_request(shared: Arc<StdioShared>, id: serde_json::Value, 
     let reply = if method == "ping" {
         serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} })
     } else if method == "roots/list" {
+        let key = base_server(&shared.server_name).to_string();
+        if roots_servers().insert(key.clone()) {
+            eprintln!("[McpHub][INFO] {} demande son dossier (roots/list) : une instance par projet desormais", key);
+        }
         let root = shared
             .root
             .lock()
@@ -2164,28 +2222,47 @@ done
             "{}",
             answers[0]
         );
+        // Le serveur a demandé son dossier : chaque projet a désormais son propre processus,
+        // dont le dossier ne change jamais (deux conversations en parallèle ne s'emmêlent pas).
+        let before = lines(&dir.join("pids")).len();
         call(Some("/tmp/Mon projet")).await;
         call(Some("/tmp/autre")).await;
-        let answers = wait_lines(&dir.join("answers"), 3).await;
-        assert!(
-            answers[2].contains("file:///tmp/autre"),
-            "le dossier du dernier appel : {}",
-            answers[2]
-        );
-        assert_eq!(
-            lines(&dir.join("changed")).len(),
-            2,
-            "averti seulement quand le dossier change"
-        );
+        call(Some("/tmp/Mon projet")).await;
+        let answers = wait_lines(&dir.join("answers"), 4).await;
+        // Deux processus écrivent dans le même fichier : l'ordre entre eux n'est pas fixé.
+        let count = |uri: &str| answers[1..].iter().filter(|a| a.contains(uri)).count();
+        assert_eq!(count("file:///tmp/Mon%20projet"), 2, "{:?}", answers);
+        assert_eq!(count("file:///tmp/autre"), 1, "{:?}", answers);
+        assert_eq!(lines(&dir.join("pids")).len(), before + 2, "un processus par dossier, reutilise");
+        // Un avis par processus, au premier dossier reçu ; le retour sur un projet n'en
+        // ajoute aucun.
+        assert_eq!(lines(&dir.join("changed")).len(), 3, "le dossier d'un processus ne change jamais");
+        // Une instance de dossier ne se désigne pas de l'extérieur.
+        let tagged = format!("fake-racines#{}", root_tag(Path::new("/tmp/autre")));
+        assert_eq!(manager.resolve_name(&tagged).await, None);
 
         call(None).await;
-        let calls = wait_lines(&dir.join("calls"), 4).await;
-        assert!(
-            !calls[3].contains("_meta"),
-            "sans session connue, rien n'est ajouté : {}",
-            calls[3]
+        let calls = wait_lines(&dir.join("calls"), 5).await;
+        assert_eq!(
+            calls.iter().filter(|c| !c.contains("_meta")).count(),
+            1,
+            "sans session connue, rien n'est ajouté : {:?}",
+            calls
         );
         manager.stop_all().await;
+    }
+
+    #[test]
+    fn serveur_de_fichiers_une_instance_par_projet() {
+        let dir = fake_dir("fs-detecte");
+        let mut fs = fake_config(&dir, &[], 5);
+        fs.args = vec!["-y".into(), "@modelcontextprotocol/server-filesystem".into()];
+        assert!(uses_roots("filesystem", &fs));
+        assert!(!uses_roots("autre-serveur-jamais-vu", &fake_config(&dir, &[], 5)));
+        assert_eq!(base_server("filesystem#3f2a01bc"), "filesystem");
+        assert_eq!(base_server("github@acme#3f2a01bc"), "github@acme");
+        assert_eq!(base_server("github"), "github");
+        assert_ne!(root_tag(Path::new("/a")), root_tag(Path::new("/b")));
     }
 
     #[test]
