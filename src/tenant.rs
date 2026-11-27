@@ -505,6 +505,15 @@ pub fn route(ctx: &Context, server: &str) -> Result<Route, String> {
             server
         ));
     }
+    // Instance propre à un dossier de projet (`serveur#empreinte`) : choisie par McpHub d'après
+    // le dossier de l'appel, jamais désignée par l'appelant (elle échapperait aux règles du
+    // serveur de base).
+    if crate::child::is_root_instance(server) {
+        return Err(format!(
+            "serveur \"{}\" refuse : l'instance d'un dossier se deduit du dossier de travail, pas de son nom",
+            server
+        ));
+    }
     match ctx {
         Context::Hub => Ok(Route::Hub(server.to_string())),
         Context::Tenant(t) if t.owns(server) => Ok(Route::Tenant {
@@ -1648,6 +1657,7 @@ mod tests {
             Route::Hub("supabase".into())
         );
         assert!(route(&Context::Hub, "supabase@acme").is_err());
+        assert!(route(&Context::Hub, "filesystem#3f2a01bc").is_err());
         // Ni depuis un tenant par le nom de l'instance.
         let acme = ctx(Some("/w/Clients/Acme"), None).unwrap();
         assert!(route(&acme, "supabase@acme").is_err());

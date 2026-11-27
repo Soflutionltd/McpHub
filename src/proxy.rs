@@ -3434,8 +3434,9 @@ async fn watch_tools_changed(
             match manager.refresh_tools(&name).await {
                 Some(Ok(tools)) => {
                     eprintln!("[McpHub][INFO] {} : liste d'outils changee, {} outils relus", name, tools.len());
-                    // Les instances de tenant ne sont pas au catalogue partagé.
-                    if let Some(entry) = cache.servers.get_mut(&name) {
+                    // Une instance de dossier met à jour le catalogue de son serveur ; les
+                    // instances de tenant ne sont pas au catalogue partagé.
+                    if let Some(entry) = cache.servers.get_mut(crate::child::base_server(&name)) {
                         *entry = tools;
                         changed = true;
                     }
