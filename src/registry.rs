@@ -2157,6 +2157,38 @@ pub struct InstallRequest {
 
 /// Installe un serveur du registre dans ~/.McpHub/config.json. S'il manque des valeurs
 /// obligatoires, rien n'est écrit et la réponse liste ce qu'il faut saisir (`needs`).
+/// Réglage `sandbox` à écrire pour un serveur installé (`None` : rien à écrire). Bouclier pour
+/// le code local (sauf réglage global, qui s'applique alors), aucun pour Docker (déjà isolé)
+/// ni pour le distant. Installé par un agent : l'isolation est vérifiée une fois le réglage
+/// interprété, un nom exempté par défaut (desktop-commander...) reçoit un bouclier explicite.
+fn install_sandbox(
+    kind: &str,
+    by: &str,
+    local: &str,
+    cfg: &Value,
+    global: Option<&Value>,
+) -> Result<Option<Value>, String> {
+    let sandbox = match kind {
+        "remote" => return Ok(None),
+        "oci" => return Ok(Some(json!(false))),
+        _ if global.is_some() => None,
+        _ => Some(json!("shield")),
+    };
+    if by != "agent" || sandbox.is_some() {
+        return Ok(sandbox);
+    }
+    let command = cfg.get("command").and_then(|c| c.as_str()).unwrap_or_default();
+    let args: Vec<String> = cfg
+        .get("args")
+        .and_then(|a| a.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    Ok(match crate::sandbox::resolve(local, cfg, global, command, &args)? {
+        Some(_) => None,
+        None => Some(json!("shield")),
+    })
+}
+
 pub async fn install(req: InstallRequest) -> Result<Value, String> {
     let e = entry(&req.name).await?;
     if status(&e) == "deleted" {
@@ -2259,12 +2291,7 @@ pub async fn install(req: InstallRequest) -> Result<Value, String> {
     let global_sandbox = config
         .pointer("/settings/sandbox")
         .filter(|v| !matches!(v, Value::Bool(false)));
-    let sandbox = match kind.as_str() {
-        "remote" => None,
-        "oci" => Some(json!(false)),
-        _ if global_sandbox.is_some() => None,
-        _ => Some(json!("shield")),
-    };
+    let sandbox = install_sandbox(&kind, &req.by, &local, &cfg, global_sandbox)?;
     if let Some(sb) = &sandbox {
         cfg["sandbox"] = sb.clone();
     }
@@ -2734,6 +2761,23 @@ pub async fn run_cli(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn isolation_d_un_serveur_installe() {
+        let global = json!("shield");
+        let exempt = json!({"command": "npx", "args": ["-y", "@wonderwhy-er/desktop-commander"]});
+        let plain = json!({"command": "npx", "args": ["-y", "weather-mcp"]});
+        // Agent + réglage global + nom exempté : bouclier explicite.
+        assert_eq!(install_sandbox("package", "agent", "desktop-commander", &exempt, Some(&global)).unwrap(), Some(json!("shield")));
+        // Agent + réglage global + serveur ordinaire : le réglage global s'applique.
+        assert_eq!(install_sandbox("package", "agent", "weather", &plain, Some(&global)).unwrap(), None);
+        // Sans réglage global : bouclier.
+        assert_eq!(install_sandbox("package", "agent", "weather", &plain, None).unwrap(), Some(json!("shield")));
+        // L'utilisateur garde l'exemption par défaut ; Docker et distant inchangés.
+        assert_eq!(install_sandbox("package", "dashboard", "desktop-commander", &exempt, Some(&global)).unwrap(), None);
+        assert_eq!(install_sandbox("oci", "agent", "x", &plain, None).unwrap(), Some(json!(false)));
+        assert_eq!(install_sandbox("remote", "agent", "x", &json!({}), None).unwrap(), None);
+    }
 
     fn sample() -> Value {
         json!({
