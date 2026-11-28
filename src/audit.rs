@@ -70,6 +70,8 @@ pub struct AuditEntry {
     pub error: Option<String>,
     /// Tenant (compte client) à l'origine de l'appel ; absent = comptes McpHub.
     pub tenant: Option<String>,
+    /// Client arrivé par l'accès distant (nom et identifiant OAuth) ; absent = client local.
+    pub remote_client: Option<String>,
 }
 
 pub struct AuditLogger {
@@ -132,6 +134,9 @@ pub fn format_entry(cfg: &AuditConfig, e: &AuditEntry) -> String {
     }
     if let Some(t) = &e.tenant {
         obj["tenant"] = json!(t);
+    }
+    if let Some(c) = &e.remote_client {
+        obj["remote_client"] = json!(c);
     }
     if cfg.log_arguments {
         if let Some(args) = &e.arguments {

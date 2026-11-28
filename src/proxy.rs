@@ -27,6 +27,8 @@ tokio::task_local! {
     static CODE_RUN: std::sync::Arc<std::sync::atomic::AtomicUsize>;
     /// Tenant de l'appel en cours : noté dans chaque entrée du journal d'audit.
     static CALL_TENANT: Option<String>;
+    /// Client de l'accès distant à l'origine de la requête : noté dans le journal d'audit.
+    static REMOTE_CLIENT: Option<String>;
 }
 
 /// Le dossier de la session d'un appel : son `working_dir`, sinon le dossier du client McpHub.
@@ -405,6 +407,9 @@ impl ProxyServer {
     async fn record_audit(&self, mut entry: AuditEntry) {
         if entry.tenant.is_none() {
             entry.tenant = CALL_TENANT.try_with(|t| t.clone()).ok().flatten();
+        }
+        if entry.remote_client.is_none() {
+            entry.remote_client = REMOTE_CLIENT.try_with(|c| c.clone()).ok().flatten();
         }
         let cfg = self.audit_config().await;
         self.audit.record(&cfg, entry);
@@ -1163,6 +1168,22 @@ impl ProxyServer {
     ) -> Option<JsonRpcResponse> {
         REQUEST_PROFILE
             .scope(profile, self.handle_request(req))
+            .await
+    }
+
+    /// Requête d'un client de l'accès distant : toujours dans le profil `remote`, et le client
+    /// est noté dans chaque entrée du journal d'audit.
+    pub async fn handle_request_remote(
+        &self,
+        req: JsonRpcRequest,
+        client: String,
+    ) -> Option<JsonRpcResponse> {
+        let profile = Some(crate::toolguard::REMOTE_PROFILE.to_string());
+        REQUEST_PROFILE
+            .scope(
+                profile,
+                REMOTE_CLIENT.scope(Some(client), self.handle_request(req)),
+            )
             .await
     }
 
@@ -2069,6 +2090,7 @@ impl ProxyServer {
             arguments: Some(serde_json::json!({ "code": code, "calls": calls })),
             error: outcome.as_ref().err().cloned(),
             tenant: None,
+            remote_client: None,
         })
         .await;
         let mut payload = crate::codemode::run_payload(calls, elapsed, logs, policy.is_some());
@@ -2613,6 +2635,7 @@ impl ProxyServer {
                 arguments: Some(crate::audit::safe_arguments(&arguments)),
                 error: outcome.as_ref().err().cloned(),
                 tenant: None,
+                remote_client: None,
             })
             .await;
         }
@@ -2717,6 +2740,7 @@ impl ProxyServer {
             arguments: Some(crate::audit::safe_arguments(&arguments)),
             error: outcome.as_ref().err().cloned(),
             tenant: None,
+            remote_client: None,
         })
         .await;
         let (payload, is_error) = match outcome {
@@ -3355,6 +3379,7 @@ impl ProxyServer {
             arguments: Some(audit_arguments),
             error: audit_error(&res),
             tenant: None,
+            remote_client: None,
         })
         .await;
 

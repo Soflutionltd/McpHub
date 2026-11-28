@@ -1341,6 +1341,62 @@ fn profile_reason(
     None
 }
 
+/// Profil appliqué aux clients qui arrivent par l'accès distant (tunnel ou relais).
+pub const REMOTE_PROFILE: &str = "remote";
+
+/// Pourquoi le profil `remote` ne permet pas d'ouvrir l'accès distant, ou None s'il est sûr.
+/// Refus par défaut : un profil absent, sans liste de serveurs (vide = tous) ou qui n'est pas
+/// en lecture seule exposerait sur Internet des outils capables d'écrire.
+fn remote_problem(p: Option<&Profile>) -> Option<String> {
+    let Some(p) = p else {
+        return Some(format!(
+            "profil '{}' absent de settings.profiles : l'acces distant reste ferme",
+            REMOTE_PROFILE
+        ));
+    };
+    if p.servers.is_empty() {
+        return Some(format!(
+            "profil '{}' sans liste de serveurs (vide = tous) : nommer les serveurs autorises",
+            REMOTE_PROFILE
+        ));
+    }
+    if let Some(g) = p
+        .servers
+        .iter()
+        .find(|g| g.trim().trim_matches('*').is_empty())
+    {
+        return Some(format!(
+            "profil '{}' : le motif '{}' couvre tous les serveurs, nommer les serveurs autorises",
+            REMOTE_PROFILE, g
+        ));
+    }
+    if !p.read_only {
+        return Some(format!(
+            "profil '{}' : \"readOnly\": true est obligatoire pour l'acces distant",
+            REMOTE_PROFILE
+        ));
+    }
+    None
+}
+
+/// Serveurs listés dans le profil `remote` (affichés dans la fenêtre de consentement).
+pub fn remote_profile_servers() -> Vec<String> {
+    let mut st = state();
+    refresh(&mut st, false);
+    st.config
+        .profiles
+        .get(REMOTE_PROFILE)
+        .map(|p| p.servers.clone())
+        .unwrap_or_default()
+}
+
+/// Problème du profil `remote` tel qu'il est configuré en ce moment, ou None.
+pub fn remote_profile_problem() -> Option<String> {
+    let mut st = state();
+    refresh(&mut st, false);
+    remote_problem(st.config.profiles.get(REMOTE_PROFILE))
+}
+
 /// Le profil existe-t-il ?
 pub fn profile_exists(name: &str) -> bool {
     state().config.profiles.contains_key(name)
@@ -1638,6 +1694,28 @@ pub fn cmd_pins(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_profile_is_closed_by_default() {
+        assert!(remote_problem(None).is_some());
+        let mut p = Profile {
+            servers: vec![],
+            read_only: true,
+            ..Default::default()
+        };
+        assert!(remote_problem(Some(&p)).unwrap().contains("vide = tous"));
+        p.servers = vec!["*".into()];
+        assert!(remote_problem(Some(&p))
+            .unwrap()
+            .contains("tous les serveurs"));
+        p.servers = vec!["memorypilot".into(), "**".into()];
+        assert!(remote_problem(Some(&p)).is_some());
+        p.servers = vec!["memorypilot".into()];
+        p.read_only = false;
+        assert!(remote_problem(Some(&p)).unwrap().contains("readOnly"));
+        p.read_only = true;
+        assert_eq!(remote_problem(Some(&p)), None);
+    }
 
     #[test]
     fn profil_en_lecture_seule_sur_les_outils_internes() {
