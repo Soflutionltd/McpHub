@@ -131,16 +131,21 @@ pub fn send_notification(title: &str, body: &str) {
 
     #[cfg(target_os = "macos")]
     {
-        // osascript display notification: no permissions needed, no accessibility popup
-        let escaped_title = title.replace('"', "\\\"");
-        let escaped_body = body.replace('"', "\\\"");
-        let script = format!(
-            "display notification \"{}\" with title \"{}\"",
-            escaped_body, escaped_title
-        );
+        // osascript display notification: no permissions needed, no accessibility popup.
+        // Titre et texte passent par `argv`, jamais dans le script : un nom d'outil ou un
+        // message d'erreur venu d'un serveur ne peut pas y injecter d'AppleScript.
         let _ = std::process::Command::new("osascript")
-            .arg("-e")
-            .arg(&script)
+            .args([
+                "-e",
+                "on run argv",
+                "-e",
+                "display notification (item 2 of argv) with title (item 1 of argv)",
+                "-e",
+                "end run",
+                "--",
+                title,
+                body,
+            ])
             .spawn();
     }
 
