@@ -389,7 +389,11 @@ With `"pinning": "off"` (or `"warn"`), changed definitions are accepted automati
 "settings": { "toolSecurity": { "pinning": "off", "scan": "block", "newTools": "auto", "requireSignedCommits": true } }
 ```
 
-There is no pop-up: blocked tools are listed under `securityAlerts` in `mcphub_status` and `mcphub_bootstrap`, so the agent tells you at the start of the next conversation, and a call to a blocked tool returns the reason. `McpHub pins simulate` replays the filter on every cached tool, as if each were new, to check it would not hold back legitimate tools.
+**You are told without relying on the agent.** On macOS, when a new tool is held back (`"block"`, or set aside by `"auto"`), the daemon opens a native window listing the server, the tool, the reason and the description, with two buttons: **Approuver** (approve) and **Laisser bloque** (keep blocked, the default). Approving applies only to the definition shown; keeping it blocked is remembered, so the window does not come back for that tool (`McpHub pins approve` still works). With no answer after 10 minutes nothing is recorded and the window returns the next time the server starts. A tool whose definition changed or whose description looks suspicious never gets a one-click approval: you get a notification, and approve it with `McpHub pins approve` after reading it. Set `MCPHUB_NO_DIALOG=1` to turn windows and notifications off.
+
+The same setting is in the dashboard under **Settings > New tools**. Making it less strict from the dashboard requires the native confirmation window, which neither the page nor an agent can answer.
+
+Blocked tools are also listed under `securityAlerts` in `mcphub_status` and `mcphub_bootstrap`, and a call to a blocked tool returns the reason. `McpHub pins simulate` replays the filter on every cached tool, as if each were new, to check it would not hold back legitimate tools.
 
 </details>
 

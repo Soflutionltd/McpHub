@@ -66,6 +66,22 @@ impl GuardMode {
     }
 }
 
+/// Valeurs acceptées pour `toolSecurity.newTools` depuis le tableau de bord.
+pub const NEW_TOOLS_MODES: [&str; 4] = ["off", "warn", "auto", "block"];
+
+/// Valeur canonique de `toolSecurity.newTools` et sa rigueur (0 = tout accepter, 3 = tout
+/// faire approuver). Absent ou illisible : la valeur par défaut, la plus stricte.
+pub fn new_tools_level(value: Option<&Value>) -> (&'static str, u8) {
+    let mode = GuardMode::parse(value, GuardSettings::default().new_tools);
+    let rank = match mode {
+        GuardMode::Off => 0,
+        GuardMode::Warn => 1,
+        GuardMode::Auto => 2,
+        GuardMode::Block => 3,
+    };
+    (mode.as_str(), rank)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct GuardSettings {
     /// Outil dont la définition change après épinglage.
@@ -2327,6 +2343,14 @@ mod tests {
         review_pins(&mut pins, "srv", &tools, &settings, "t1");
         assert!(!pins.servers["srv"].tools["helper"].flags.is_empty());
         assert!(prompt_candidates(&pins, "srv", &tools, &settings).is_empty());
+    }
+
+    #[test]
+    fn rigueur_du_reglage_des_nouveaux_outils() {
+        assert_eq!(new_tools_level(None), ("block", 3));
+        assert_eq!(new_tools_level(Some(&json!("smart"))), ("auto", 2));
+        assert_eq!(new_tools_level(Some(&json!("off"))), ("off", 0));
+        assert!(new_tools_level(Some(&json!("warn"))).1 < new_tools_level(Some(&json!("auto"))).1);
     }
 
     #[test]

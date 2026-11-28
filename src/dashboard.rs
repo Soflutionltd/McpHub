@@ -484,6 +484,13 @@ fn handle_get_servers() -> Vec<u8> {
     json_ok(json!({
         "servers": result,
         "settings": config.get("settings").unwrap_or(&json!({})),
+        "newToolsMode": crate::toolguard::new_tools_level(
+            config
+                .get("settings")
+                .and_then(|s| s.get("toolSecurity"))
+                .and_then(|s| s.get("newTools"))
+        )
+        .0,
         "totalTools": total_tools,
         "cacheExists": cache.is_some(),
         "securityAlerts": crate::toolguard::security_alerts()
@@ -741,28 +748,109 @@ async fn handle_get_metrics(
     }
 }
 
-fn handle_update_settings(body: &str) -> Vec<u8> {
-    let data: Value = match serde_json::from_str(body) {
+/// Réglage demandé pour les nouveaux outils, s'il y en a un. Seule la clé `newTools` de
+/// `toolSecurity` se règle depuis la page : pinning et scan restent dans config.json.
+fn requested_new_tools(data: &Value) -> Result<Option<&str>, &'static str> {
+    let Some(sec) = data.get("toolSecurity") else {
+        return Ok(None);
+    };
+    let invalid = "toolSecurity accepts only newTools: off, warn, auto or block";
+    let obj = sec.as_object().ok_or(invalid)?;
+    if obj.len() != 1 {
+        return Err(invalid);
+    }
+    let mode = obj
+        .get("newTools")
+        .and_then(|v| v.as_str())
+        .ok_or(invalid)?;
+    if !crate::toolguard::NEW_TOOLS_MODES.contains(&mode) {
+        return Err(invalid);
+    }
+    Ok(Some(mode))
+}
+
+fn new_tools_label(mode: &str) -> &'static str {
+    match mode {
+        "off" => "tout accepter sans rien demander",
+        "warn" => "tout accepter et le noter dans le journal",
+        "auto" => "filtre automatique, le reste est a approuver",
+        _ => "chaque nouvel outil est a approuver",
+    }
+}
+
+/// `PUT /api/settings`. Assouplir la garde des nouveaux outils demande la fenêtre macOS
+/// native : ni la page ni un agent ne peuvent la valider.
+async fn handle_update_settings(proxy: Option<Arc<ProxyServer>>, body: &str) -> Vec<u8> {
+    let mut data: Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(_) => return json_err(400, "Invalid JSON"),
+    };
+    let new_tools = match requested_new_tools(&data) {
+        Ok(mode) => mode.map(String::from),
+        Err(e) => return json_err(400, e),
     };
     let mut config = match read_config() {
         Ok(c) => c,
         Err(resp) => return resp,
     };
-    if let Some(existing) = config.get_mut("settings").and_then(|v| v.as_object_mut()) {
-        if let Some(obj) = data.as_object() {
-            for (k, v) in obj {
-                existing.insert(k.clone(), v.clone());
+    if let Some(mode) = &new_tools {
+        let current = config
+            .get("settings")
+            .and_then(|s| s.get("toolSecurity"))
+            .and_then(|s| s.get("newTools"));
+        let (current_mode, current_rank) = crate::toolguard::new_tools_level(current);
+        let (_, wanted_rank) = crate::toolguard::new_tools_level(Some(&json!(mode)));
+        if wanted_rank < current_rank {
+            let message = format!(
+                "Le tableau de bord demande d'assouplir la garde des nouveaux outils.\n\nAujourd'hui : {}\nDemande : {}\n\nUn outil ajoute par un serveur deviendra utilisable par l'IA sans passer par vous.\n\nAutoriser ce changement ?",
+                new_tools_label(current_mode),
+                new_tools_label(mode)
+            );
+            match crate::proxy::ask_human(message, 120).await {
+                crate::confirm_dialog::DialogAnswer::Allow => {}
+                crate::confirm_dialog::DialogAnswer::Deny => {
+                    return json_err(403, "Change refused in the confirmation window")
+                }
+                crate::confirm_dialog::DialogAnswer::Timeout => {
+                    return json_err(403, "No answer in the confirmation window: nothing changed")
+                }
+                crate::confirm_dialog::DialogAnswer::Unavailable => {
+                    return json_err(
+                        403,
+                        "Confirmation window unavailable: set settings.toolSecurity.newTools in config.json",
+                    )
+                }
             }
         }
-    } else {
-        config["settings"] = data;
     }
-    match save_config(&config) {
-        Ok(()) => json_ok(json!({"ok": true, "settings": config["settings"]})),
-        Err(resp) => resp,
+    // Fusion clé par clé : toolSecurity garde ses autres réglages (pinning, scan...).
+    if let Some(obj) = data.as_object_mut() {
+        obj.remove("toolSecurity");
     }
+    if !config.get("settings").is_some_and(|v| v.is_object()) {
+        config["settings"] = json!({});
+    }
+    if let (Some(existing), Some(obj)) = (config["settings"].as_object_mut(), data.as_object()) {
+        for (k, v) in obj {
+            existing.insert(k.clone(), v.clone());
+        }
+        if let Some(mode) = &new_tools {
+            let sec = existing.entry("toolSecurity").or_insert_with(|| json!({}));
+            if !sec.is_object() {
+                *sec = json!({});
+            }
+            sec["newTools"] = json!(mode);
+        }
+    }
+    if let Err(resp) = save_config(&config) {
+        return resp;
+    }
+    if new_tools.is_some() {
+        if let Some(p) = &proxy {
+            p.reload_config_now().await;
+        }
+    }
+    json_ok(json!({"ok": true, "settings": config["settings"]}))
 }
 
 async fn handle_generate() -> Vec<u8> {
@@ -2405,7 +2493,7 @@ async fn route(
         ("POST", "/api/servers") => handle_add_server(&req.body),
         ("GET", "/api/settings") => handle_get_settings(),
         ("GET", "/api/metrics") => handle_get_metrics(proxy, sse).await,
-        ("PUT", "/api/settings") => handle_update_settings(&req.body),
+        ("PUT", "/api/settings") => handle_update_settings(proxy, &req.body).await,
         ("POST", "/api/generate") => handle_generate().await,
         _ => {
             if let Some(rest) = path.strip_prefix("/api/tenants/") {

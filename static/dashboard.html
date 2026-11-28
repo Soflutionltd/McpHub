@@ -312,6 +312,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
   <div id="view-settings" class="hidden">
     <div class="setting-row"><div class="setting-label"><div class="setting-name">Mode</div><div class="setting-desc">discover = 2 meta-tools, passthrough = all tools exposed</div></div><div class="setting-input"><select id="setting-mode"><option value="discover">discover</option><option value="passthrough">passthrough</option></select></div></div>
     <div class="setting-row"><div class="setting-label"><div class="setting-name">Idle Timeout (seconds)</div><div class="setting-desc">Kill idle server processes after this duration</div></div><div class="setting-input"><input type="number" id="setting-timeout" value="300" min="30" max="3600"></div></div>
+    <div class="setting-row"><div class="setting-label"><div class="setting-name"><label for="setting-new-tools">New tools</label></div><div class="setting-desc">When a server you already use announces a new tool. A blocked tool opens an approval window on this Mac; making this setting less strict asks for your confirmation there too.</div></div><div class="setting-input"><select id="setting-new-tools"><option value="block">Ask me for every new tool</option><option value="auto">Automatic filter, ask me for the rest</option><option value="warn">Accept everything, write it to the log</option><option value="off">Accept everything</option></select></div></div>
     <div class="setting-row"><div class="setting-label"><div class="setting-name">Cache</div><div class="setting-desc" id="cache-info">No cache</div></div><div><button class="btn btn-ghost" id="settings-rebuild" onclick="regenerateCache()">↻ Rebuild</button></div></div>
     <div style="margin-top:20px"><button class="btn btn-primary" onclick="saveSettings()">Save Settings</button></div>
   </div>
@@ -447,7 +448,7 @@ if(!MCPHUB_SESSION){document.addEventListener('DOMContentLoaded',()=>{document.b
 const __mcphubFetch = window.fetch.bind(window);
 window.fetch = (url, opts = {}) => { opts = Object.assign({}, opts); opts.headers = Object.assign({}, opts.headers || {}, { 'Authorization': 'Bearer ' + MCPHUB_SESSION }); return __mcphubFetch(url, opts); };
 
-let servers=[], settings={mode:'discover',idleTimeout:300}, totalTools=0, cacheExists=false;
+let servers=[], settings={mode:'discover',idleTimeout:300}, newToolsMode='block', totalTools=0, cacheExists=false;
 let currentView='servers', editingServerName=null;
 
 const ICONS={'github':'🐙','filesystem':'📁','supabase':'⚡','stripe':'💳','playwright':'🎭','firecrawl':'🔥','deepcrawl':'🕷️','MemoryPilot':'🧠','memory':'🧠','openmemory':'🧠','chrome-devtools':'🔧','desktop-commander':'🖥️','resend':'📧','lighthouse':'💡','magic':'✨','sequential-thinking':'🔗','context7':'📚','svelte':'🟠','browserbase':'🌐','browser-mcp':'🌐','cloudflare':'☁️','cloudflare-docs':'☁️','cloudflare-agents-docs':'☁️','app-store-connect':'🍎','xcodemcp':'📱','task-master':'📋','brandcheck':'🔍','depsonar':'📡','stitch':'🧵','recraft':'🎨'};
@@ -511,7 +512,7 @@ function switchView(view){
 async function fetchServers(){
   try{
     const res=await fetch('/api/servers');const data=await res.json();
-    servers=data.servers||[];settings=data.settings||settings;totalTools=data.totalTools||0;cacheExists=data.cacheExists||false;
+    servers=data.servers||[];settings=data.settings||settings;newToolsMode=data.newToolsMode||newToolsMode;totalTools=data.totalTools||0;cacheExists=data.cacheExists||false;
     renderAll();
   }catch(e){console.error(e)}
 }
@@ -546,6 +547,7 @@ function renderAll(){
   }
   document.getElementById('setting-mode').value=settings.mode||'discover';
   document.getElementById('setting-timeout').value=settings.idleTimeout||300;
+  document.getElementById('setting-new-tools').value=newToolsMode;
   document.getElementById('cache-info').textContent=cacheExists?totalTools+' tools cached':'No cache';
   renderGrid();
 }
@@ -759,8 +761,17 @@ async function regenerateCache(){
 async function saveSettings(){
   const mode=document.getElementById('setting-mode').value;
   const idleTimeout=parseInt(document.getElementById('setting-timeout').value);
-  await fetch('/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,idleTimeout})});
-  notify('Settings saved');
+  const body={mode,idleTimeout};
+  const newTools=document.getElementById('setting-new-tools').value;
+  if(newTools!==newToolsMode){body.toolSecurity={newTools};notify('Confirm in the McpHub window if it opens')}
+  try{
+    await api('PUT','/api/settings',body);
+    newToolsMode=newTools;
+    notify('Settings saved');
+  }catch(e){
+    document.getElementById('setting-new-tools').value=newToolsMode;
+    notify(e.message,'danger');
+  }
 }
 
 function dismissWelcome(){
