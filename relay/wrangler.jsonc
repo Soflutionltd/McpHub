@@ -2,7 +2,8 @@
   // Relais de l'acces distant de McpHub.
   // Au deploiement (cf-orchestrator), ajouter la variable RELAY_HOST (domaine du relais) et
   // deux routes sur sa zone : "RELAY_HOST/connect*" et "*.RELAY_HOST/*" (enregistrement DNS
-  // generique proxifie). Sans RELAY_HOST, le relais refuse tout.
+  // generique proxifie), plus une regle de limitation de debit (WAF) sur "*.RELAY_HOST".
+  // Sans RELAY_HOST, le relais refuse tout.
   "name": "mcphub-relay",
   "main": "src/index.ts",
   "compatibility_date": "2026-11-01",

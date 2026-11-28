@@ -1,8 +1,9 @@
 // Relais de l'accès distant de McpHub.
 //
 // - `wss://RELAY_HOST/connect?hub=<hubId>` : le McpHub de l'utilisateur s'y connecte avec son
-//   secret (en-tête Authorization). La première connexion enregistre l'empreinte SHA-256 du
-//   secret ; les suivantes doivent présenter le même. Une nouvelle connexion remplace l'ancienne.
+//   secret (en-tête Authorization). L'identifiant est dérivé du secret (26 premiers caractères
+//   base32 de son SHA-256) : le relais refait le calcul, ne garde rien, et personne ne peut
+//   prendre l'identifiant d'un autre. Une nouvelle connexion remplace l'ancienne.
 // - `https://<hubId>.RELAY_HOST/...` : toute requête (Gemini, claude.ai, ChatGPT) est transmise
 //   telle quelle au McpHub connecté, qui répond. Le relais ne lit ni ne garde rien d'autre :
 //   l'OAuth, le consentement, le profil et le journal d'audit restent dans McpHub.
@@ -36,12 +37,20 @@ interface ResponseHeader {
 interface Pending {
   resolve: (response: Response) => void;
   timer: ReturnType<typeof setTimeout>;
+  authorize: boolean;
+  bytes: number;
 }
 
 const HUB_ID = /^[a-z2-7]{26}$/;
 const MAX_BODY = 16 * 1024 * 1024;
+/// Corps admis hors de /mcp (inscription, jeton) : petit, pour ne pas saturer la mémoire.
+const MAX_SMALL_BODY = 1024 * 1024;
 const TIMEOUT_MS = 90_000;
 const MAX_PENDING = 32;
+/// Requêtes /authorize en attente au plus : elles ne bloquent jamais les appels /mcp.
+const MAX_PENDING_AUTHORIZE = 4;
+/// Octets de corps en transit au plus par hub (mémoire d'un Durable Object : 128 Mo).
+const MAX_PENDING_BYTES = 48 * 1024 * 1024;
 const HOP_HEADERS = new Set([
   "connection",
   "keep-alive",
@@ -89,12 +98,26 @@ function decodeFrame(frame: Uint8Array): { header: ResponseHeader; body: Uint8Ar
   }
 }
 
-async function sha256Hex(value: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+/// Même calcul que McpHub (src/remote_access/relay.rs, hub_id_for).
+async function hubIdFor(secret: string): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(secret)));
+  const alphabet = "abcdefghijklmnopqrstuvwxyz234567";
+  let bits = 0;
+  let acc = 0;
+  let out = "";
+  for (const byte of digest.subarray(0, 17)) {
+    acc = (acc << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      bits -= 5;
+      out += alphabet[(acc >> bits) & 31];
+    }
+    acc &= (1 << bits) - 1;
+  }
+  return out.slice(0, 26);
 }
 
-function sameHex(a: string, b: string): boolean {
+function sameText(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
   let diff = 0;
   for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
@@ -140,12 +163,8 @@ export class HubRelay extends DurableObject<Env> {
   private async acceptHub(request: Request): Promise<Response> {
     const auth = request.headers.get("Authorization") ?? "";
     const secret = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
-    if (secret.length < 32) return text(401, "unauthorized");
-    const hash = await sha256Hex(secret);
-    const stored = await this.ctx.storage.get<string>("secretHash");
-    if (stored === undefined) {
-      await this.ctx.storage.put("secretHash", hash);
-    } else if (!sameHex(stored, hash)) {
+    const hub = new URL(request.url).searchParams.get("hub") ?? "";
+    if (secret.length < 32 || !sameText(await hubIdFor(secret), hub)) {
       return text(401, "unauthorized");
     }
     for (const old of this.ctx.getWebSockets()) old.close(4000, "replaced by a new connection");
@@ -159,12 +178,20 @@ export class HubRelay extends DurableObject<Env> {
   private async forward(request: Request, url: URL): Promise<Response> {
     const socket = this.ctx.getWebSockets()[0];
     if (!socket) return text(503, "McpHub is offline");
-    if (this.pending.size >= MAX_PENDING) return text(429, "too many requests in flight");
-    if (Number(request.headers.get("Content-Length") ?? "0") > MAX_BODY) {
+    const authorize = url.pathname.startsWith("/authorize");
+    const pending = [...this.pending.values()];
+    if (pending.length >= MAX_PENDING) return text(429, "too many requests in flight");
+    if (authorize && pending.filter((p) => p.authorize).length >= MAX_PENDING_AUTHORIZE) {
+      return text(429, "too many sign-ins in progress");
+    }
+    const limit = url.pathname.replace(/\/+$/, "") === "/mcp" ? MAX_BODY : MAX_SMALL_BODY;
+    if (Number(request.headers.get("Content-Length") ?? "0") > limit) {
       return text(413, "payload too large");
     }
     const body = new Uint8Array(await request.arrayBuffer());
-    if (body.byteLength > MAX_BODY) return text(413, "payload too large");
+    if (body.byteLength > limit) return text(413, "payload too large");
+    const inFlight = pending.reduce((sum, p) => sum + p.bytes, 0);
+    if (inFlight + body.byteLength > MAX_PENDING_BYTES) return text(503, "relay busy, retry");
 
     const headers: Record<string, string> = {};
     request.headers.forEach((value, key) => {
@@ -182,7 +209,7 @@ export class HubRelay extends DurableObject<Env> {
         this.pending.delete(id);
         resolve(text(504, "McpHub did not answer in time"));
       }, TIMEOUT_MS);
-      this.pending.set(id, { resolve, timer });
+      this.pending.set(id, { resolve, timer, authorize, bytes: body.byteLength });
       try {
         socket.send(frame);
       } catch {

@@ -1,12 +1,30 @@
 // Essai local du relais contre `pnpm dev` (wrangler dev, RELAY_HOST=relay.localhost).
 // Joue le rôle d'un McpHub : se connecte en WebSocket, répond aux requêtes transmises.
 import http from "node:http";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import WebSocket from "ws";
 
 const PORT = Number(process.env.RELAY_PORT ?? 8787);
-const HUB = Array.from(randomBytes(26), (b) => "abcdefghijklmnopqrstuvwxyz234567"[b % 32]).join("");
+// Identifiant dérivé du secret, comme McpHub (hub_id_for) et le relais (hubIdFor).
+function hubIdFor(secret) {
+  const digest = createHash("sha256").update(secret).digest();
+  const alphabet = "abcdefghijklmnopqrstuvwxyz234567";
+  let bits = 0;
+  let acc = 0;
+  let out = "";
+  for (const byte of digest.subarray(0, 17)) {
+    acc = (acc << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      bits -= 5;
+      out += alphabet[(acc >> bits) & 31];
+    }
+    acc &= (1 << bits) - 1;
+  }
+  return out.slice(0, 26);
+}
 const SECRET = `mhrelay_${randomBytes(32).toString("base64url")}`;
+const HUB = hubIdFor(SECRET);
 
 function check(name, ok, info = "") {
   console.log(`${ok ? "OK  " : "FAIL"} ${name}${ok ? "" : ` ${info}`}`);
@@ -71,7 +89,10 @@ check("hote du hub transmis", echo.host === `${HUB}.relay.localhost`, echo.host)
 check("en-tetes de la reponse gardes, Connection retire", forwarded.headers["x-test"] === "1" && forwarded.headers.connection !== "close");
 
 const intruder = await connectHub(`mhrelay_${randomBytes(32).toString("base64url")}`);
-check("mauvais secret refuse", !intruder.ok && intruder.status === 401, intruder.status);
+check("autre secret refuse pour cet identifiant", !intruder.ok && intruder.status === 401, intruder.status);
+
+const bigLogin = await publicRequest("/register", { method: "POST", body: "x".repeat(1024 * 1024 + 10) });
+check("corps de plus de 1 Mo hors /mcp -> 413", bigLogin.status === 413, bigLogin.status);
 
 const badHub = await publicRequest("/mcp", { host: "UPPER.relay.localhost" });
 check("identifiant de hub invalide -> 404", badHub.status === 404, badHub.status);
