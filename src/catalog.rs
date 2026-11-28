@@ -299,7 +299,9 @@ pub fn suggestions(query: &str, configured: &[(String, Option<String>)]) -> Vec<
         .iter()
         .filter(|s| installed_as(s, configured).is_none())
         .map(|s| (score(s, query), s))
-        .filter(|(points, _)| *points > 0)
+        // Le nom du service, ou au moins deux mots-clés : un mot courant seul (« page »,
+        // « documentation ») ne suffit pas à proposer un service.
+        .filter(|(points, _)| *points >= 4)
         .collect();
     found.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.name.cmp(b.1.name)));
     found.into_iter().take(3).map(|(_, s)| s).collect()
@@ -425,6 +427,8 @@ mod tests {
         // Déjà connecté : plus proposé.
         assert!(!names("page notion", &configured(&[("notion", None)])).contains(&"notion"));
         assert!(names("météo de demain", &none).is_empty());
+        // Un mot courant isolé ne propose rien.
+        assert!(names("snapshot of current tab page elements", &none).is_empty());
         assert!(names("x", &none).is_empty());
     }
 
