@@ -116,6 +116,9 @@ pub struct Profile {
     /// Outils masqués, au format "serveur/outil" (jokers).
     pub exclude_tools: Vec<String>,
     pub read_only: bool,
+    /// Profil `remote` seulement : outils autorisés nommément ("serveur/outil"), en plus de
+    /// ceux qui passent la lecture seule stricte.
+    pub tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -233,6 +236,7 @@ pub fn parse_guard_config(raw: &Value) -> GuardConfig {
                     exclude_servers: str_list(p.get("excludeServers")),
                     exclude_tools: str_list(p.get("excludeTools")),
                     read_only: p.get("readOnly").and_then(|v| v.as_bool()).unwrap_or(false),
+                    tools: str_list(p.get("tools")),
                 },
             );
         }
@@ -336,6 +340,162 @@ pub fn looks_read_only(tool: &str, def: Option<&ToolDef>) -> bool {
     }
     let w = first_word(tool);
     READ_VERBS.contains(&w.as_str())
+}
+
+/// Mots qui signalent une écriture, où qu'ils soient dans le nom de l'outil.
+const WRITE_WORDS: &[&str] = &[
+    "add",
+    "apply",
+    "approve",
+    "archive",
+    "assign",
+    "book",
+    "buy",
+    "call",
+    "cancel",
+    "charge",
+    "clear",
+    "close",
+    "commit",
+    "copy",
+    "create",
+    "delete",
+    "deploy",
+    "disable",
+    "download",
+    "drop",
+    "edit",
+    "enable",
+    "exec",
+    "execute",
+    "export",
+    "flush",
+    "grant",
+    "import",
+    "insert",
+    "install",
+    "invite",
+    "invoke",
+    "issue",
+    "kill",
+    "launch",
+    "mark",
+    "merge",
+    "migrate",
+    "modify",
+    "move",
+    "mutate",
+    "open",
+    "order",
+    "patch",
+    "pause",
+    "pay",
+    "post",
+    "publish",
+    "purge",
+    "push",
+    "put",
+    "refund",
+    "remove",
+    "rename",
+    "reset",
+    "resolve",
+    "restart",
+    "restore",
+    "revoke",
+    "rollback",
+    "rotate",
+    "run",
+    "save",
+    "schedule",
+    "sell",
+    "send",
+    "set",
+    "sign",
+    "start",
+    "stop",
+    "submit",
+    "sync",
+    "transfer",
+    "trigger",
+    "uninstall",
+    "update",
+    "upload",
+    "upsert",
+    "write",
+];
+
+/// Verbes de lecture admis pour l'accès distant (sans export, download ni resolve, qui
+/// écrivent sur disque ou changent un état).
+const STRICT_READ_VERBS: &[&str] = &[
+    "get",
+    "list",
+    "search",
+    "read",
+    "find",
+    "fetch",
+    "describe",
+    "show",
+    "count",
+    "view",
+    "lookup",
+    "inspect",
+    "status",
+    "info",
+    "stat",
+    "stats",
+    "whoami",
+    "preview",
+    "browse",
+    "explain",
+    "diff",
+    "history",
+    "recall",
+    "summarize",
+    "summary",
+    "query",
+];
+
+fn name_words(tool: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut prev_lower = false;
+    for c in tool.chars() {
+        if !c.is_ascii_alphanumeric() {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            prev_lower = false;
+            continue;
+        }
+        if c.is_ascii_uppercase() && prev_lower && !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+        prev_lower = c.is_ascii_lowercase() || c.is_ascii_digit();
+        current.push(c.to_ascii_lowercase());
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+/// Lecture seule stricte (accès distant) : le serveur annonce readOnlyHint, le nom commence
+/// par un verbe de lecture et ne contient aucun mot d'écriture. Sinon, l'outil doit être
+/// autorisé nommément dans le profil (`tools`).
+pub fn strictly_read_only(tool: &str, def: Option<&ToolDef>) -> bool {
+    if is_destructive(tool) || def.is_some_and(|d| d.declared_destructive()) {
+        return false;
+    }
+    if def.and_then(|d| d.read_only_hint()) != Some(true) {
+        return false;
+    }
+    let words = name_words(tool);
+    let Some(first) = words.first() else {
+        return false;
+    };
+    STRICT_READ_VERBS.contains(&first.as_str())
+        && !words.iter().any(|w| WRITE_WORDS.contains(&w.as_str()))
 }
 
 // ─── Détection d'empoisonnement ──────────────────────────────
@@ -1323,6 +1483,9 @@ fn profile_reason(
     server: &str,
     tool: Option<(&str, Option<&ToolDef>)>,
 ) -> Option<String> {
+    if name == REMOTE_PROFILE {
+        return remote_reason(p, server, tool);
+    }
     if !p.servers.is_empty() && !p.servers.iter().any(|g| glob_match(g, server)) {
         return Some(format!("serveur absent du profil '{}'", name));
     }
@@ -1344,6 +1507,35 @@ fn profile_reason(
 /// Profil appliqué aux clients qui arrivent par l'accès distant (tunnel ou relais).
 pub const REMOTE_PROFILE: &str = "remote";
 
+/// Règles du profil `remote`, plus strictes que celles des autres profils et indépendantes
+/// de sa configuration du moment : serveurs nommés exactement (jamais `mcphub`), lecture
+/// seule toujours imposée, outils en lecture seule stricte ou autorisés nommément.
+fn remote_reason(
+    p: &Profile,
+    server: &str,
+    tool: Option<(&str, Option<&ToolDef>)>,
+) -> Option<String> {
+    if server == "mcphub" || !p.servers.iter().any(|s| s == server) {
+        return Some(format!("serveur absent du profil '{}'", REMOTE_PROFILE));
+    }
+    if let Some((tool, def)) = tool {
+        let key = format!("{}/{}", server, tool);
+        if p.exclude_tools.iter().any(|g| glob_match(g, &key)) {
+            return Some(format!("outil exclu du profil '{}'", REMOTE_PROFILE));
+        }
+        if p.tools.iter().any(|t| t == &key) {
+            return None;
+        }
+        if !strictly_read_only(tool, def) {
+            return Some(format!(
+                "acces distant : {} n'est pas reconnu comme lecture seule (readOnlyHint et nom de lecture). Pour l'autoriser quand meme : McpHub remote allow-tool {}",
+                key, key
+            ));
+        }
+    }
+    None
+}
+
 /// Pourquoi le profil `remote` ne permet pas d'ouvrir l'accès distant, ou None s'il est sûr.
 /// Refus par défaut : un profil absent, sans liste de serveurs (vide = tous) ou qui n'est pas
 /// en lecture seule exposerait sur Internet des outils capables d'écrire.
@@ -1363,11 +1555,17 @@ fn remote_problem(p: Option<&Profile>) -> Option<String> {
     if let Some(g) = p
         .servers
         .iter()
-        .find(|g| g.trim().trim_matches('*').is_empty())
+        .find(|g| g.contains('*') || g.contains('?'))
     {
         return Some(format!(
-            "profil '{}' : le motif '{}' couvre tous les serveurs, nommer les serveurs autorises",
+            "profil '{}' : motif '{}' refuse, nommer chaque serveur autorise",
             REMOTE_PROFILE, g
+        ));
+    }
+    if p.servers.iter().any(|s| s == "mcphub") {
+        return Some(format!(
+            "profil '{}' : le serveur interne mcphub ne peut pas etre expose",
+            REMOTE_PROFILE
         ));
     }
     if !p.read_only {
@@ -1704,17 +1902,67 @@ mod tests {
             ..Default::default()
         };
         assert!(remote_problem(Some(&p)).unwrap().contains("vide = tous"));
-        p.servers = vec!["*".into()];
-        assert!(remote_problem(Some(&p))
-            .unwrap()
-            .contains("tous les serveurs"));
-        p.servers = vec!["memorypilot".into(), "**".into()];
-        assert!(remote_problem(Some(&p)).is_some());
+        for glob in ["*", "?*", "*a*", "memory?ilot"] {
+            p.servers = vec![glob.into()];
+            assert!(
+                remote_problem(Some(&p)).unwrap().contains("refuse"),
+                "{}",
+                glob
+            );
+        }
+        p.servers = vec!["mcphub".into()];
+        assert!(remote_problem(Some(&p)).unwrap().contains("mcphub"));
         p.servers = vec!["memorypilot".into()];
         p.read_only = false;
         assert!(remote_problem(Some(&p)).unwrap().contains("readOnly"));
         p.read_only = true;
         assert_eq!(remote_problem(Some(&p)), None);
+    }
+
+    #[test]
+    fn remote_profile_requires_strict_read_only() {
+        let read_only_def = |name: &str| ToolDef {
+            name: name.into(),
+            annotations: Some(json!({"readOnlyHint": true})),
+            ..Default::default()
+        };
+        let p = Profile {
+            servers: vec!["docs".into()],
+            read_only: false,
+            tools: vec!["docs/export_pdf".into()],
+            ..Default::default()
+        };
+        let reason = |server: &str, tool: &str, def: Option<&ToolDef>| {
+            profile_reason(&p, REMOTE_PROFILE, server, Some((tool, def)))
+        };
+        let search = read_only_def("search_docs");
+        assert_eq!(reason("docs", "search_docs", Some(&search)), None);
+        assert!(
+            reason("docs", "search_docs", None).is_some(),
+            "sans readOnlyHint"
+        );
+        for tool in [
+            "get_or_create_page",
+            "check_and_charge",
+            "resolve_issue",
+            "download_file",
+            "export_csv",
+            "listAndDelete",
+        ] {
+            let def = read_only_def(tool);
+            assert!(reason("docs", tool, Some(&def)).is_some(), "{}", tool);
+        }
+        assert_eq!(
+            reason("docs", "export_pdf", None),
+            None,
+            "autorise nommement"
+        );
+        assert!(reason("other", "search_docs", Some(&search)).is_some());
+        assert!(reason("mcphub", "search_docs", Some(&search)).is_some());
+        assert!(
+            profile_reason(&p, REMOTE_PROFILE, "docx", None).is_some(),
+            "nom exact"
+        );
     }
 
     #[test]
