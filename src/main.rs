@@ -27,6 +27,7 @@ mod proxy;
 mod redaction;
 mod registry;
 mod remote;
+mod remote_access;
 mod response_cache;
 mod sandbox;
 mod search;
@@ -77,6 +78,7 @@ USAGE:
   McpHub sandbox      Server isolation (macOS sandbox): list, or 'sandbox show SERVER'
   McpHub oauth        Remote servers: status, login SERVER, logout SERVER, migrate [--apply] (from mcp-remote)
                       --tenant ID: tokens of a tenant (login prints the URL, never opens your browser)
+  McpHub remote       Remote access from Gemini, claude.ai, ChatGPT: status, enable, allow, clients, revoke
   McpHub pins         Tool pinning (anti rug-pull): list, status, approve SERVER [TOOL], reset SERVER, scan
   McpHub registry     Library of the official MCP Registry: search, info, install, uninstall
   McpHub sync         Move the config to another machine with no plaintext secret (export, import)
@@ -317,6 +319,7 @@ async fn cmd_serve() {
         std::process::exit(0);
     });
 
+    remote_access::spawn(proxy.clone());
     dashboard::start_server(proxy).await;
 }
 
@@ -417,6 +420,7 @@ async fn main() {
         }
         Some("pins") => std::process::exit(toolguard::cmd_pins(&args[2..])),
         Some("oauth") => std::process::exit(oauth::run_cli(&args[2..]).await),
+        Some("remote") => std::process::exit(remote_access::run_cli(&args[2..]).await),
         Some("sync") => std::process::exit(sync::run_cli(&args[2..])),
         Some("registry") | Some("library") => {
             std::process::exit(registry::run_cli(&args[2..]).await)

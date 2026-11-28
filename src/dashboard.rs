@@ -283,10 +283,12 @@ fn json_err(status: u16, msg: &str) -> Vec<u8> {
 /// Streamable HTTP sans état (spec MCP 2025-06-18 et 2026-07-28) : un POST = un message
 /// JSON-RPC, réponse JSON directe ; une notification seule reçoit 202 sans corps.
 /// Les lots (tableau JSON, ancienne spec 2025-03-26) restent acceptés.
-async fn handle_streamable_http_message(
+/// `remote_client` : client de l'accès distant (profil `remote` imposé, quel que soit `profile`).
+pub(crate) async fn handle_streamable_http_message(
     body: &str,
     proxy: &Arc<ProxyServer>,
     profile: Option<String>,
+    remote_client: Option<String>,
 ) -> Vec<u8> {
     let rpc_error = |code: i64, msg: &str| {
         http_response(
@@ -320,10 +322,15 @@ async fn handle_streamable_http_message(
     }
     let mut responses = Vec::new();
     for request in requests {
-        if let Some(resp) = proxy
-            .handle_request_in_profile(request, profile.clone())
-            .await
-        {
+        let answer = match &remote_client {
+            Some(client) => proxy.handle_request_remote(request, client.clone()).await,
+            None => {
+                proxy
+                    .handle_request_in_profile(request, profile.clone())
+                    .await
+            }
+        };
+        if let Some(resp) = answer {
             responses.push(resp);
         }
     }
@@ -2401,6 +2408,15 @@ async fn route(
                 },
             }
         }
+        ("GET", "/api/remote") => json_ok(crate::remote_access::api_status()),
+        ("POST", "/api/remote/approve") => match crate::remote_access::api_approve(&req.body) {
+            Ok(client) => json_ok(json!({"ok": true, "client": client})),
+            Err(e) => json_err(400, &e),
+        },
+        ("POST", "/api/remote/revoke") => match crate::remote_access::api_revoke(&req.body) {
+            Ok(removed) => json_ok(json!({"ok": true, "removed": removed})),
+            Err(e) => json_err(400, &e),
+        },
         ("GET", "/api/servers") => handle_get_servers(),
         ("POST", "/api/servers") => handle_add_server(&req.body),
         ("GET", "/api/settings") => handle_get_settings(),
@@ -2728,7 +2744,9 @@ async fn handle_connection(
 
         let response = if let Some(proxy_ref) = &proxy {
             match requested_profile(&req.path) {
-                Ok(profile) => handle_streamable_http_message(&req.body, proxy_ref, profile).await,
+                Ok(profile) => {
+                    handle_streamable_http_message(&req.body, proxy_ref, profile, None).await
+                }
                 Err(resp) => resp,
             }
         } else {
