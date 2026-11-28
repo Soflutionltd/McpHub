@@ -9,3 +9,7 @@ client/node_modules/
 
 # Rapports locaux de scan de secrets (jamais dans git)
 secrets-trouves.csv
+
+# Banc d essai : environnement Python local
+bench/.venv/
+bench/__pycache__/
