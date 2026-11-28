@@ -1210,7 +1210,8 @@ pub fn enable_prompts() {
 }
 
 fn prompts_enabled() -> bool {
-    PROMPTS_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+    !cfg!(test)
+        && PROMPTS_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
         && std::env::var_os("MCPHUB_NO_DIALOG").is_none()
 }
 
@@ -1240,8 +1241,9 @@ fn notify_blocked(server: &str, tool: &str, reason: &str) {
 
 /// Écrit la réponse de l'utilisateur dans le fichier d'épingles.
 fn record_answer(server: &str, items: &[PromptItem], approve: bool) -> Result<usize, String> {
-    let _lock = lock_pins().map_err(|e| format!("verrou des epingles impossible : {}", e))?;
+    // Même ordre que `review` (état puis verrou du fichier) : l'ordre inverse peut figer le démon.
     let mut st = state();
+    let _lock = lock_pins().map_err(|e| format!("verrou des epingles impossible : {}", e))?;
     refresh(&mut st, true);
     if st.corrupt {
         return Err("fichier d'epingles illisible".into());
@@ -1260,6 +1262,9 @@ fn record_answer(server: &str, items: &[PromptItem], approve: bool) -> Result<us
 }
 
 async fn prompt_user(server: String, items: Vec<PromptItem>) {
+    // Outils signalés par notification faute de fenêtre : ils restent dans `asking`, sinon
+    // chaque redémarrage du serveur renverrait la même notification.
+    let mut notified: Vec<&str> = Vec::new();
     for batch in items.chunks(PROMPT_BATCH) {
         let answer = crate::proxy::ask_human_with(
             build_prompt_message(&server, batch),
@@ -1279,6 +1284,7 @@ async fn prompt_user(server: String, items: Vec<PromptItem>) {
             DialogAnswer::Unavailable => {
                 for item in batch {
                     notify_blocked(&server, &item.tool, &item.reason);
+                    notified.push(&item.tool);
                 }
                 Ok("fenetre d'approbation indisponible, notification envoyee".to_string())
             }
@@ -1290,7 +1296,9 @@ async fn prompt_user(server: String, items: Vec<PromptItem>) {
     }
     let mut pending = asking();
     for item in &items {
-        pending.remove(&(server.clone(), item.tool.clone()));
+        if !notified.contains(&item.tool.as_str()) {
+            pending.remove(&(server.clone(), item.tool.clone()));
+        }
     }
 }
 

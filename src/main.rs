@@ -290,6 +290,8 @@ async fn cmd_serve() {
     update::startup_guard();
     let config = auto_detect();
     let proxy = std::sync::Arc::new(ProxyServer::new(config));
+    // Seul le démon ouvre la fenêtre d'approbation : une par machine, pas une par client stdio.
+    crate::toolguard::enable_prompts();
     proxy.init().await;
     update::spawn_daemon_tasks(proxy.clone());
     eprintln!(

@@ -274,7 +274,6 @@ enum PolicyGate {
 impl ProxyServer {
     pub fn new(config: ProxyConfig) -> Self {
         crate::toolguard::configure(config.guard.clone());
-        crate::toolguard::enable_prompts();
         let response_cache = ResponseCache::new();
         response_cache.set_ttl_secs(config.response_cache.ttl_secs);
         let child_manager = Arc::new(ChildManager::new(

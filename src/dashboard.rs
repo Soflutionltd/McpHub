@@ -789,7 +789,7 @@ async fn handle_update_settings(proxy: Option<Arc<ProxyServer>>, body: &str) -> 
         Ok(mode) => mode.map(String::from),
         Err(e) => return json_err(400, e),
     };
-    let mut config = match read_config() {
+    let config = match read_config() {
         Ok(c) => c,
         Err(resp) => return resp,
     };
@@ -823,6 +823,11 @@ async fn handle_update_settings(proxy: Option<Arc<ProxyServer>>, body: &str) -> 
             }
         }
     }
+    // Relue après la fenêtre : un serveur ajouté pendant l'attente ne doit pas être écrasé.
+    let mut config = match read_config() {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
     // Fusion clé par clé : toolSecurity garde ses autres réglages (pinning, scan...).
     if let Some(obj) = data.as_object_mut() {
         obj.remove("toolSecurity");
