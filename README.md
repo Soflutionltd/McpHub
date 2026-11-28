@@ -473,12 +473,15 @@ McpHub keeps, for every token of your account and of each client account, its ex
 
 Web assistants run on their vendor's servers: they cannot reach `127.0.0.1`. Remote access gives McpHub a public HTTPS address with OAuth 2.1, so you can add it as a custom connector in Gemini, claude.ai or ChatGPT. Nothing changes for your servers: they stay behind McpHub, which keeps talking to them as before.
 
-**Closed by default.** Remote clients only see the `remote` profile, and it must name its servers and stay read-only, or every request is refused:
+**Closed by default.** Remote clients only see the `remote` profile. It must name each server (no wildcard, never `mcphub`) and stay read-only, or every request is refused. Within those servers, a tool is usable only if the server marks it `readOnlyHint` **and** its name starts with a read verb (get, list, search, query…) **and** contains no write word (create, update, send, resolve, export…). Anything else must be allowed by name:
 
 ```bash
-McpHub remote allow memorypilot        # add a server (the profile is always readOnly)
-McpHub remote deny memorypilot
+McpHub remote allow context7                          # add a server
+McpHub remote allow-tool context7/resolve-library-id  # allow one tool the rule rejects
+McpHub remote deny context7
 ```
+
+Remote clients never get `mcphub_run` (code mode) nor `crawl`, and cannot pick a working folder: they always act with McpHub's own accounts, never a client account.
 
 **Two ways to get an address:**
 
@@ -487,14 +490,14 @@ McpHub remote deny memorypilot
 | Command | `McpHub remote enable --tunnel hub.example.com` | `McpHub remote enable --relay https://relay.example.com` |
 | Needs | a Cloudflare account, a domain on it, `cloudflared` | nothing on your side |
 | Address | `https://hub.example.com/mcp` | `https://<hub id>.relay.example.com/mcp` |
-| Path | Cloudflare Tunnel to a dedicated local port (24681) | outbound WebSocket to the relay ([`relay/`](relay/), a Cloudflare Worker) |
+| Path | Cloudflare Tunnel to a Unix socket (`~/.McpHub/remote/tunnel.sock`), never a TCP port | outbound WebSocket to the relay ([`relay/`](relay/), a Cloudflare Worker) |
 
 Either way, the public side only serves `/mcp`, OAuth and discovery: never the dashboard nor `/api`. Paste the address in your assistant's connector settings; it registers itself (Dynamic Client Registration, or Client ID Metadata Documents).
 
 **Security:**
-- every new connection opens an *Allow / Refuse* window on your Mac (on a machine without a screen, the sign-in page shows a code to confirm with `McpHub remote approve CODE`);
-- PKCE S256 is mandatory; access tokens last one hour, refresh tokens 30 days and rotate on every use; only their SHA-256 is stored, in `~/.McpHub/remote/` (hidden from sandboxed servers);
-- the `Host` header must match the public address; 100 MCP calls per minute per client; registrations, sign-ins and failed token requests are rate limited per IP;
+- every new connection shows a code on the sign-in page and opens a window on your Mac where that code must be typed: a connection started by someone else (from their own assistant account) cannot be approved by a reflex click. On a machine without a screen, `McpHub remote approve CODE` shows the request and asks before approving;
+- PKCE S256 is mandatory; access tokens last one hour, refresh tokens 30 days and rotate on every use, and a reused refresh token revokes the client; only their SHA-256 is stored, in `~/.McpHub/remote/` (hidden from sandboxed servers);
+- the `Host` header must match the public address; 100 MCP calls per minute per client (a batch counts each call, 20 at most); registrations, sign-ins and failed token requests are rate limited per IP (per /64 for IPv6) and overall; 5 sign-in windows per 15 minutes at most;
 - each remote call is written to the audit log with the client's name (`remote_client`), and sensitive actions still ask for confirmation on your Mac;
 - `McpHub remote clients` lists who is connected, `McpHub remote revoke CLIENT_ID` (or `all`, or the dashboard's *Remote access* tab) cuts a client off at once.
 
@@ -680,7 +683,7 @@ McpHub tenant ...         # client accounts: add ID --dir DIR, list, check ID, r
 McpHub registry ...       # Library: search, info, install, uninstall, sync
 McpHub sync ...           # export / import to another machine, secrets encrypted
 McpHub oauth ...          # remote servers: status, login, logout, migrate (--tenant ID)
-McpHub remote ...         # remote access: status, enable --tunnel|--relay, allow, deny, clients, revoke, approve
+McpHub remote ...         # remote access: status, enable --tunnel|--relay, allow, allow-tool, deny, clients, revoke, approve
 McpHub pins ...           # tool pinning: status, approve, reset, scan
 McpHub sandbox [show S]   # server isolation
 McpHub policy test S T    # which permission applies
