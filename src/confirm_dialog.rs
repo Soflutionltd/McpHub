@@ -123,6 +123,76 @@ pub async fn ask(message: String, timeout_secs: u64) -> DialogAnswer {
         .unwrap_or(DialogAnswer::Unavailable)
 }
 
+/// Réponse d'une fenêtre qui demande de taper un code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodeAnswer {
+    Entered(String),
+    Deny,
+    Timeout,
+    Unavailable,
+}
+
+/// Fenêtre de connexion distante : titre distinct des confirmations d'actions, et un code à
+/// recopier depuis la page de connexion. Un clic réflexe ne suffit donc pas à autoriser.
+pub fn ask_code_blocking(message: &str, timeout_secs: u64) -> CodeAnswer {
+    if !cfg!(target_os = "macos") || std::env::var_os("MCPHUB_NO_DIALOG").is_some() {
+        return CodeAnswer::Unavailable;
+    }
+    let script = [
+        "on run argv",
+        "tell current application to activate",
+        &format!(
+            "set r to display dialog (item 1 of argv) default answer \"\" with title \"McpHub : connexion depuis Internet\" buttons {{\"Refuser\", \"Autoriser\"}} default button \"Autoriser\" cancel button \"Refuser\" giving up after {} with icon stop",
+            timeout_secs.clamp(10, 600)
+        ),
+        "if gave up of r then return \"timeout\"",
+        "return \"code:\" & (text returned of r)",
+        "end run",
+    ];
+    let mut cmd = Command::new("/usr/bin/osascript");
+    for line in script {
+        cmd.arg("-e").arg(line);
+    }
+    cmd.arg("--").arg(message);
+    match cmd.output() {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            match stdout.strip_prefix("code:") {
+                Some(code) => CodeAnswer::Entered(code.trim().to_string()),
+                None if stdout == "timeout" => CodeAnswer::Timeout,
+                None => CodeAnswer::Deny,
+            }
+        }
+        Ok(out) if String::from_utf8_lossy(&out.stderr).contains("-128") => CodeAnswer::Deny,
+        Ok(out) => {
+            eprintln!(
+                "[McpHub][CONFIRM] Fenetre indisponible : {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            CodeAnswer::Unavailable
+        }
+        Err(e) => {
+            eprintln!("[McpHub][CONFIRM] osascript introuvable : {}", e);
+            CodeAnswer::Unavailable
+        }
+    }
+}
+
+/// Une fenêtre de connexion distante à la fois, dans une file séparée de celle des
+/// confirmations d'actions : une rafale de demandes venues d'Internet ne retarde jamais une
+/// confirmation locale.
+pub async fn ask_code(message: String, timeout_secs: u64) -> CodeAnswer {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let Ok(_guard) =
+        tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), LOCK.lock()).await
+    else {
+        return CodeAnswer::Timeout;
+    };
+    tokio::task::spawn_blocking(move || ask_code_blocking(&message, timeout_secs))
+        .await
+        .unwrap_or(CodeAnswer::Unavailable)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

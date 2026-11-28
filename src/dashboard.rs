@@ -2410,7 +2410,7 @@ async fn route(
         }
         ("GET", "/api/remote") => json_ok(crate::remote_access::api_status()),
         ("POST", "/api/remote/approve") => match crate::remote_access::api_approve(&req.body) {
-            Ok(client) => json_ok(json!({"ok": true, "client": client})),
+            Ok(request) => json_ok(request),
             Err(e) => json_err(400, &e),
         },
         ("POST", "/api/remote/revoke") => match crate::remote_access::api_revoke(&req.body) {

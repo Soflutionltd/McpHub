@@ -1046,7 +1046,12 @@ async function remoteRevoke(id){
 }
 async function remoteApprove(){
   const input=document.getElementById('remote-code');
-  try{const d=await api('POST','/api/remote/approve',{code:input.value});input.value='';notify('Approved: '+d.client+'. Click Continue on the sign-in page.')}catch(e){notify(e.message,'danger')}
+  try{
+    const d=await api('POST','/api/remote/approve',{code:input.value});
+    if(!confirm('Allow '+d.client+'\nReturn to: '+d.returnHost+'\nFrom: '+d.origin+' ?'))return;
+    await api('POST','/api/remote/approve',{code:input.value,confirm:true});
+    input.value='';notify('Approved: the sign-in page continues on its own.');
+  }catch(e){notify(e.message,'danger')}
 }
 
 // ─── Client accounts (tenants) ───────────────────────────────

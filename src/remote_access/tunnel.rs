@@ -1,11 +1,11 @@
-//! Transport « tunnel » : `cloudflared` relaie `https://<domaine>` vers le port local dédié.
+//! Transport « tunnel » : `cloudflared` relaie `https://<domaine>` vers le socket Unix du démon.
 //!
 //! `McpHub remote enable --tunnel hub.example.com` :
 //! 1. vérifie `cloudflared` et la connexion au compte Cloudflare (`cloudflared tunnel login`,
 //!    une page à valider dans le navigateur la première fois) ;
 //! 2. crée (ou reprend) le tunnel nommé `mcphub` (`mcphub-<instance>` pour une instance) ;
 //! 3. crée l'enregistrement DNS du domaine, sans jamais écraser un enregistrement existant ;
-//! 4. écrit `~/.McpHub/remote/cloudflared.yml` (le domaine vers 127.0.0.1:<port>, tout le
+//! 4. écrit `~/.McpHub/remote/cloudflared.yml` (le domaine vers le socket `tunnel.sock`, tout le
 //!    reste en 404) ;
 //! 5. installe un service de fond (LaunchAgent sur macOS, unité systemd utilisateur sur Linux)
 //!    qui relance le tunnel au démarrage de la session.
@@ -157,18 +157,15 @@ pub fn enable(domain: &str) -> Result<(), String> {
             enabled: true,
             transport: Transport::Tunnel,
             public_url: format!("https://{}", domain),
-            port: Settings::load()
-                .map(|s| s.port)
-                .unwrap_or_else(|_| Settings::default_port()),
             relay_url: None,
         };
         super::ensure_private_dir()?;
         let yaml = format!(
-            "tunnel: {id}\ncredentials-file: {creds}\nno-autoupdate: true\ningress:\n  - hostname: {domain}\n    service: http://127.0.0.1:{port}\n  - service: http_status:404\n",
+            "tunnel: {id}\ncredentials-file: {creds}\nno-autoupdate: true\ningress:\n  - hostname: {domain}\n    service: unix:{socket}\n  - service: http_status:404\n",
             id = id,
             creds = credentials.display(),
             domain = domain,
-            port = settings.port,
+            socket = super::socket_path().display(),
         );
         std::fs::write(config_file(), yaml)
             .map_err(|e| format!("{} : {}", config_file().display(), e))?;
@@ -363,7 +360,7 @@ pub fn service_state() -> String {
     }
 }
 
-/// Relance le démon pour qu'il applique les réglages (port du tunnel ou relais).
+/// Relance le démon pour qu'il applique les réglages (socket du tunnel ou relais).
 pub fn restart_daemon() {
     #[cfg(target_os = "macos")]
     {

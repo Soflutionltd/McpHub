@@ -64,15 +64,22 @@ fn save_identity(identity: &Identity) -> Result<(), String> {
     std::fs::rename(&tmp, &path).map_err(|e| format!("{} : {}", path.display(), e))
 }
 
-/// Identifiant de hub utilisable comme étiquette DNS : 26 caractères base32 minuscules.
-fn new_hub_id() -> Result<String, String> {
+/// Identifiant de hub dérivé du secret : les 26 premiers caractères base32 (minuscules) de
+/// son SHA-256. Le relais refait le calcul à chaque connexion : personne ne peut revendiquer
+/// un identifiant sans en connaître le secret, et le relais n'a rien à garder.
+pub fn hub_id_for(secret: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(secret.as_bytes());
+    base32(&digest[..17])[..26].to_string()
+}
+
+fn base32(bytes: &[u8]) -> String {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
-    let bytes = super::authz::random_bytes(16)?;
     let mut bits: u32 = 0;
     let mut acc: u32 = 0;
     let mut out = String::new();
     for b in bytes {
-        acc = (acc << 8) | b as u32;
+        acc = (acc << 8) | *b as u32;
         bits += 8;
         while bits >= 5 {
             bits -= 5;
@@ -83,7 +90,7 @@ fn new_hub_id() -> Result<String, String> {
     if bits > 0 {
         out.push(ALPHABET[((acc << (5 - bits)) & 31) as usize] as char);
     }
-    Ok(out)
+    out
 }
 
 fn relay_host(url: &str) -> Result<String, String> {
@@ -102,14 +109,15 @@ pub fn enable(url: &str) -> Result<(), String> {
     let url = url.trim().trim_end_matches('/');
     let host = relay_host(url)?;
     let identity = match load_identity() {
-        Ok(existing) => existing,
-        Err(_) => {
+        Ok(existing) if existing.hub_id == hub_id_for(&existing.secret) => existing,
+        _ => {
+            let secret = format!(
+                "mhrelay_{}",
+                crate::oauth::b64url(&super::authz::random_bytes(32)?)
+            );
             let identity = Identity {
-                hub_id: new_hub_id()?,
-                secret: format!(
-                    "mhrelay_{}",
-                    crate::oauth::b64url(&super::authz::random_bytes(32)?)
-                ),
+                hub_id: hub_id_for(&secret),
+                secret,
             };
             save_identity(&identity)?;
             identity
@@ -117,14 +125,10 @@ pub fn enable(url: &str) -> Result<(), String> {
     };
     // Le tunnel éventuel n'a plus d'usage : son service est retiré.
     super::tunnel::remove_service()?;
-    let previous_port = Settings::load()
-        .map(|s| s.port)
-        .unwrap_or_else(|_| Settings::default_port());
     save_settings(&Settings {
         enabled: true,
         transport: Transport::Relay,
         public_url: format!("https://{}.{}", identity.hub_id, host),
-        port: previous_port,
         relay_url: Some(url.to_string()),
     })
 }
@@ -322,13 +326,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hub_id_is_a_dns_label() {
-        let id = new_hub_id().unwrap();
+    fn hub_id_is_a_dns_label_derived_from_the_secret() {
+        let id = hub_id_for("mhrelay_secret");
         assert_eq!(id.len(), 26);
         assert!(id
             .chars()
             .all(|c| c.is_ascii_lowercase() || ('2'..='7').contains(&c)));
-        assert_ne!(id, new_hub_id().unwrap());
+        assert_eq!(id, hub_id_for("mhrelay_secret"));
+        assert_ne!(id, hub_id_for("mhrelay_other"));
+        // Même calcul que le relais (relay/src/index.ts, hubIdFor).
+        assert_eq!(hub_id_for("abc"), "xj4bnp4pahh6uqkbidpf3lrceo");
     }
 
     #[test]

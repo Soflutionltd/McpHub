@@ -27,11 +27,13 @@ const ACCESS_TTL: u64 = 3600;
 const REFRESH_TTL: u64 = 30 * 24 * 3600;
 const CODE_TTL: u64 = 120;
 const PAIRING_TTL: u64 = 600;
-/// Sous le délai d'environ 100 s après lequel Cloudflare coupe une réponse qui tarde.
-const CONSENT_TIMEOUT: u64 = 90;
+/// Durée de la fenêtre de connexion (la page du navigateur attend sans bloquer de requête).
+const CONSENT_TIMEOUT: u64 = 120;
 /// Client inscrit mais jamais autorisé : oublié au bout de 24 h.
 const UNAPPROVED_TTL: u64 = 24 * 3600;
 const MAX_CLIENTS: usize = 100;
+/// Clients inscrits mais pas encore autorisés (DCR et CIMD, séparément).
+const MAX_UNAPPROVED: usize = 30;
 const MAX_PENDING: usize = 20;
 const MAX_REDIRECTS: usize = 10;
 const CIMD_MAX_BYTES: usize = 64 * 1024;
@@ -63,6 +65,9 @@ pub struct Client {
     pub fetched_at: Option<u64>,
     #[serde(default)]
     pub refresh: Vec<RefreshGrant>,
+    /// Empreintes des jetons de rafraîchissement déjà utilisés : un rejeu révoque le client.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub used_refresh: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -119,11 +124,15 @@ struct Access {
 struct Pending {
     code: String,
     client_id: String,
+    client_label: String,
     redirect_uri: String,
+    return_host: String,
+    origin: String,
     state: Option<String>,
     challenge: String,
     created: u64,
     approved: bool,
+    denied: bool,
 }
 
 #[derive(Default)]
@@ -134,6 +143,8 @@ struct State {
     codes: HashMap<String, Code>,
     access: HashMap<String, Access>,
     pending: HashMap<String, Pending>,
+    /// Clients CIMD vus mais jamais autorisés (jamais écrits sur disque).
+    cimd: HashMap<String, Client>,
     hits: HashMap<String, VecDeque<Instant>>,
 }
 
@@ -170,9 +181,11 @@ impl State {
         self.codes.retain(|_, c| c.expires > now);
         self.access.retain(|_, a| a.expires > now);
         self.pending.retain(|_, p| p.created + PAIRING_TTL > now);
-        self.store.clients.retain(|_, c| {
-            c.approved_at.is_some() || c.kind == "cimd" || c.created + UNAPPROVED_TTL > now
-        });
+        self.store
+            .clients
+            .retain(|_, c| c.approved_at.is_some() || c.created + UNAPPROVED_TTL > now);
+        self.cimd
+            .retain(|_, c| c.fetched_at.unwrap_or(0) + CIMD_REFRESH > now);
         for client in self.store.clients.values_mut() {
             client.refresh.retain(|r| r.expires > now);
         }
@@ -194,7 +207,10 @@ impl State {
         }
         hits.push_back(now);
         if self.hits.len() > 10_000 {
-            self.hits.retain(|_, v| !v.is_empty());
+            // Purge par âge : une clé qui ne revient jamais finit par disparaître.
+            let hour = std::time::Duration::from_secs(3600);
+            self.hits
+                .retain(|_, v| v.back().is_some_and(|t| now.duration_since(*t) < hour));
         }
         true
     }
@@ -294,6 +310,22 @@ fn redirect_with(redirect_uri: &str, params: &[(&str, &str)]) -> String {
     format!("{}{}{}", redirect_uri, sep, query.join("&"))
 }
 
+/// Nom affichable : sans caractères de contrôle ni de mise en forme invisibles (U+202E et
+/// voisins), qui permettraient d'imiter un autre nom dans la fenêtre de consentement.
+fn clean_name(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| {
+            let code = *c as u32;
+            !c.is_control()
+                && !matches!(
+                    code,
+                    0x00AD | 0x061C | 0x180E | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x206F | 0xFEFF
+                )
+        })
+        .take(80)
+        .collect()
+}
+
 fn client_label(client: &Client) -> String {
     let short: String = client.client_id.chars().take(48).collect();
     if client.name.is_empty() {
@@ -337,7 +369,9 @@ pub fn authorization_server_metadata(base: &str) -> Value {
 // ─── Inscription dynamique (RFC 7591) ────────────────────────
 
 pub fn register(req: &Request) -> Response {
-    if !rate_allow(format!("register:{}", req.client_ip()), 10, 3600) {
+    if !rate_allow(format!("register:{}", req.client_ip()), 10, 3600)
+        || !rate_allow("register:all".into(), 30, 3600)
+    {
         return Response::oauth_error(429, "slow_down", "too many registrations");
     }
     let Ok(body) = serde_json::from_slice::<Value>(&req.body) else {
@@ -381,14 +415,11 @@ pub fn register(req: &Request) -> Response {
             "token_endpoint_auth_method must be none, client_secret_post or client_secret_basic",
         );
     }
-    let name: String = body
-        .get("client_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(80)
-        .collect();
+    let name = clean_name(
+        body.get("client_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+    );
 
     let (client_id, secret) = match (random_token("mhc_"), random_token("mhs_")) {
         (Ok(id), Ok(secret)) => (id, secret),
@@ -411,11 +442,17 @@ pub fn register(req: &Request) -> Response {
         return Response::oauth_error(500, "server_error", &e);
     }
     st.prune(issued);
-    if st.store.clients.len() >= MAX_CLIENTS {
+    let unapproved = st
+        .store
+        .clients
+        .values()
+        .filter(|c| c.approved_at.is_none())
+        .count();
+    if unapproved >= MAX_UNAPPROVED || st.store.clients.len() >= MAX_CLIENTS + MAX_UNAPPROVED {
         return Response::oauth_error(
             400,
             "invalid_client_metadata",
-            "too many clients: revoke unused ones with McpHub remote revoke",
+            "too many clients waiting for approval, try again later",
         );
     }
     st.store.clients.insert(client_id.clone(), client);
@@ -455,6 +492,8 @@ fn forbidden_ip(ip: std::net::IpAddr) -> bool {
                 || v4.is_multicast()
                 || v4.is_documentation()
                 || (o[0] == 100 && (64..128).contains(&o[1]))
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
                 || o[0] == 0
                 || o[0] >= 240
         }
@@ -465,6 +504,11 @@ fn forbidden_ip(ip: std::net::IpAddr) -> bool {
                 || v6.is_multicast()
                 || (seg[0] & 0xfe00) == 0xfc00
                 || (seg[0] & 0xffc0) == 0xfe80
+                // NAT64 (64:ff9b::/96), 6to4 (2002::/16) : une adresse IPv4 cachée dedans.
+                || (seg[0] == 0x64 && seg[1] == 0xff9b)
+                || seg[0] == 0x2002
+                // Ancienne forme compatible IPv4 (::a.b.c.d).
+                || seg[..6].iter().all(|s| *s == 0)
                 || v6
                     .to_ipv4_mapped()
                     .is_some_and(|v4| forbidden_ip(v4.into()))
@@ -496,6 +540,8 @@ async fn fetch_cimd(client_id: &str) -> Result<Client, String> {
     }
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        // Un proxy du système annulerait l'épinglage de l'adresse vérifiée.
+        .no_proxy()
         .timeout(std::time::Duration::from_secs(5))
         .resolve(&host, first)
         .user_agent(concat!("McpHub/", env!("CARGO_PKG_VERSION")))
@@ -547,14 +593,11 @@ async fn fetch_cimd(client_id: &str) -> Result<Client, String> {
     {
         return Err("redirect_uris absentes ou refusees dans le document du client".into());
     }
-    let name: String = doc
-        .get("client_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(80)
-        .collect();
+    let name = clean_name(
+        doc.get("client_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+    );
     Ok(Client {
         client_id: client_id.to_string(),
         name,
@@ -566,14 +609,20 @@ async fn fetch_cimd(client_id: &str) -> Result<Client, String> {
     })
 }
 
-/// Client connu, ou document CIMD téléchargé (et mis à jour au bout d'une heure).
+/// Client connu, ou document CIMD. Un client CIMD jamais autorisé reste en mémoire : seul
+/// un consentement l'inscrit dans le fichier (pas de saturation du registre par des
+/// documents servis par un inconnu).
 async fn resolve_client(client_id: &str) -> Result<Client, String> {
+    let is_url = client_id.starts_with("https://");
     let known = {
         let mut st = state();
         st.sync()?;
-        st.store.clients.get(client_id).cloned()
+        st.store
+            .clients
+            .get(client_id)
+            .cloned()
+            .or_else(|| st.cimd.get(client_id).cloned())
     };
-    let is_url = client_id.starts_with("https://");
     match known {
         Some(c) if !is_url || c.fetched_at.unwrap_or(0) + CIMD_REFRESH > now() => Ok(c),
         Some(old) => {
@@ -582,26 +631,27 @@ async fn resolve_client(client_id: &str) -> Result<Client, String> {
             fresh.approved_at = old.approved_at;
             fresh.last_used = old.last_used;
             fresh.refresh = old.refresh;
+            fresh.used_refresh = old.used_refresh;
             let mut st = state();
             st.sync()?;
-            st.store
-                .clients
-                .insert(client_id.to_string(), fresh.clone());
-            st.save()?;
+            if st.store.clients.contains_key(client_id) {
+                st.store
+                    .clients
+                    .insert(client_id.to_string(), fresh.clone());
+                st.save()?;
+            } else {
+                st.cimd.insert(client_id.to_string(), fresh.clone());
+            }
             Ok(fresh)
         }
         None if is_url => {
             let fresh = fetch_cimd(client_id).await?;
             let mut st = state();
-            st.sync()?;
             st.prune(now());
-            if st.store.clients.len() >= MAX_CLIENTS {
-                return Err("trop de clients : en revoquer avec McpHub remote revoke".into());
+            if st.cimd.len() >= MAX_UNAPPROVED {
+                return Err("trop de clients en attente : reessayer plus tard".into());
             }
-            st.store
-                .clients
-                .insert(client_id.to_string(), fresh.clone());
-            st.save()?;
+            st.cimd.insert(client_id.to_string(), fresh.clone());
             Ok(fresh)
         }
         None => Err("client inconnu (inscription expiree ou revoquee)".into()),
@@ -610,7 +660,14 @@ async fn resolve_client(client_id: &str) -> Result<Client, String> {
 
 // ─── Autorisation ────────────────────────────────────────────
 
-fn page(req: &Request, title_fr: &str, title_en: &str, body_fr: &str, body_en: &str) -> String {
+fn page(
+    req: &Request,
+    head: &str,
+    title_fr: &str,
+    title_en: &str,
+    body_fr: &str,
+    body_en: &str,
+) -> String {
     let french = req.prefers_french();
     let (title, body) = if french {
         (title_fr, body_fr)
@@ -618,8 +675,9 @@ fn page(req: &Request, title_fr: &str, title_en: &str, body_fr: &str, body_en: &
         (title_en, body_en)
     };
     format!(
-        "<!doctype html><html lang=\"{lang}\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>McpHub</title><style>body{{font-family:-apple-system,system-ui,sans-serif;max-width:34rem;margin:12vh auto;padding:0 1rem;color:#1d1d1f;background:#fbfbfd}}h1{{font-size:1.4rem}}code{{background:#f0f0f3;padding:.15rem .4rem;border-radius:6px;font-size:1.05rem}}a.btn{{display:inline-block;margin-top:1rem;padding:.6rem 1.1rem;border-radius:10px;background:#1d1d1f;color:#fff;text-decoration:none}}@media(prefers-color-scheme:dark){{body{{background:#111;color:#f5f5f7}}code{{background:#2a2a2e}}a.btn{{background:#f5f5f7;color:#111}}}}</style></head><body><h1>{title}</h1>{body}</body></html>",
+        "<!doctype html><html lang=\"{lang}\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">{head}<title>McpHub</title><style>body{{font-family:-apple-system,system-ui,sans-serif;max-width:34rem;margin:12vh auto;padding:0 1rem;color:#1d1d1f;background:#fbfbfd}}h1{{font-size:1.4rem}}code{{background:#f0f0f3;padding:.15rem .4rem;border-radius:6px;font-size:1.05rem}}.code{{font:600 2rem ui-monospace,monospace;letter-spacing:.15em;margin:1.2rem 0}}a.btn{{display:inline-block;margin-top:1rem;padding:.6rem 1.1rem;border-radius:10px;background:#1d1d1f;color:#fff;text-decoration:none}}@media(prefers-color-scheme:dark){{body{{background:#111;color:#f5f5f7}}code{{background:#2a2a2e}}a.btn{{background:#f5f5f7;color:#111}}}}</style></head><body><h1>{title}</h1>{body}</body></html>",
         lang = if french { "fr" } else { "en" },
+        head = head,
         title = title,
         body = body,
     )
@@ -630,6 +688,7 @@ fn error_page(req: &Request, fr: &str, en: &str) -> Response {
         400,
         page(
             req,
+            "",
             "Connexion impossible",
             "Cannot connect",
             &format!("<p>{}</p>", html_escape(fr)),
@@ -650,6 +709,35 @@ fn issue_code(
         Err(e) => return Response::oauth_error(500, "server_error", &e),
     };
     let mut st = state();
+    if let Err(e) = st.sync() {
+        return Response::oauth_error(500, "server_error", &e);
+    }
+    // Un client CIMD autorisé pour la première fois entre dans le registre.
+    if !st.store.clients.contains_key(client_id) {
+        let Some(client) = st.cimd.remove(client_id) else {
+            return Response::oauth_error(400, "invalid_client", "client revoked");
+        };
+        let approved = st
+            .store
+            .clients
+            .values()
+            .filter(|c| c.approved_at.is_some())
+            .count();
+        if approved >= MAX_CLIENTS {
+            return Response::oauth_error(
+                400,
+                "invalid_client",
+                "too many clients: revoke unused ones with McpHub remote revoke",
+            );
+        }
+        st.store.clients.insert(client_id.to_string(), client);
+    }
+    if let Some(c) = st.store.clients.get_mut(client_id) {
+        c.approved_at = Some(now());
+    }
+    if let Err(e) = st.save() {
+        return Response::oauth_error(500, "server_error", &e);
+    }
     st.codes.insert(
         digest(&code),
         Code {
@@ -659,14 +747,6 @@ fn issue_code(
             expires: now() + CODE_TTL,
         },
     );
-    if let Ok(()) = st.sync() {
-        if let Some(c) = st.store.clients.get_mut(client_id) {
-            c.approved_at = Some(now());
-        }
-        if let Err(e) = st.save() {
-            eprintln!("[McpHub][REMOTE] enregistrement du client : {}", e);
-        }
-    }
     drop(st);
     let mut params = vec![("code", code.as_str()), ("iss", base)];
     if let Some(s) = state_param {
@@ -687,6 +767,12 @@ fn denied(redirect_uri: &str, state_param: Option<&str>, base: &str, why: &str) 
     Response::redirect(&redirect_with(redirect_uri, &params))
 }
 
+/// Demande d'autorisation : vérifie tout, puis affiche un code dans le navigateur qui se
+/// connecte et ouvre sur la machine une fenêtre où ce code doit être recopié. Une connexion
+/// lancée par quelqu'un d'autre (son propre compte claude.ai, par exemple) ne peut donc pas
+/// être autorisée par un simple clic : son code n'est visible que dans son navigateur.
+/// Aucune erreur ne redirige vers l'adresse de retour d'un client : pas de redirection
+/// ouverte depuis le domaine du hub.
 pub async fn authorize(req: &Request, base: &str) -> Response {
     let p = req.params();
     let client_id = p.get("client_id").cloned().unwrap_or_default();
@@ -694,8 +780,9 @@ pub async fn authorize(req: &Request, base: &str) -> Response {
     if client_id.is_empty() {
         return error_page(req, "Paramètre client_id manquant.", "Missing client_id.");
     }
-    // Chaque demande peut ouvrir une fenêtre sur le Mac : débit limité par adresse.
-    if !rate_allow(format!("authorize:{}", req.client_ip()), 10, 900) {
+    if !rate_allow(format!("authorize:{}", req.client_ip()), 10, 900)
+        || !rate_allow("authorize:all".into(), 60, 900)
+    {
         return error_page(
             req,
             "Trop de tentatives. Réessayez dans 15 minutes.",
@@ -719,48 +806,30 @@ pub async fn authorize(req: &Request, base: &str) -> Response {
         redirect_uri
     };
     if !client.redirect_uris.iter().any(|u| u == &redirect_uri) {
-        // Jamais de redirection vers une adresse non inscrite.
         return error_page(
             req,
             "Adresse de retour non inscrite pour ce client.",
             "redirect_uri is not registered for this client.",
         );
     }
-    let state_param = p.get("state").map(|s| s.as_str());
     if p.get("response_type").map(|s| s.as_str()) != Some("code") {
-        let mut params = vec![("error", "unsupported_response_type"), ("iss", base)];
-        if let Some(s) = state_param {
-            params.push(("state", s));
-        }
-        return Response::redirect(&redirect_with(&redirect_uri, &params));
+        return error_page(
+            req,
+            "response_type doit valoir code.",
+            "response_type must be code.",
+        );
     }
     let challenge = p.get("code_challenge").cloned().unwrap_or_default();
     if challenge.len() < 43
         || challenge.len() > 128
         || p.get("code_challenge_method").map(|s| s.as_str()) != Some("S256")
     {
-        let mut params = vec![
-            ("error", "invalid_request"),
-            ("error_description", "PKCE S256 is required"),
-            ("iss", base),
-        ];
-        if let Some(s) = state_param {
-            params.push(("state", s));
-        }
-        return Response::redirect(&redirect_with(&redirect_uri, &params));
+        return error_page(req, "PKCE S256 obligatoire.", "PKCE S256 is required.");
     }
     if let Some(resource) = p.get("resource") {
         let resource = resource.trim_end_matches('/');
         if resource != base && resource != format!("{}/mcp", base) {
-            let mut params = vec![
-                ("error", "invalid_target"),
-                ("error_description", "unknown resource"),
-                ("iss", base),
-            ];
-            if let Some(s) = state_param {
-                params.push(("state", s));
-            }
-            return Response::redirect(&redirect_with(&redirect_uri, &params));
+            return error_page(req, "Ressource inconnue.", "Unknown resource.");
         }
     }
     if let Some(problem) = crate::toolguard::remote_profile_problem() {
@@ -775,93 +844,96 @@ pub async fn authorize(req: &Request, base: &str) -> Response {
         .ok()
         .and_then(|u| u.host_str().map(String::from))
         .unwrap_or_else(|| redirect_uri.clone());
-    let servers = crate::toolguard::remote_profile_servers().join(", ");
-    let message = format!(
-        "Un service veut se connecter a McpHub depuis Internet.\n\nClient : {}\nRetour vers : {}\nServeurs visibles : {}\nAcces : lecture seule (profil remote)\n\nAutoriser cette connexion ?",
-        client_label(&client),
-        return_host,
-        servers
-    );
-    let answer = crate::confirm_dialog::ask(message, CONSENT_TIMEOUT).await;
-    match answer {
-        crate::confirm_dialog::DialogAnswer::Allow => issue_code(
-            &client.client_id,
-            &redirect_uri,
-            &challenge,
-            state_param,
-            base,
-        ),
-        crate::confirm_dialog::DialogAnswer::Deny => denied(
-            &redirect_uri,
-            state_param,
-            base,
-            "refused on the McpHub machine",
-        ),
-        crate::confirm_dialog::DialogAnswer::Timeout => denied(
-            &redirect_uri,
-            state_param,
-            base,
-            "no answer on the McpHub machine",
-        ),
-        crate::confirm_dialog::DialogAnswer::Unavailable => {
-            start_pairing(req, &client, &redirect_uri, state_param, &challenge)
-        }
-    }
-}
-
-/// Machine sans écran (serveur Linux) : un code à valider avec `McpHub remote approve`.
-fn start_pairing(
-    req: &Request,
-    client: &Client,
-    redirect_uri: &str,
-    state_param: Option<&str>,
-    challenge: &str,
-) -> Response {
+    let origin = match req.header("cf-ipcountry") {
+        Some(country) => format!("{} ({})", req.client_ip(), clean_name(country)),
+        None => req.client_ip(),
+    };
     let (id, code) = match (random_token("mhp_"), pairing_code()) {
         (Ok(id), Ok(code)) => (id, code),
         (Err(e), _) | (_, Err(e)) => return Response::oauth_error(500, "server_error", &e),
     };
-    let mut st = state();
-    st.prune(now());
-    if st.pending.len() >= MAX_PENDING {
-        return error_page(
-            req,
-            "Trop de connexions en attente. Réessayez plus tard.",
-            "Too many pending connections. Try again later.",
+    {
+        let mut st = state();
+        st.prune(now());
+        if st.pending.len() >= MAX_PENDING {
+            return error_page(
+                req,
+                "Trop de connexions en attente. Réessayez plus tard.",
+                "Too many pending connections. Try again later.",
+            );
+        }
+        st.pending.insert(
+            id.clone(),
+            Pending {
+                code: code.clone(),
+                client_id: client.client_id.clone(),
+                client_label: client_label(&client),
+                redirect_uri: redirect_uri.clone(),
+                return_host: return_host.clone(),
+                origin: origin.clone(),
+                state: p.get("state").cloned(),
+                challenge,
+                created: now(),
+                approved: false,
+                denied: false,
+            },
         );
     }
-    st.pending.insert(
-        id.clone(),
-        Pending {
-            code: code.clone(),
-            client_id: client.client_id.clone(),
-            redirect_uri: redirect_uri.to_string(),
-            state: state_param.map(String::from),
-            challenge: challenge.to_string(),
-            created: now(),
-            approved: false,
-        },
-    );
-    drop(st);
     eprintln!(
-        "[McpHub][REMOTE] Connexion de {} en attente : McpHub remote approve {}",
-        client_label(client),
-        code
+        "[McpHub][REMOTE] Connexion demandee par {} depuis {}",
+        client_label(&client),
+        origin
     );
-    pairing_page(req, &id, &code)
+
+    // Fenêtres limitées à 5 par 15 minutes, toutes adresses confondues ; au-delà, seule la
+    // validation par `McpHub remote approve` reste possible.
+    if rate_allow("consent-dialog".into(), 5, 900) {
+        let message = format!(
+            "Un service veut se connecter a McpHub depuis Internet.\n\nClient : {}\nRetour vers : {}\nDepuis : {}\nServeurs visibles : {}\nAcces : lecture seule (profil remote)\n\nPour autoriser, tapez le code affiche sur la page de connexion. Si vous n'avez pas lance cette connexion vous-meme, cliquez Refuser.",
+            client_label(&client),
+            return_host,
+            origin,
+            crate::toolguard::remote_profile_servers().join(", ")
+        );
+        let pending_id = id.clone();
+        tokio::spawn(async move {
+            let answer = crate::proxy::ask_human_code(message, CONSENT_TIMEOUT).await;
+            let mut st = state();
+            let Some(pending) = st.pending.get_mut(&pending_id) else {
+                return;
+            };
+            match answer {
+                crate::confirm_dialog::CodeAnswer::Entered(typed)
+                    if same(&normalize_pairing(&typed), &pending.code) =>
+                {
+                    pending.approved = true
+                }
+                crate::confirm_dialog::CodeAnswer::Entered(_)
+                | crate::confirm_dialog::CodeAnswer::Deny
+                | crate::confirm_dialog::CodeAnswer::Timeout => pending.denied = true,
+                crate::confirm_dialog::CodeAnswer::Unavailable => {}
+            }
+        });
+    }
+    waiting_page(req, &id, &code)
 }
 
-fn pairing_page(req: &Request, id: &str, code: &str) -> Response {
+fn waiting_page(req: &Request, id: &str, code: &str) -> Response {
     let link = format!("/authorize/continue?p={}", urlencode(id));
+    let refresh = format!(
+        "<meta http-equiv=\"refresh\" content=\"3;url={}\">",
+        html_escape(&link)
+    );
     let code = html_escape(code);
     Response::html(
         200,
         page(
             req,
+            &refresh,
             "Validation sur la machine McpHub",
             "Approve on the McpHub machine",
-            &format!("<p>Sur la machine où tourne McpHub, lancez :</p><p><code>McpHub remote approve {code}</code></p><p>puis revenez ici. Ce code expire dans 10 minutes.</p><a class=\"btn\" href=\"{link}\">Continuer</a>"),
-            &format!("<p>On the machine running McpHub, run:</p><p><code>McpHub remote approve {code}</code></p><p>then come back here. This code expires in 10 minutes.</p><a class=\"btn\" href=\"{link}\">Continue</a>"),
+            &format!("<p>Une fenêtre McpHub vient de s'ouvrir sur la machine de McpHub. Tapez-y ce code :</p><p class=\"code\">{code}</p><p>Machine sans écran : <code>McpHub remote approve {code}</code>. Cette page continue toute seule une fois la connexion validée. Le code expire dans 10 minutes.</p><a class=\"btn\" href=\"{link}\">Continuer</a>"),
+            &format!("<p>A McpHub window just opened on the McpHub machine. Type this code in it:</p><p class=\"code\">{code}</p><p>Machine without a screen: <code>McpHub remote approve {code}</code>. This page continues on its own once the connection is approved. The code expires in 10 minutes.</p><a class=\"btn\" href=\"{link}\">Continue</a>"),
         ),
     )
 }
@@ -879,15 +951,23 @@ pub fn authorize_continue(req: &Request, base: &str) -> Response {
             "Request expired. Start the connection again from your app.",
         );
     };
-    if !pending.approved {
+    if !pending.approved && !pending.denied {
         let code = pending.code.clone();
         drop(st);
-        return pairing_page(req, &id, &code);
+        return waiting_page(req, &id, &code);
     }
     let Some(pending) = st.pending.remove(&id) else {
         return error_page(req, "Demande expirée.", "Request expired.");
     };
     drop(st);
+    if pending.denied {
+        return denied(
+            &pending.redirect_uri,
+            pending.state.as_deref(),
+            base,
+            "refused on the McpHub machine",
+        );
+    }
     issue_code(
         &pending.client_id,
         &pending.redirect_uri,
@@ -897,28 +977,26 @@ pub fn authorize_continue(req: &Request, base: &str) -> Response {
     )
 }
 
-/// `McpHub remote approve CODE` (via l'API locale du démon).
-pub fn approve_pairing(code: &str) -> Result<String, String> {
+/// `McpHub remote approve CODE` (via l'API locale du démon). Sans `confirm`, ne fait que
+/// décrire la demande (client, retour, origine) pour qu'on la vérifie avant de valider.
+pub fn approve_pairing(code: &str, confirm: bool) -> Result<Value, String> {
     let wanted = normalize_pairing(code);
     let mut st = state();
     st.prune(now());
-    let client_id = {
-        let pending = st
-            .pending
-            .values_mut()
-            .find(|p| same(&p.code, &wanted))
-            .ok_or("code inconnu ou expire")?;
+    let pending = st
+        .pending
+        .values_mut()
+        .find(|p| !p.denied && same(&p.code, &wanted))
+        .ok_or("code inconnu ou expire")?;
+    if confirm {
         pending.approved = true;
-        pending.client_id.clone()
-    };
-    st.sync()?;
-    let label = st
-        .store
-        .clients
-        .get(&client_id)
-        .map(client_label)
-        .unwrap_or(client_id);
-    Ok(label)
+    }
+    Ok(json!({
+        "client": pending.client_label,
+        "returnHost": pending.return_host,
+        "origin": pending.origin,
+        "approved": pending.approved,
+    }))
 }
 
 // ─── Jetons ──────────────────────────────────────────────────
@@ -1098,9 +1176,36 @@ pub fn token(req: &Request) -> Response {
         }
         Some("refresh_token") => {
             let presented = digest(form.get("refresh_token").map(|s| s.as_str()).unwrap_or(""));
+            let replayed = st
+                .store
+                .clients
+                .get(&client_id)
+                .is_some_and(|c| c.used_refresh.iter().any(|h| same(h, &presented)));
+            if replayed {
+                // Jeton déjà utilisé : il a fuité. Le client entier est révoqué.
+                st.store.clients.remove(&client_id);
+                if let Err(e) = st.save() {
+                    eprintln!("[McpHub][REMOTE] revocation apres rejeu : {}", e);
+                }
+                eprintln!(
+                    "[McpHub][REMOTE] Rejeu d'un jeton de rafraichissement : client {} revoque",
+                    client_id
+                );
+                drop(st);
+                return token_failure(
+                    &ip,
+                    400,
+                    "invalid_grant",
+                    "refresh_token reuse detected, client revoked",
+                );
+            }
             let entry = st.store.clients.get_mut(&client_id).and_then(|c| {
                 let pos = c.refresh.iter().position(|r| same(&r.hash, &presented))?;
-                Some(c.refresh.remove(pos))
+                let grant = c.refresh.remove(pos);
+                c.used_refresh.push(grant.hash.clone());
+                let excess = c.used_refresh.len().saturating_sub(20);
+                c.used_refresh.drain(..excess);
+                Some(grant)
             });
             match entry {
                 Some(r) if r.expires > now() => issue_tokens(&mut st, &client_id),

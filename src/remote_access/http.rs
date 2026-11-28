@@ -42,11 +42,21 @@ impl Request {
     /// Adresse du client telle que Cloudflare la transmet (tunnel et relais passent tous deux
     /// par Cloudflare). Le port local n'écoute que sur 127.0.0.1 : rien d'autre ne l'atteint
     /// depuis Internet.
+    /// Une adresse IPv6 compte pour son /64 : un attaquant en dispose de milliards, les
+    /// limites par adresse doivent porter sur le réseau.
     pub fn client_ip(&self) -> String {
-        self.header("cf-connecting-ip")
+        let raw = self
+            .header("cf-connecting-ip")
             .map(|ip| ip.trim().to_string())
             .filter(|ip| !ip.is_empty())
-            .unwrap_or_else(|| "local".to_string())
+            .unwrap_or_else(|| "local".to_string());
+        match raw.parse::<std::net::Ipv6Addr>() {
+            Ok(v6) if v6.to_ipv4_mapped().is_none() => {
+                let s = v6.segments();
+                format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+            }
+            _ => raw,
+        }
     }
 
     /// Hôte demandé, sans le port, en minuscules.
@@ -292,6 +302,18 @@ mod tests {
         assert_eq!(req.host().as_deref(), Some("hub.example.com"));
         assert_eq!(len, 5);
         assert_eq!(&raw[end..], b"hello");
+    }
+
+    #[test]
+    fn ipv6_counts_per_64() {
+        let ip = |v: &str| {
+            let mut r = Request::default();
+            r.headers.insert("cf-connecting-ip".into(), v.into());
+            r.client_ip()
+        };
+        assert_eq!(ip("2001:db8:1:2:aaaa::1"), ip("2001:db8:1:2:bbbb::9"));
+        assert_ne!(ip("2001:db8:1:2::1"), ip("2001:db8:1:3::1"));
+        assert_eq!(ip("203.0.113.5"), "203.0.113.5");
     }
 
     #[test]

@@ -2,9 +2,10 @@
 //! depuis Internet, par OAuth, sans voir autre chose que le profil `remote`.
 //!
 //! Deux transports, une seule porte d'entrée (`handle`) :
-//! - **tunnel** : `cloudflared` relaie `https://<domaine>` vers un port local dédié
-//!   (24681 par défaut), distinct du port principal. Ce port ne sert que `/mcp`, l'OAuth et la
-//!   découverte : jamais le tableau de bord ni l'API `/api`.
+//! - **tunnel** : `cloudflared` relaie `https://<domaine>` vers le socket Unix
+//!   `~/.McpHub/remote/tunnel.sock` (dossier en 700), jamais vers un port TCP : ni page web ni
+//!   autre processus ne l'atteint. Il ne sert que `/mcp`, l'OAuth et la découverte : jamais le
+//!   tableau de bord ni l'API `/api`.
 //! - **relais** : le démon ouvre un WebSocket sortant vers un relais Cloudflare (dossier
 //!   `relay/`), qui lui transmet les requêtes reçues sur `https://<hubId>.<domaine du relais>`.
 //!
@@ -53,8 +54,6 @@ pub struct Settings {
     pub transport: Transport,
     /// Adresse publique, sans barre finale (ex. https://hub.example.com).
     pub public_url: String,
-    /// Port local du tunnel.
-    pub port: u16,
     /// Relais : adresse https du relais (ex. https://relay.example.com).
     pub relay_url: Option<String>,
 }
@@ -77,15 +76,17 @@ pub fn ensure_private_dir() -> Result<std::path::PathBuf, String> {
     Ok(dir)
 }
 
+/// Socket du tunnel : `cloudflared` s'y connecte ; dans un dossier en 700, aucun autre
+/// utilisateur, aucune page web et aucun serveur isolé ne l'atteint.
+pub fn socket_path() -> std::path::PathBuf {
+    remote_dir().join("tunnel.sock")
+}
+
 pub fn config_path() -> std::path::PathBuf {
     crate::instance::hub_dir().join("config.json")
 }
 
 impl Settings {
-    pub fn default_port() -> u16 {
-        crate::instance::port().saturating_add(1)
-    }
-
     pub fn from_json(value: Option<&Value>) -> Settings {
         let get = |k: &str| value.and_then(|v| v.get(k));
         let transport = match get("transport").and_then(|v| v.as_str()) {
@@ -100,11 +101,6 @@ impl Settings {
                 .unwrap_or("")
                 .trim_end_matches('/')
                 .to_string(),
-            port: get("port")
-                .and_then(|v| v.as_u64())
-                .and_then(|p| u16::try_from(p).ok())
-                .filter(|p| *p >= 1024)
-                .unwrap_or_else(Settings::default_port),
             relay_url: get("relayUrl")
                 .and_then(|v| v.as_str())
                 .map(|s| s.trim_end_matches('/').to_string()),
@@ -126,7 +122,6 @@ impl Settings {
             "enabled": self.enabled,
             "transport": self.transport.as_str(),
             "publicUrl": self.public_url,
-            "port": self.port,
         });
         if let Some(r) = &self.relay_url {
             v["relayUrl"] = json!(r);
@@ -262,6 +257,8 @@ pub async fn handle(proxy: &Arc<ProxyServer>, settings: &Settings, req: Request)
     response.to_bytes()
 }
 
+const MAX_BATCH: usize = 20;
+
 fn unauthorized(base: &str, invalid: bool) -> Vec<u8> {
     let mut challenge = format!(
         "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource/mcp\", scope=\"mcp\"",
@@ -296,13 +293,27 @@ async fn handle_mcp(proxy: &Arc<ProxyServer>, base: &str, req: Request) -> Vec<u
         )
         .to_bytes();
     }
-    if !authz::rate_allow(format!("mcp:{}", client_id), 100, 60) {
+    // Un lot compte pour autant d'appels qu'il contient, 20 au plus.
+    let calls = match serde_json::from_slice::<Value>(&req.body) {
+        Ok(Value::Array(items)) => items.len(),
+        _ => 1,
+    };
+    if calls > MAX_BATCH {
         return Response::json(
-            429,
-            &json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32002, "message": "trop d'appels : 100 par minute au plus"}}),
+            400,
+            &json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": format!("lot trop grand : {} requetes au plus", MAX_BATCH)}}),
         )
-        .with("Retry-After", "60")
         .to_bytes();
+    }
+    for _ in 0..calls.max(1) {
+        if !authz::rate_allow(format!("mcp:{}", client_id), 100, 60) {
+            return Response::json(
+                429,
+                &json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32002, "message": "trop d'appels : 100 par minute au plus"}}),
+            )
+            .with("Retry-After", "60")
+            .to_bytes();
+        }
     }
     let body = String::from_utf8_lossy(&req.body).to_string();
     crate::dashboard::handle_streamable_http_message(&body, proxy, None, Some(label)).await
@@ -349,42 +360,71 @@ pub fn spawn(proxy: Arc<ProxyServer>) {
     }
 }
 
-/// Port local dédié au tunnel : 127.0.0.1 uniquement.
+/// Connexions traitées en même temps sur le socket du tunnel.
+const MAX_CONNECTIONS: usize = 64;
+/// Corps admis hors de `/mcp` (inscription, jeton, révocation).
+const MAX_SMALL_BODY: usize = 64 * 1024;
+
+/// Socket du tunnel (Unix uniquement : le tunnel n'existe que sur macOS et Linux).
+#[cfg(unix)]
 async fn serve_local(proxy: Arc<ProxyServer>, settings: Arc<Settings>) {
-    let addr = format!("127.0.0.1:{}", settings.port);
-    let listener = match tokio::net::TcpListener::bind(&addr).await {
+    let path = socket_path();
+    if let Err(e) = ensure_private_dir() {
+        eprintln!("[McpHub][REMOTE] {}", e);
+        return;
+    }
+    let _ = std::fs::remove_file(&path);
+    let listener = match tokio::net::UnixListener::bind(&path) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("[McpHub][REMOTE] Port {} indisponible : {}", addr, e);
+            eprintln!(
+                "[McpHub][REMOTE] Socket {} indisponible : {}",
+                path.display(),
+                e
+            );
             return;
         }
     };
+    crate::vault::restrict_permissions(&path);
     eprintln!(
-        "[McpHub][REMOTE] Acces distant pret : {} -> http://{}",
-        settings.public_url, addr
+        "[McpHub][REMOTE] Acces distant pret : {} -> {}",
+        settings.public_url,
+        path.display()
     );
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         let Ok((stream, _)) = listener.accept().await else {
+            continue;
+        };
+        let Ok(permit) = permits.clone().try_acquire_owned() else {
+            drop(stream);
             continue;
         };
         let proxy = proxy.clone();
         let settings = settings.clone();
         tokio::spawn(async move {
             serve_connection(stream, &proxy, &settings).await;
+            drop(permit);
         });
     }
 }
 
-async fn serve_connection(
-    mut stream: tokio::net::TcpStream,
-    proxy: &Arc<ProxyServer>,
-    settings: &Settings,
-) {
-    let read_timeout = std::time::Duration::from_secs(15);
+#[cfg(not(unix))]
+async fn serve_local(_proxy: Arc<ProxyServer>, _settings: Arc<Settings>) {
+    eprintln!("[McpHub][REMOTE] Tunnel : macOS et Linux seulement dans cette version");
+}
+
+/// Lit une requête entière en 30 s au plus (pas de connexion lente qui s'éternise), corps
+/// limité à 16 Mo pour `/mcp` et 64 Ko ailleurs, puis répond.
+async fn serve_connection<S>(mut stream: S, proxy: &Arc<ProxyServer>, settings: &Settings)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
     let mut chunk = vec![0u8; 65536];
     let (mut req, head_len, body_len) = loop {
-        let n = match tokio::time::timeout(read_timeout, stream.read(&mut chunk)).await {
+        let n = match tokio::time::timeout_at(deadline, stream.read(&mut chunk)).await {
             Ok(Ok(n)) if n > 0 => n,
             _ => return,
         };
@@ -392,27 +432,26 @@ async fn serve_connection(
         if let Some(parsed) = http::parse_head(&buf) {
             break parsed;
         }
-        if buf.len() > 64 * 1024 {
-            let _ = stream
-                .write_all(&Response::text(400, "headers too large").to_bytes())
-                .await;
-            return;
-        }
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+        if buf.len() > 64 * 1024 || buf.windows(4).any(|w| w == b"\r\n\r\n") {
             let _ = stream
                 .write_all(&Response::text(400, "bad request").to_bytes())
                 .await;
             return;
         }
     };
-    if body_len > MAX_BODY {
+    let limit = if req.path.trim_end_matches('/') == "/mcp" {
+        MAX_BODY
+    } else {
+        MAX_SMALL_BODY
+    };
+    if body_len > limit {
         let _ = stream
             .write_all(&Response::text(413, "payload too large").to_bytes())
             .await;
         return;
     }
     while buf.len() < head_len + body_len {
-        let n = match tokio::time::timeout(read_timeout, stream.read(&mut chunk)).await {
+        let n = match tokio::time::timeout_at(deadline, stream.read(&mut chunk)).await {
             Ok(Ok(n)) if n > 0 => n,
             _ => return,
         };
@@ -446,12 +485,15 @@ pub fn api_status() -> Value {
     })
 }
 
-pub fn api_approve(body: &str) -> Result<String, String> {
-    let code = serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|v| v.get("code").and_then(|c| c.as_str()).map(String::from))
+/// `{"code"}` décrit la demande ; `{"code", "confirm": true}` la valide.
+pub fn api_approve(body: &str) -> Result<Value, String> {
+    let parsed: Value = serde_json::from_str(body).map_err(|_| "corps JSON attendu")?;
+    let code = parsed
+        .get("code")
+        .and_then(|c| c.as_str())
         .ok_or("champ code manquant")?;
-    authz::approve_pairing(&code)
+    let confirm = parsed.get("confirm").and_then(|c| c.as_bool()) == Some(true);
+    authz::approve_pairing(code, confirm)
 }
 
 pub fn api_revoke(body: &str) -> Result<usize, String> {
@@ -473,10 +515,13 @@ fn print_usage() {
          \x20 McpHub remote disable                   coupe l'acces distant\n\
          \x20 McpHub remote allow SERVEUR             ajoute un serveur au profil remote\n\
          \x20 McpHub remote deny SERVEUR              retire un serveur du profil remote\n\
+         \x20 McpHub remote allow-tool SERVEUR/OUTIL autorise un outil qui n'est pas reconnu en lecture\n\
+         \x20 McpHub remote deny-tool SERVEUR/OUTIL  retire cet outil\n\
          \x20 McpHub remote clients                   clients connectes\n\
          \x20 McpHub remote revoke CLIENT_ID|all      deconnecte un client\n\
          \x20 McpHub remote approve CODE              valide une connexion (machine sans ecran)\n\n\
-         Le profil remote est toujours en lecture seule et ne montre que les serveurs nommes."
+         Le profil remote ne montre que les serveurs nommes, et seulement leurs outils en lecture\n\
+         seule stricte (readOnlyHint et nom de lecture) ou autorises nommement."
     );
 }
 
@@ -497,7 +542,7 @@ fn print_status() -> i32 {
         println!("  Transport   : {}", settings.transport.as_str());
     }
     if settings.transport == Transport::Tunnel && settings.enabled {
-        println!("  Port local  : 127.0.0.1:{}", settings.port);
+        println!("  Socket      : {}", socket_path().display());
         println!("  Service     : {}", tunnel::service_state());
     }
     match crate::toolguard::remote_profile_problem() {
@@ -550,41 +595,119 @@ fn print_clients() -> i32 {
     }
 }
 
-async fn approve_cli(code: &str) -> i32 {
+async fn approve_request(code: &str, confirm: bool) -> Result<Value, String> {
     let url = format!(
         "http://127.0.0.1:{}/api/remote/approve",
         crate::instance::port()
     );
-    let result = reqwest::Client::new()
+    let response = reqwest::Client::new()
         .post(&url)
         .bearer_auth(crate::dashboard::get_auth_token())
-        .json(&json!({"code": code}))
+        .json(&json!({"code": code, "confirm": confirm}))
         .send()
-        .await;
-    match result {
-        Ok(r) if r.status().is_success() => {
-            let v: Value = r.json().await.unwrap_or_default();
-            println!(
-                "Connexion validee : {}. Revenez sur la page et cliquez Continuer.",
-                v.get("client").and_then(|c| c.as_str()).unwrap_or("client")
-            );
-            0
-        }
-        Ok(r) => {
-            eprintln!("Refuse : {}", r.text().await.unwrap_or_default());
-            1
-        }
-        Err(e) => {
-            eprintln!(
+        .await
+        .map_err(|e| {
+            format!(
                 "Demon McpHub injoignable ({}). Il doit tourner (McpHub install).",
                 e
-            );
+            )
+        })?;
+    if response.status().is_success() {
+        Ok(response.json().await.unwrap_or_default())
+    } else {
+        Err(format!(
+            "Refuse : {}",
+            response.text().await.unwrap_or_default()
+        ))
+    }
+}
+
+/// Montre la demande (client, retour, origine) et ne valide qu'après un « o ».
+async fn approve_cli(code: &str) -> i32 {
+    let preview = match approve_request(code, false).await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{}", e);
+            return 1;
+        }
+    };
+    let field = |k: &str| {
+        preview
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+            .to_string()
+    };
+    println!(
+        "Client      : {}\nRetour vers : {}\nDepuis      : {}",
+        field("client"),
+        field("returnHost"),
+        field("origin")
+    );
+    print!("Autoriser cette connexion ? [o/N] ");
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err()
+        || !matches!(
+            answer.trim().to_ascii_lowercase().as_str(),
+            "o" | "oui" | "y" | "yes"
+        )
+    {
+        println!("Rien n'a ete autorise.");
+        return 1;
+    }
+    match approve_request(code, true).await {
+        Ok(_) => {
+            println!("Connexion validee : la page de connexion continue toute seule.");
+            0
+        }
+        Err(e) => {
+            eprintln!("{}", e);
             1
         }
     }
 }
 
+/// Ajoute ou retire un outil autorisé nommément dans le profil `remote` ("serveur/outil").
+pub fn set_profile_tool(key: &str, allowed: bool) -> Result<Vec<String>, String> {
+    let valid = key.split_once('/').is_some_and(|(s, t)| {
+        !s.is_empty() && !t.is_empty() && !key.contains('*') && !key.contains('?')
+    });
+    if !valid {
+        return Err("format attendu : serveur/outil, sans joker".into());
+    }
+    let path = config_path();
+    let mut config = crate::config::read_raw(&path)?.ok_or("config.json introuvable")?;
+    let profile = config
+        .pointer_mut("/settings/profiles/remote")
+        .and_then(|p| p.as_object_mut())
+        .ok_or("profil remote absent : McpHub remote allow SERVEUR d'abord")?;
+    let mut tools: Vec<String> = profile
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    tools.retain(|t| t != key);
+    if allowed {
+        tools.push(key.to_string());
+    }
+    tools.sort();
+    profile.insert("tools".into(), json!(tools));
+    crate::config::write_raw_atomic(&path, &config)?;
+    Ok(tools)
+}
+
 pub async fn run_cli(args: &[String]) -> i32 {
+    // Hors du démon, la garde des outils n'a pas de config : on lui donne celle du fichier,
+    // pour que status et allow décrivent le profil remote tel qu'il est écrit.
+    if let Ok(Some(raw)) = crate::config::read_raw(&config_path()) {
+        crate::toolguard::configure(crate::toolguard::parse_guard_config(&raw));
+    }
     let arg = |i: usize| args.get(i).map(|s| s.as_str());
     match arg(0) {
         None | Some("status") => print_status(),
@@ -655,6 +778,29 @@ pub async fn run_cli(args: &[String]) -> i32 {
                 }
             }
         }
+        Some(cmd @ ("allow-tool" | "deny-tool")) => {
+            let Some(key) = arg(1) else {
+                print_usage();
+                return 2;
+            };
+            match set_profile_tool(key, cmd == "allow-tool") {
+                Ok(tools) => {
+                    println!(
+                        "Outils autorises nommement : {}",
+                        if tools.is_empty() {
+                            "aucun".to_string()
+                        } else {
+                            tools.join(", ")
+                        }
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("{}", e);
+                    1
+                }
+            }
+        }
         Some("clients") => print_clients(),
         Some("revoke") => match arg(1) {
             Some(target) => match authz::revoke_client(target) {
@@ -700,13 +846,11 @@ mod tests {
             "enabled": true,
             "transport": "relay",
             "publicUrl": "https://Abc.Relay.Example.com/",
-            "port": 80,
         })));
         assert!(s.enabled);
         assert_eq!(s.transport, Transport::Relay);
         assert_eq!(s.public_url, "https://Abc.Relay.Example.com");
         assert_eq!(s.public_host().as_deref(), Some("abc.relay.example.com"));
-        assert!(s.port >= 1024, "port reserve ignore");
 
         let off = Settings::from_json(None);
         assert!(!off.enabled);
