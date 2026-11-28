@@ -102,34 +102,34 @@ impl Default for ProxyConfig {
     }
 }
 
-/// Chemin qui désigne McpHub lui-même (binaire, client Node...). Les serveurs installés par la
-/// bibliothèque vivent dans .../McpHub/servers/ : leur chemin contient « McpHub » sans l'être.
+/// Une commande ou un argument désigne McpHub lui-même quand le fichier visé est McpHub : le
+/// binaire (`McpHub`, `mcphub`, `mcp-hub`…), le paquet `mcphub-client`, ou son client Node
+/// (`…/McpHub/client/index.js`). Un fichier rangé dans un dossier qui s'appelle McpHub (un
+/// script de test, un venv Python dans le dépôt) n'en est pas une copie, ni une valeur comme
+/// `com.soflution.mcphub/roots`. Les serveurs de la bibliothèque (`…/McpHub/servers/`) non plus.
 fn names_mcphub(s: &str) -> bool {
+    const NAMES: [&str; 3] = ["mcphub", "mcp-hub", "mcp-on-demand"];
     let lower = s.to_lowercase();
     let bundles = crate::registry::servers_dir()
         .to_string_lossy()
         .to_lowercase();
-    let lower = match lower.strip_prefix(&bundles) {
-        Some(rest) => rest.to_string(),
-        None => lower,
-    };
-    lower.contains("mcphub") || lower.contains("mcp-on-demand")
-}
-
-/// Un argument désigne McpHub quand un élément de son chemin est McpHub (`mcphub`,
-/// `McpHub/client/index.js`, `mcp-hub`…), jamais quand il cite le mot ailleurs : une valeur
-/// comme `com.soflution.mcphub/roots` ne fait pas d'un serveur une copie de McpHub.
-fn arg_names_mcphub(arg: &str) -> bool {
-    let lower = arg.to_lowercase();
-    let bundles = crate::registry::servers_dir()
-        .to_string_lossy()
-        .to_lowercase();
     let lower = lower.strip_prefix(&bundles).unwrap_or(&lower);
-    lower.split('/').any(|part| {
-        ["mcphub", "mcp-hub", "mcp-on-demand"]
-            .iter()
-            .any(|name| part.starts_with(name))
-    })
+    let parts: Vec<&str> = lower.split(['/', '\\']).filter(|p| !p.is_empty()).collect();
+    let is_name = |part: &str| NAMES.iter().any(|name| part.starts_with(name));
+    let Some((file, dirs)) = parts.split_last() else {
+        return false;
+    };
+    if is_name(file)
+        || dirs
+            .last()
+            .is_some_and(|d| is_name(d) && d.contains("client"))
+    {
+        return true;
+    }
+    // Client Node d'une copie du dépôt : `<…McpHub…>/client/index.js`.
+    *file == "index.js"
+        && dirs.last() == Some(&"client")
+        && dirs[..dirs.len() - 1].iter().any(|d| is_name(d))
 }
 
 fn is_self(name: &str, config: &Value) -> bool {
@@ -145,7 +145,7 @@ fn is_self(name: &str, config: &Value) -> bool {
     if let Some(args) = config.get("args").and_then(|v| v.as_array()) {
         if args
             .iter()
-            .any(|a| a.as_str().map(arg_names_mcphub).unwrap_or(false))
+            .any(|a| a.as_str().map(names_mcphub).unwrap_or(false))
         {
             return true;
         }
@@ -891,6 +891,27 @@ mod tests {
             ),
             "un argument qui cite McpHub ne fait pas du serveur une copie de McpHub"
         );
+        assert!(
+            !is_self(
+                "bench",
+                &json!({"command": "/Users/me/Cursor/App/MCP/McpHub/bench/.venv/bin/python",
+                        "args": ["-I", "/Users/me/Cursor/App/MCP/McpHub/bench/fake_server.py"]})
+            ),
+            "un script range dans un dossier McpHub n'est pas McpHub"
+        );
+        assert!(is_self(
+            "dev",
+            &json!({"command": "node",
+                    "args": ["/Users/me/McpHub/.claude/worktrees/x/client/index.js"]})
+        ));
+        assert!(is_self(
+            "npm",
+            &json!({"command": "node", "args": ["/opt/lib/node_modules/mcphub-client/index.js"]})
+        ));
+        assert!(is_self(
+            "bin",
+            &json!({"command": "/Users/me/.local/bin/McpHub", "args": ["stdio"]})
+        ));
         let bundle = crate::registry::servers_dir().join("depsonar/current/dist/index.js");
         assert!(!is_self(
             "depsonar",
