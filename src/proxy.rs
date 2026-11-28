@@ -76,6 +76,17 @@ fn recent_denials() -> std::sync::MutexGuard<'static, HashMap<String, Instant>> 
         .unwrap_or_else(|e| e.into_inner())
 }
 
+/// Fenêtre de connexion distante (code à recopier) : mêmes pauses que `ask_human`.
+pub async fn ask_human_code(
+    message: String,
+    timeout_secs: u64,
+) -> crate::confirm_dialog::CodeAnswer {
+    DIALOG_OPEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let answer = crate::confirm_dialog::ask_code(message, timeout_secs).await;
+    DIALOG_OPEN.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    answer
+}
+
 /// Fenêtre de confirmation native ouverte hors d'un appel d'outil (tableau de bord) : les
 /// serveurs capables de piloter l'ordinateur sont mis en pause pendant ce temps aussi.
 pub async fn ask_human(message: String, timeout_secs: u64) -> crate::confirm_dialog::DialogAnswer {
@@ -84,6 +95,20 @@ pub async fn ask_human(message: String, timeout_secs: u64) -> crate::confirm_dia
     DIALOG_OPEN.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     answer
 }
+
+/// Appel venu de l'accès distant (Gemini, claude.ai…) : pas de dossier de session, pas de
+/// tenant, pas de code mode ni d'outil qui consomme les comptes du propriétaire.
+pub fn is_remote_call() -> bool {
+    REMOTE_CLIENT.try_with(|c| c.is_some()).unwrap_or(false)
+}
+
+fn remote_client_label() -> Option<String> {
+    REMOTE_CLIENT.try_with(|c| c.clone()).ok().flatten()
+}
+
+/// Outils internes refusés aux clients distants : `mcphub_run` lance Node à chaque appel,
+/// `crawl` consomme le jeton Cloudflare du propriétaire.
+const REMOTE_DENIED_TOOLS: &[&str] = &["mcphub_run", "crawl"];
 
 /// Profil actif : celui de la requête HTTP, sinon la variable MCPHUB_PROFILE (mode stdio).
 pub fn current_profile() -> Option<String> {
@@ -1272,10 +1297,19 @@ impl ProxyServer {
             config.mode.clone()
         };
 
-        let tools = match mode {
+        let mut tools = match mode {
             Mode::Discover => self.get_discover_tools().await,
             Mode::Passthrough => self.get_passthrough_tools().await,
         };
+        if is_remote_call() {
+            if let Some(list) = tools.as_array_mut() {
+                list.retain(|t| {
+                    !t.get("name")
+                        .and_then(|n| n.as_str())
+                        .is_some_and(|n| REMOTE_DENIED_TOOLS.contains(&n))
+                });
+            }
+        }
 
         JsonRpcResponse::success(id, serde_json::json!({ "tools": tools }))
     }
@@ -1428,6 +1462,14 @@ impl ProxyServer {
             .get("arguments")
             .cloned()
             .unwrap_or(serde_json::json!({}));
+
+        if is_remote_call() && REMOTE_DENIED_TOOLS.contains(&tool_name) {
+            return JsonRpcResponse::error(
+                id,
+                -32601,
+                format!("{} n'est pas disponible par l'acces distant", tool_name),
+            );
+        }
 
         let mode = {
             let config = self.config.lock().await;
@@ -3115,6 +3157,8 @@ impl ProxyServer {
             decision: gate_decision,
             policy: gate_policy,
             arguments: Some(arguments.clone()),
+            // L'entrée finale est écrite depuis une autre tâche : le client y est noté ici.
+            remote_client: remote_client_label(),
             ..Default::default()
         };
 

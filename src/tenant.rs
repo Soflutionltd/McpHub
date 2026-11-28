@@ -397,6 +397,10 @@ pub struct CallOrigin {
 
 impl CallOrigin {
     pub fn from_args(args: &Value) -> Self {
+        // Un client distant ne choisit ni dossier ni tenant : contexte des comptes McpHub.
+        if crate::proxy::is_remote_call() {
+            return Self::default();
+        }
         let ctx = args.get("_mcphub_context");
         let dir = |key: &str| {
             ctx.and_then(|c| c.get(key))
