@@ -463,20 +463,33 @@ fn valid_client_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
 }
 
-/// Identifiant public de l'app GitHub de l'éditeur : fixé à la compilation
-/// (`MCPHUB_GITHUB_CLIENT_ID`) ou `settings.githubClientId` dans config.json. Ce n'est pas un
-/// secret : le flux par code d'appareil n'en utilise aucun.
+/// Client ID de l'app GitHub « McpHub by Soflution » (organisation Soflutionltd, flux par code
+/// d'appareil activé, jetons sans expiration). Valeur publique : le flux par code d'appareil
+/// n'utilise aucun secret.
+const SOFLUTION_GITHUB_CLIENT_ID: &str = "Iv23liJBrtEAdZOl58tl";
+
+/// Identifiant public de l'app GitHub : `settings.githubClientId` (une autre app, pour une
+/// version redistribuée), sinon `MCPHUB_GITHUB_CLIENT_ID` fixé à la compilation, sinon l'app de
+/// Soflution.
 pub fn github_client_id() -> Option<String> {
-    if let Some(id) = option_env!("MCPHUB_GITHUB_CLIENT_ID").filter(|id| valid_client_id(id)) {
-        return Some(id.to_string());
-    }
     let path = crate::config::dedicated_config_path();
-    let raw = crate::config::read_raw(&path).ok().flatten()?;
-    raw.get("settings")
-        .and_then(|s| s.get("githubClientId"))
-        .and_then(|v| v.as_str())
-        .filter(|id| valid_client_id(id))
-        .map(String::from)
+    let configured = crate::config::read_raw(&path)
+        .ok()
+        .flatten()
+        .and_then(|raw| {
+            raw.get("settings")
+                .and_then(|s| s.get("githubClientId"))
+                .and_then(|v| v.as_str())
+                .filter(|id| valid_client_id(id))
+                .map(String::from)
+        });
+    configured
+        .or_else(|| {
+            option_env!("MCPHUB_GITHUB_CLIENT_ID")
+                .filter(|id| valid_client_id(id))
+                .map(String::from)
+        })
+        .or_else(|| Some(SOFLUTION_GITHUB_CLIENT_ID.to_string()))
 }
 
 /// Code à saisir sur github.com/login/device.
@@ -931,6 +944,7 @@ mod tests {
             DevicePoll::Failed(_)
         ));
         assert!(valid_client_id("Iv23liAbCdEf0123"));
+        assert!(valid_client_id(SOFLUTION_GITHUB_CLIENT_ID));
         assert!(!valid_client_id("id avec espace"));
     }
 

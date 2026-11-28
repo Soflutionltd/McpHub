@@ -456,7 +456,7 @@ On the dashboard, every server card (and every client account) shows what is mis
 
 - **Connect** on a remote OAuth server opens the service's consent page; you click Authorize and the tokens land in the right Keychain. Known services get the scopes they need (Cloudflare `mcp.cloudflare.com` with write access to Workers, Pages, D1, KV, R2 and DNS, instead of the read-only default; Supabase `mcp.supabase.com` with project and database access).
 - **Connect Cloudflare / Supabase / GitHub** on a token variable opens the service's token page pre-filled with the right permissions, then takes the pasted token: it is checked with the service's API before saving (the Cloudflare account ID is filled in by itself), goes straight to the Keychain and is never shown again, sent back to the page or logged. One Cloudflare token also fills `CLOUDFLARE_MCP_TOKEN` and `CLOUDFLARE_API_TOKEN` when both are expected.
-- **Sign in with GitHub** (device code: no token to copy) appears once a GitHub App client ID is set in `settings.githubClientId` (public value, no secret).
+- **Sign in with GitHub** (device code: no token to copy) uses the public GitHub App *McpHub by Soflution*: McpHub shows an 8-character code, you paste it on GitHub and click Authorize. Each account installs the app once and picks its repositories. A redistributed build can point to its own app with `settings.githubClientId` (public value, no secret).
 - For a client account, choose the client's browser profile on their card: consent and token pages open in that profile. A client on another computer approves from the link you send; their browser then shows a connection error whose address you paste back to finish.
 
 ### Token expiry: you and your agents are told in time

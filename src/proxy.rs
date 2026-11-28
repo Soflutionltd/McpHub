@@ -4465,7 +4465,9 @@ mod tests {
         let result = serde_json::json!({"content": [{"type": "text", "text": "page web"}]});
         let marked = present_result(result.clone(), true, "serveur-sans-jeton");
         assert_eq!(marked["_untrusted"]["is_external_data"], true);
-        assert!(present_result(result, false, "serveur-sans-jeton").get("_untrusted").is_none());
+        assert!(present_result(result, false, "serveur-sans-jeton")
+            .get("_untrusted")
+            .is_none());
     }
 
     #[test]
