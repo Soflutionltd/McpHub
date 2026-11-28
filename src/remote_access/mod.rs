@@ -174,8 +174,10 @@ pub fn save_settings(settings: &Settings) -> Result<(), String> {
 pub fn set_profile_server(server: &str, allowed: bool) -> Result<Vec<String>, String> {
     let path = config_path();
     let mut config = crate::config::read_raw(&path)?.ok_or("config.json introuvable")?;
+    // Même ordre que config.rs : "mcpServers", sinon "servers".
     let known = config
         .get("mcpServers")
+        .or_else(|| config.get("servers"))
         .and_then(|m| m.get(server))
         .is_some();
     if allowed && !known {
