@@ -1,0 +1,23 @@
+{
+  "name": "mcphub-relay",
+  "private": true,
+  "type": "module",
+  "description": "Relais de l'acces distant de McpHub : transmet les requetes de https://<hubId>.<domaine> au McpHub connecte par WebSocket.",
+  "scripts": {
+    "dev": "wrangler dev --var RELAY_HOST:relay.localhost",
+    "check": "tsc --noEmit",
+    "test": "node test/relay.test.mjs"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20261128.1",
+    "typescript": "7.0.2",
+    "wrangler": "4.169.0",
+    "ws": "8.23.1"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "workerd"
+    ]
+  }
+}

@@ -9,3 +9,5 @@ client/node_modules/
 
 # Rapports locaux de scan de secrets (jamais dans git)
 secrets-trouves.csv
+relay/node_modules/
+relay/.wrangler/
