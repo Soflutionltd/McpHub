@@ -77,8 +77,17 @@ fn recent_denials() -> std::sync::MutexGuard<'static, HashMap<String, Instant>> 
 /// Fenêtre de confirmation native ouverte hors d'un appel d'outil (tableau de bord) : les
 /// serveurs capables de piloter l'ordinateur sont mis en pause pendant ce temps aussi.
 pub async fn ask_human(message: String, timeout_secs: u64) -> crate::confirm_dialog::DialogAnswer {
+    ask_human_with(message, timeout_secs, crate::confirm_dialog::CONFIRM_LABELS).await
+}
+
+/// Comme `ask_human`, avec un autre titre et d'autres boutons.
+pub async fn ask_human_with(
+    message: String,
+    timeout_secs: u64,
+    labels: crate::confirm_dialog::DialogLabels,
+) -> crate::confirm_dialog::DialogAnswer {
     DIALOG_OPEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let answer = crate::confirm_dialog::ask(message, timeout_secs).await;
+    let answer = crate::confirm_dialog::ask_with(message, timeout_secs, labels).await;
     DIALOG_OPEN.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     answer
 }
@@ -265,6 +274,7 @@ enum PolicyGate {
 impl ProxyServer {
     pub fn new(config: ProxyConfig) -> Self {
         crate::toolguard::configure(config.guard.clone());
+        crate::toolguard::enable_prompts();
         let response_cache = ResponseCache::new();
         response_cache.set_ttl_secs(config.response_cache.ttl_secs);
         let child_manager = Arc::new(ChildManager::new(

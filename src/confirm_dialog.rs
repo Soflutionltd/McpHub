@@ -63,8 +63,23 @@ pub fn build_message(
     )
 }
 
+/// Titre et boutons d'une fenêtre. Des constantes du code, jamais un texte venu d'un serveur :
+/// ils sont écrits dans le script AppleScript, contrairement au message (passé par `argv`).
+#[derive(Debug, Clone, Copy)]
+pub struct DialogLabels {
+    pub title: &'static str,
+    pub deny: &'static str,
+    pub allow: &'static str,
+}
+
+pub const CONFIRM_LABELS: DialogLabels = DialogLabels {
+    title: "McpHub : confirmation",
+    deny: "Refuser",
+    allow: "Autoriser",
+};
+
 /// Bloquant : à appeler via `spawn_blocking`.
-pub fn ask_blocking(message: &str, timeout_secs: u64) -> DialogAnswer {
+pub fn ask_blocking(message: &str, timeout_secs: u64, labels: DialogLabels) -> DialogAnswer {
     if !cfg!(target_os = "macos") || std::env::var_os("MCPHUB_NO_DIALOG").is_some() {
         return DialogAnswer::Unavailable;
     }
@@ -72,8 +87,11 @@ pub fn ask_blocking(message: &str, timeout_secs: u64) -> DialogAnswer {
         "on run argv",
         "tell current application to activate",
         &format!(
-            "set r to display dialog (item 1 of argv) with title \"McpHub : confirmation\" buttons {{\"Refuser\", \"Autoriser\"}} default button \"Refuser\" cancel button \"Refuser\" giving up after {} with icon caution",
-            timeout_secs.clamp(10, 600)
+            "set r to display dialog (item 1 of argv) with title \"{title}\" buttons {{\"{deny}\", \"{allow}\"}} default button \"{deny}\" cancel button \"{deny}\" giving up after {secs} with icon caution",
+            title = labels.title,
+            deny = labels.deny,
+            allow = labels.allow,
+            secs = timeout_secs.clamp(10, 600)
         ),
         "if gave up of r then return \"timeout\"",
         "return button returned of r",
@@ -90,12 +108,12 @@ pub fn ask_blocking(message: &str, timeout_secs: u64) -> DialogAnswer {
             let stderr = String::from_utf8_lossy(&out.stderr);
             if out.status.success() {
                 match stdout.as_str() {
-                    "Autoriser" => DialogAnswer::Allow,
                     "timeout" => DialogAnswer::Timeout,
+                    answer if answer == labels.allow => DialogAnswer::Allow,
                     _ => DialogAnswer::Deny,
                 }
             } else if stderr.contains("-128") {
-                // Bouton d'annulation "Refuser" ou touche Échap.
+                // Bouton d'annulation ou touche Échap.
                 DialogAnswer::Deny
             } else {
                 eprintln!("[McpHub][CONFIRM] Fenetre indisponible : {}", stderr.trim());
@@ -111,6 +129,11 @@ pub fn ask_blocking(message: &str, timeout_secs: u64) -> DialogAnswer {
 
 /// Une seule fenêtre à la fois : les demandes simultanées attendent leur tour.
 pub async fn ask(message: String, timeout_secs: u64) -> DialogAnswer {
+    ask_with(message, timeout_secs, CONFIRM_LABELS).await
+}
+
+/// Comme `ask`, avec un autre titre et d'autres boutons.
+pub async fn ask_with(message: String, timeout_secs: u64, labels: DialogLabels) -> DialogAnswer {
     static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     // File d'attente bornée : au-delà du délai, la demande est abandonnée (refus).
     let Ok(_guard) =
@@ -118,7 +141,7 @@ pub async fn ask(message: String, timeout_secs: u64) -> DialogAnswer {
     else {
         return DialogAnswer::Timeout;
     };
-    tokio::task::spawn_blocking(move || ask_blocking(&message, timeout_secs))
+    tokio::task::spawn_blocking(move || ask_blocking(&message, timeout_secs, labels))
         .await
         .unwrap_or(DialogAnswer::Unavailable)
 }
