@@ -213,6 +213,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
       <div class="tab" data-view="library" onclick="switchView('library')">Library</div>
       <div class="tab" data-view="tools" onclick="switchView('tools')">Tools</div>
       <div class="tab" data-view="clients" onclick="switchView('clients')">Client accounts</div>
+      <div class="tab" data-view="remote" onclick="switchView('remote')">Remote access</div>
       <div class="tab" data-view="metrics" onclick="switchView('metrics')">Metrics</div>
       <div class="tab" data-view="logs" onclick="switchView('logs')">Logs</div>
       <div class="tab" data-view="settings" onclick="switchView('settings')">Settings</div>
@@ -265,6 +266,23 @@ header{display:flex;align-items:center;justify-content:space-between;padding:16p
     </div>
     <div class="cl-intro">Each client account has its own tokens (in its own Keychain item), its own server instances and its own isolated HOME. It is used automatically when an agent works in one of its folders. Token values are write-only here: they are never shown or sent back to this page.</div>
     <div id="clients-list"></div>
+  </div>
+
+  <!-- Remote access View -->
+  <div id="view-remote" class="hidden">
+    <div class="toolbar">
+      <button class="btn btn-ghost" onclick="fetchRemote()">↻ Refresh</button>
+    </div>
+    <div class="cl-intro">Lets Gemini, claude.ai or ChatGPT reach McpHub from the Internet over OAuth. Remote clients only see the <code>remote</code> profile: always read-only, and only the servers named in it. Every new connection must be approved on this machine.</div>
+    <div id="remote-status"></div>
+    <div id="remote-clients"></div>
+    <div class="card" style="cursor:default;margin-top:16px">
+      <div style="font-weight:600;margin-bottom:8px">Approve a pending connection (machine without a screen)</div>
+      <div style="display:flex;gap:8px">
+        <input id="remote-code" placeholder="ABCD-EFGH" maxlength="9" style="flex:1;padding:9px 12px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text)">
+        <button class="btn btn-primary" onclick="remoteApprove()">Approve</button>
+      </div>
+    </div>
   </div>
 
   <!-- Metrics View -->
@@ -503,9 +521,11 @@ function switchView(view){
   document.getElementById('view-logs').classList.toggle('hidden',view!=='logs');
   document.getElementById('view-settings').classList.toggle('hidden',view!=='settings');
   document.getElementById('view-clients').classList.toggle('hidden',view!=='clients');
+  document.getElementById('view-remote').classList.toggle('hidden',view!=='remote');
   if(view==='tools')renderTools();
   if(view==='metrics')fetchMetrics();
   if(view==='clients')fetchClients();
+  if(view==='remote')fetchRemote();
   if(view==='library'&&!libLoaded)libSearch();
 }
 async function fetchServers(){
@@ -989,6 +1009,45 @@ async function libOauth(server){try{await fetch('/api/oauth/login',{method:'POST
 fetchServers();
 checkWelcome();
 setTimeout(()=>document.body.classList.add('ready'),80);
+
+// ─── Remote access ───────────────────────────────────────────
+function remoteDate(secs){return secs?new Date(secs*1000).toLocaleString():'never'}
+async function fetchRemote(){
+  const box=document.getElementById('remote-status'), list=document.getElementById('remote-clients');
+  let d;
+  try{d=await api('GET','/api/remote')}catch(e){box.innerHTML=`<div class="card" style="cursor:default;color:var(--danger)">${esc(e.message)}</div>`;list.innerHTML='';return}
+  const s=d.settings||{};
+  const on=!!s.enabled&&!!s.publicUrl;
+  const url=on?s.publicUrl+'/mcp':'';
+  const profile=d.profileProblem
+    ?`<div style="color:var(--danger)">Closed: ${esc(d.profileProblem)}</div><div style="color:var(--text-dim);margin-top:4px">Add a server: <code>McpHub remote allow SERVER</code></div>`
+    :`<div>Read-only, servers: <b>${esc((d.servers||[]).join(', '))}</b></div>`;
+  box.innerHTML=`<div class="card" style="cursor:default">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+      <div style="font-weight:600">${on?'<span style="color:var(--ok)">●</span> Enabled':'<span style="color:var(--text-dim)">●</span> Off'}${on?` <span style="color:var(--text-dim);font-weight:400">(${esc(s.transport)})</span>`:''}</div>
+      ${on?`<button class="btn btn-ghost" onclick="navigator.clipboard.writeText(${esc(JSON.stringify(url))}).then(()=>notify('Address copied'))">Copy MCP address</button>`:''}
+    </div>
+    ${on?`<div style="margin-top:8px;font-family:ui-monospace,monospace;font-size:12px;word-break:break-all">${esc(url)}</div>`:`<div style="margin-top:8px;color:var(--text-dim)">Turn it on from a terminal: <code>McpHub remote enable --tunnel hub.example.com</code> or <code>McpHub remote enable --relay https://relay.example.com</code></div>`}
+    <div style="margin-top:10px">${profile}</div>
+  </div>`;
+  const clients=d.clients||[];
+  list.innerHTML=`<div style="font-weight:600;margin:18px 0 8px">Connected clients (${clients.length})</div>`+(clients.length?clients.map(c=>`<div class="card" style="cursor:default;margin-bottom:8px;display:flex;justify-content:space-between;gap:12px;align-items:center">
+      <div style="min-width:0">
+        <div style="font-weight:600">${esc(c.name||'Unnamed client')} <span style="color:var(--text-dim);font-weight:400">${esc(c.kind)}</span></div>
+        <div style="color:var(--text-dim);font-size:12px;word-break:break-all">${esc(c.clientId)}</div>
+        <div style="color:var(--text-dim);font-size:12px">Approved: ${esc(remoteDate(c.approvedAt))} · Last token: ${esc(remoteDate(c.lastUsed))}</div>
+      </div>
+      <button class="btn btn-danger" onclick="remoteRevoke(${esc(JSON.stringify(c.clientId))})">Disconnect</button>
+    </div>`).join(''):'<div style="color:var(--text-dim)">No client yet.</div>');
+}
+async function remoteRevoke(id){
+  if(!confirm('Disconnect this client? Its tokens stop working immediately.'))return;
+  try{await api('POST','/api/remote/revoke',{clientId:id});notify('Client disconnected');fetchRemote()}catch(e){notify(e.message,'danger')}
+}
+async function remoteApprove(){
+  const input=document.getElementById('remote-code');
+  try{const d=await api('POST','/api/remote/approve',{code:input.value});input.value='';notify('Approved: '+d.client+'. Click Continue on the sign-in page.')}catch(e){notify(e.message,'danger')}
+}
 
 // ─── Client accounts (tenants) ───────────────────────────────
 // Écran en écriture seule pour les secrets : aucune valeur n'est jamais lue ici.
